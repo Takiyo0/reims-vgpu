@@ -839,6 +839,36 @@ mod encode_render_frame {
         );
         assert_eq!(d.in_flight_frame_count.load(Ordering::SeqCst), 0);
     }
+
+    /// When dst is larger than 8x8, procedural wallpaper backdrop is generated, retained,
+    /// and encoded as a two-draw pass (backdrop first with blend: false, guest frame second with blend: true).
+    #[test]
+    fn backdrop_compositing_two_draws() {
+        let e = env();
+        let d = make(&e);
+        let cb = cmdbuf(&e);
+        let dst = texture(&e, 1024, 768);
+        let frame = texture(&e, 800, 600);
+        let vp_guest = MtlViewport {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            znear: 0.0,
+            zfar: 0.0,
+        };
+        let m = e.p.call_log().mark();
+        d.encode_render_frame(&frame, &dst, &cb, vp_guest).unwrap();
+        let calls = e.p.call_log().since(m);
+        assert!(calls.iter().any(|c| c.sel == "newTextureWithDescriptor:"));
+        assert!(calls.iter().any(|c| c.sel == "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"));
+        let draw_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sel == "drawPrimitives:vertexStart:vertexCount:")
+            .collect();
+        assert_eq!(draw_calls.len(), 2);
+        assert!(d.display_mutex.lock().wallpaper_backdrop.is_some());
+    }
 }
 
 mod wait_for_pending_frames {
@@ -1247,6 +1277,7 @@ fn the_display_holds_no_mtl_device_of_its_own() {
         let mut pd = PipelineKey {
             format: 80,
             gamma: true,
+            blend: false,
         };
         drop(cache.pipeline_for(pd));
         pd.gamma = false;

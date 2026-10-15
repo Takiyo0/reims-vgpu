@@ -29,6 +29,12 @@ reims-vgpu-metal.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
+# On Windows the OS services are this crate's own (`os/windows.rs`): threads, QPC clocks, the
+# views of guest pages over Win32 section objects and placeholder reservations, VirtualProtect
+# for maximum protection, and IOSurface's stand-in. Native Windows host, no WSL2 at runtime.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
+
 # The hashes of the metallibs' sources, which a metallib built elsewhere is checked by (build.rs).
 [build-dependencies]
 sha2.workspace = true

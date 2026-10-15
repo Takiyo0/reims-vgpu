@@ -271,7 +271,7 @@ impl<P: Platform> LocalTask<P> {
         handler: CompletedHandler,
     ) -> RaiseResult<()> {
         // A handler no buffer took goes with the call
-        let mut handler = Some(handler);
+        let handler = Some(handler);
         if !sync.needs_complete {
             return Ok(());
         }
@@ -300,6 +300,22 @@ impl<P: Platform> LocalTask<P> {
             None => None,
         };
         crate::fatal_unless!(sync.event.is_some(), DeathKind::NoFifoEvent);
+        let to_flush: Vec<Arc<Resource<P>>> = blit_resources
+            .iter()
+            .chain(&compute_resources)
+            .cloned()
+            .collect();
+        let mut handler = handler.map(|h| {
+            let wrapped: CompletedHandler = Box::new(move |info: CompletedInfo| {
+                if info.status == CommandBufferStatus::COMPLETED {
+                    for r in &to_flush {
+                        r.flush_to_guest();
+                    }
+                }
+                h(info);
+            });
+            wrapped
+        });
         if let Some(buffer) = &command_buffer {
             buffer.encode_wait(sync.event.map(EventRef::Shared), sync.value)?;
             if let Some(handler) = handler.take() {

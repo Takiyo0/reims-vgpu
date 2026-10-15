@@ -311,7 +311,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             .into_iter()
             .chain(crate::answer::HEARD)
             .collect();
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(cache_dir) = std::env::var_os("REIMS_VGPU_CACHE_DIR") {
+            options.shader_cache =
+                rt::ShaderCacheOptions::in_directory(PathBuf::from(cache_dir));
+        } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             options.shader_cache =
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
         }

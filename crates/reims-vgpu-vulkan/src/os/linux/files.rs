@@ -339,12 +339,16 @@ pub struct GuestMemoryLease {
 pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> GuestMemoryLease {
     let registrations: Vec<Registration> = ranges
         .into_iter()
-        .map(|r| {
+        .filter_map(|r| {
+            // On Linux every guest-RAM range has a backing fd (the library maps it to build its
+            // views). A range without one (the Windows/WHPX host-pointer path) cannot be viewed
+            // here, so it is skipped rather than registered.
+            let fd = r.fd?;
             let backing = Backing {
-                fd: r.fd,
+                fd,
                 offset: r.offset,
             };
-            Registration::new(r.host, r.length, backing)
+            Some(Registration::new(r.host, r.length, backing))
         })
         .collect();
     let guest_ram = registrations
@@ -485,7 +489,7 @@ mod tests {
         let ram = |host, length, offset| GuestRamFile {
             host,
             length,
-            fd: Arc::clone(&f),
+            fd: Some(Arc::clone(&f)),
             offset,
         };
         let lease =

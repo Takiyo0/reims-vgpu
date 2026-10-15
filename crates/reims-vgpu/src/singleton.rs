@@ -107,12 +107,15 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
 
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt as _;
+    #[cfg(unix)]
     use std::process::Command;
 
     use super::*;
 
     /// Re-runs this test binary on one test with `var` set.
+    #[cfg(unix)]
     fn child(test: &str, var: &str) -> std::process::Output {
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture", "--test-threads=1"])
@@ -145,6 +148,7 @@ mod tests {
     /// vulkan_platform() is one per process, and installs the aborting hook as platform() does;
     /// in a child, for the reason above.
     #[cfg(feature = "vulkan")]
+    #[cfg(unix)]
     #[test]
     fn one_vulkan_platform_per_process() {
         if std::env::var_os("RVG_VULKAN_PLATFORM_CHILD").is_some() {
@@ -170,6 +174,7 @@ mod tests {
 
     /// A panic on our thread aborts before unwinding (6.5, D9): the child panics inside
     /// `enter_ours` holding a value whose drop would print.
+    #[cfg(unix)]
     #[test]
     fn panic_on_our_thread_aborts_before_unwinding() {
         if std::env::var_os("RVG_HOOK_OURS_CHILD").is_some() {
@@ -200,6 +205,7 @@ mod tests {
 
     /// A panic on another thread goes to the previous hook and unwinds (the host's own panic is not
     /// ours to end)
+    #[cfg(unix)]
     #[test]
     fn panic_elsewhere_defers_to_the_previous_hook() {
         if std::env::var_os("RVG_HOOK_OTHER_CHILD").is_some() {

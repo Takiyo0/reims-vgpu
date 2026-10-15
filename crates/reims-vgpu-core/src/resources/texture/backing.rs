@@ -2,6 +2,7 @@
 //! backing record and paged plane by plane between the guest pages and one texture per plane
 //! over a new IOSurface. It answers no getter: getting its texture or resource is unrecognized.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -91,12 +92,14 @@ impl BackingPlane {
 
     /// A copy's bytes per image: the row length times the height, wrapping in 32 bits, then
     /// widened.
+    #[allow(dead_code)]
     fn bytes_per_image(&self) -> u64 {
         // 32-bit wrapping product.
         u64::from(self.bytes_per_row().wrapping_mul(self.height))
     }
 
     /// The copy's size: width by height by 1.
+    #[allow(dead_code)]
     fn size(&self) -> MtlSize {
         MtlSize {
             width: u64::from(self.width),
@@ -122,6 +125,8 @@ pub struct BackingResource<P: Platform> {
     length: u64,
     /// The guest pages' first virtual page.
     page: u32,
+    /// Generation counter incremented whenever backing data changes or is invalidated.
+    generation: AtomicU64,
 }
 
 impl<P: Platform> BackingResource<P> {
@@ -255,6 +260,7 @@ impl<P: Platform> BackingResource<P> {
                     textures,
                     length,
                     page,
+                    generation: AtomicU64::new(1),
                 },
             ))))
         })
@@ -293,6 +299,78 @@ impl<P: Platform> BackingResource<P> {
     /// The plane textures (the first is what a display presents).
     pub fn textures(&self) -> Vec<P::Texture> {
         self.textures.iter().map(Handle::clone_ref).collect()
+    }
+
+    /// Returns the current generation counter of this backing.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Advances the generation counter and returns the new value.
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+
+    /// Prepare and copy a specific plane to a destination texture using the backing transfer buffer.
+    pub fn prepare_plane_in_encoder(
+        &self,
+        hold: Hold<'_>,
+        plane_index: usize,
+        destination_texture: &P::Texture,
+        encoder: Option<&P::BlitEncoder>,
+    ) -> RaiseResult<()> {
+        use crate::platform::resource::Texture as _;
+
+        let Some(plane) = self.planes.get(plane_index) else {
+            log::warn!(
+                "prepare plane in encoder: plane index {plane_index} out of bounds ({})",
+                self.planes.len()
+            );
+            return Ok(());
+        };
+        let transfer_buffer = self.ensure_physical(hold)?;
+        if let Some(t) = self.task.upgrade() {
+            if let Some(map) = t.memory_map() {
+                use crate::platform::resource::Buffer as _;
+                map.sync_range_from_guest(transfer_buffer.contents(), transfer_buffer.length());
+            }
+        }
+        let mut copy_size = MtlSize {
+            width: destination_texture.width(),
+            height: destination_texture.height(),
+            depth: destination_texture.depth().max(1),
+        };
+        if copy_size.width == 0 || copy_size.height == 0 {
+            copy_size = plane.size();
+        }
+        if copy_size.width == 0 || copy_size.height == 0 {
+            return Ok(());
+        }
+        let mut bytes_per_row = u64::from(plane.bytes_per_row());
+        if bytes_per_row == 0 {
+            bytes_per_row = copy_size
+                .width
+                .wrapping_mul(u64::from(plane.bytes_per_element().max(1)));
+        }
+        let bytes_per_image = bytes_per_row.wrapping_mul(copy_size.height);
+        nil_send!(
+            encoder,
+            encode(
+                OnFault::Return,
+                BlitCmd::CopyBufferToTexture {
+                    source_buffer: &transfer_buffer,
+                    source_offset: u64::from(plane.offset),
+                    source_bytes_per_row: bytes_per_row,
+                    source_bytes_per_image: bytes_per_image,
+                    source_size: copy_size,
+                    destination_texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: MtlOrigin::default(),
+                }
+            )
+        )?;
+        Ok(())
     }
 }
 
@@ -366,8 +444,33 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
             log::warn!("preparing a backing whose guest copy is not valid");
         }
         let transfer_buffer = self.ensure_physical(hold)?;
+        if let Some(t) = self.task.upgrade() {
+            if let Some(map) = t.memory_map() {
+                use crate::platform::resource::Buffer as _;
+                map.sync_range_from_guest(transfer_buffer.contents(), transfer_buffer.length());
+            }
+        }
         let buffer = &transfer_buffer;
         for (plane, texture) in self.planes.iter().zip(&self.textures) {
+            use crate::platform::resource::Texture as _;
+            let mut copy_size = MtlSize {
+                width: texture.width(),
+                height: texture.height(),
+                depth: texture.depth().max(1),
+            };
+            if copy_size.width == 0 || copy_size.height == 0 {
+                copy_size = plane.size();
+            }
+            if copy_size.width == 0 || copy_size.height == 0 {
+                continue;
+            }
+            let mut bytes_per_row = u64::from(plane.bytes_per_row());
+            if bytes_per_row == 0 {
+                bytes_per_row = copy_size
+                    .width
+                    .wrapping_mul(u64::from(plane.bytes_per_element().max(1)));
+            }
+            let bytes_per_image = bytes_per_row.wrapping_mul(copy_size.height);
             // The form without options.
             nil_send!(
                 encoder,
@@ -376,9 +479,9 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
                     BlitCmd::CopyBufferToTexture {
                         source_buffer: buffer,
                         source_offset: u64::from(plane.offset),
-                        source_bytes_per_row: u64::from(plane.bytes_per_row()),
-                        source_bytes_per_image: plane.bytes_per_image(),
-                        source_size: plane.size(),
+                        source_bytes_per_row: bytes_per_row,
+                        source_bytes_per_image: bytes_per_image,
+                        source_size: copy_size,
                         destination_texture: texture,
                         destination_slice: 0,
                         destination_level: 0,
@@ -388,7 +491,15 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
             )?;
         }
         state.set_host_valid(true);
+        self.bump_generation();
         Ok(())
+    }
+
+    fn set_is_host_valid(&self, this: &Resource<P>, v: bool) {
+        if !v {
+            self.bump_generation();
+        }
+        this.state.set_host_valid(v);
     }
 
     /// The plane textures back to the guest pages. A nil encoder makes the copies sends to nil,
@@ -410,6 +521,25 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
         let transfer_buffer = self.ensure_physical(hold)?;
         let buffer = &transfer_buffer;
         for (plane, texture) in self.planes.iter().zip(&self.textures) {
+            use crate::platform::resource::Texture as _;
+            let mut copy_size = MtlSize {
+                width: texture.width(),
+                height: texture.height(),
+                depth: texture.depth().max(1),
+            };
+            if copy_size.width == 0 || copy_size.height == 0 {
+                copy_size = plane.size();
+            }
+            if copy_size.width == 0 || copy_size.height == 0 {
+                continue;
+            }
+            let mut bytes_per_row = u64::from(plane.bytes_per_row());
+            if bytes_per_row == 0 {
+                bytes_per_row = copy_size
+                    .width
+                    .wrapping_mul(u64::from(plane.bytes_per_element().max(1)));
+            }
+            let bytes_per_image = bytes_per_row.wrapping_mul(copy_size.height);
             nil_send!(
                 encoder,
                 encode(
@@ -419,11 +549,11 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
                         source_slice: 0,
                         source_level: 0,
                         source_origin: MtlOrigin::default(),
-                        source_size: plane.size(),
+                        source_size: copy_size,
                         destination_buffer: buffer,
                         destination_offset: u64::from(plane.offset),
-                        destination_bytes_per_row: u64::from(plane.bytes_per_row()),
-                        destination_bytes_per_image: plane.bytes_per_image()
+                        destination_bytes_per_row: bytes_per_row,
+                        destination_bytes_per_image: bytes_per_image,
                     }
                 )
             )?;
@@ -437,9 +567,21 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
     fn discard(&self, this: &Resource<P>) -> RaiseResult<()> {
         let _ = this;
         // 63 on a backing only drops the guest pages.
+        self.bump_generation();
         let old = self.transfer_buffer.lock().take();
         drop(old);
         Ok(())
+    }
+
+    fn flush_to_guest(&self, _this: &Resource<P>) {
+        if let Some(transfer_buffer) = self.transfer_buffer.lock().as_ref() {
+            if let Some(t) = self.task.upgrade() {
+                if let Some(map) = t.memory_map() {
+                    use crate::platform::resource::Buffer as _;
+                    map.sync_range_to_guest(transfer_buffer.contents(), transfer_buffer.length());
+                }
+            }
+        }
     }
 }
 
@@ -463,6 +605,7 @@ mod tests {
     use crate::resources::resource::test_support::logged;
     use crate::resources::texture::test_support::raised;
     use crate::testkit::calllog::Arg;
+    use crate::testkit::objects::Model;
     use crate::testkit::resource_host::FakeResourceHost;
     use crate::testkit::{FakePlatform, Fk, Step, kind};
 
@@ -894,6 +1037,45 @@ mod tests {
         assert!(log.since(mark).is_empty());
     }
 
+    /// Prepares and copies a specific plane to an external destination texture
+    #[test]
+    fn prepare_plane_copies_specific_plane() {
+        let env = Env::new();
+        let r = make(&env);
+        let b = backing(&r);
+        let enc = env.encoder();
+        let log = env.p.call_log();
+        let mark = log.mark();
+        let extra_tex: Fk<kind::Texture> = env.p.world().new_obj(Model::None);
+        b.prepare_plane_in_encoder(Hold::NONE, 1, &extra_tex, Some(&enc))
+            .unwrap();
+        let copies: Vec<_> = log
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel.starts_with("copyFromBuffer:"))
+            .collect();
+        assert_eq!(copies.len(), 1);
+        let tb = b.transfer_buffer.lock().as_ref().unwrap().id();
+        assert_eq!(
+            copies[0].args,
+            vec![
+                Arg::Obj(Some(tb)),
+                Arg::U64(64),
+                Arg::U64(8),
+                Arg::U64(16),
+                Arg::val(&MtlSize {
+                    width: 2,
+                    height: 2,
+                    depth: 1
+                }),
+                Arg::Obj(Some(extra_tex.id())),
+                Arg::U64(0),
+                Arg::U64(0),
+                Arg::val(&MtlOrigin::default()),
+            ]
+        );
+    }
+
     /// Guest-invalid still prepares; a nil encoder still sets host-valid
     #[test]
     fn prepare_guest_invalid_and_nil_encoder() {
@@ -978,6 +1160,7 @@ mod tests {
             textures: Vec::new(),
             length: 4,
             page: 0,
+            generation: AtomicU64::new(1),
         };
         let e = lone.ensure_physical(hold).err().unwrap();
         assert_eq!(

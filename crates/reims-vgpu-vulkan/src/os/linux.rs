@@ -24,6 +24,10 @@ pub use surface::{LinuxSurface, LinuxSurfaces};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
 
+/// The backing object behind a guest-RAM range (`crate::os::GuestRamFile`): a file descriptor
+/// mapped `MAP_SHARED` on Linux.
+pub use std::os::fd::OwnedFd as BackingHandle;
+
 pub(crate) use import::{TWINS_READ_ONLY, allocate_zeros, import_view, shown_at};
 pub(crate) use surface::{plane_at, plane_shape, recorded_mut, ycbcr_matrix};
 #[cfg(test)]

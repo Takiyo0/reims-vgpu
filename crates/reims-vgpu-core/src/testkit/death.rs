@@ -43,11 +43,18 @@
 // test-only code, as `testkit::capture`).
 #![allow(clippy::panic, clippy::disallowed_methods)]
 
-use std::ffi::{OsString, c_char, c_int, c_void};
+#[cfg(unix)]
+use std::ffi::c_void;
+use std::ffi::{OsString, c_char, c_int};
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt as _;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -85,6 +92,12 @@ const H_BODY_TID: usize = 16;
 /// The number of trace slots reserved so far.
 const H_CURSOR: usize = 24;
 const H_DIR_COUNT: usize = 32;
+#[cfg(windows)]
+const H_ACTIVE_TID: usize = 40;
+#[cfg(windows)]
+const H_ACTIVE_NAME_LEN: usize = 48;
+#[cfg(windows)]
+const H_ACTIVE_NAME: usize = 52;
 const DIR_OFF: usize = 64;
 const DIR_ENTRY: usize = 64;
 const DIR_TAG: usize = 32;
@@ -122,6 +135,190 @@ const K_ADVANCED: u8 = 5;
 const K_PANICKED: u8 = 6;
 
 mod sys;
+
+// ---------------------------------------------------------------------------------------------
+// The platform's file and OS seams, so the shared code reads one way on both. On Unix the file
+// is addressed by its descriptor and `FileExt`'s positioned reads; on Windows by its `HANDLE`
+// and `seek_read`/`seek_write`.
+
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
+
+/// The file's OS backing handle, as the shared-mapping call takes it: a descriptor on Unix, a
+/// `HANDLE` (as `isize`) on Windows.
+#[cfg(unix)]
+fn raw_backing(file: &File) -> std::os::fd::RawFd {
+    file.as_raw_fd()
+}
+#[cfg(windows)]
+fn raw_backing(file: &File) -> isize {
+    file.as_raw_handle() as isize
+}
+
+/// Reads exactly `buf.len()` bytes from `file` at `off`, as `FileExt::read_exact_at`. Windows's
+/// `FileExt` has only `seek_read` (one short read possible), so this loops.
+fn read_exact_at(file: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.read_exact_at(buf, off)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], off.saturating_add(done as u64))?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read",
+                ));
+            }
+            done = done.saturating_add(n);
+        }
+        Ok(())
+    }
+}
+
+/// Writes all of `buf` to `file` at `off`, as `FileExt::write_all_at`. Windows's `seek_write`
+/// may be short, so this loops.
+fn write_all_at(file: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.write_all_at(buf, off)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_write(&buf[done..], off.saturating_add(done as u64))?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "short write",
+                ));
+            }
+            done = done.saturating_add(n);
+        }
+        Ok(())
+    }
+}
+
+/// Marks a `SIGABRT` death on the calling thread, for Windows's abort path (the one `fatal` path
+/// and a bare `raise(other)`), which no handler sees. A no-op outside a child or off Windows.
+#[cfg(windows)]
+pub(crate) fn mark_abort_here() {
+    if in_child() {
+        flush_shared_spans();
+        append_here(K_DEATH, SIGABRT_U, b"");
+    }
+}
+
+/// Marks a death with signal `sig` on the calling thread, for Windows's vectored handler. A
+/// no-op outside a child.
+#[cfg(windows)]
+pub(crate) fn mark_signal_here(sig: c_int) {
+    if in_child() {
+        flush_shared_spans();
+        append_here(K_DEATH, sig.cast_unsigned(), b"");
+    }
+}
+
+/// Windows: re-copies every shared span's current bytes into the scratch file, so the parent
+/// reads what the child wrote. On Unix the span is a live `MAP_SHARED` view and needs no flush;
+/// Windows cannot alias the heap region onto the file, so the bytes are copied at share time and
+/// again here, when the death is marked. Best-effort: a copy error leaves the earlier bytes.
+#[cfg(windows)]
+fn flush_shared_spans() {
+    let Some(st) = CHILD.get() else { return };
+    let Some(a) = st.alloc.try_lock() else { return };
+    for &(start, end, off) in &a.spans {
+        let span = end.wrapping_sub(start);
+        let first = std::ptr::with_exposed_provenance::<u8>(start);
+        // SAFETY: `start..end` are the whole pages a `share` recorded, mapped for the life of the
+        // child; the copy reads them and writes them to the file at `off`.
+        let now = unsafe { std::slice::from_raw_parts(first, span) };
+        let _ = write_all_at(&st.file, now, off);
+    }
+}
+
+/// `SIGABRT` as the marker's `aux` (an abort is signal 6 on every platform the harness reports).
+#[cfg(windows)]
+const SIGABRT_U: u32 = 6;
+
+/// The signal a dead child's exit status names, as the Unix `ExitStatus::signal`. On Unix it is
+/// the delivering signal; on Windows a faulted or aborted process exits with its exception code,
+/// which maps back to the harness's pinned signal numbers ([`signal_of_exit`]). A clean exit
+/// (0, a test failure's 101, [`HANG_EXIT`]) is `None` on both.
+fn signal_of_status(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        status.signal()
+    }
+    #[cfg(windows)]
+    {
+        status.code().and_then(signal_of_exit)
+    }
+}
+
+/// Windows: the harness signal a faulted/aborted child's exit code maps to, or `None` for a code
+/// that is a clean exit or a test's own failure. The abort/fast-fail family and a stack overflow
+/// (which ends in std's abort) are `SIGABRT` (6); a breakpoint is `SIGTRAP` (5); an access
+/// violation is `SIGSEGV` (11); an illegal instruction is `SIGILL` (4). Measured on this host in
+/// the `windows.rs` probe. Clean exits — 0, libtest's 101, and [`HANG_EXIT`] — are not deaths.
+#[cfg(windows)]
+fn signal_of_exit(code: i32) -> Option<i32> {
+    if code == 0 || code == 101 || code == HANG_EXIT {
+        return None;
+    }
+    let c = code.cast_unsigned();
+    match c {
+        0xC000_0005 | 0xC000_0006 => Some(11), // access violation / in-page error
+        0x8000_0003 | 0x8000_0004 => Some(5),  // breakpoint / single step
+        0xC000_001D | 0xC000_0096 => Some(4),  // illegal / privileged instruction
+        // abort / __fastfail / stack-buffer-overrun / stack overflow (ends in abort) / fail-fast
+        0xC000_0409 | 0xC000_00FD | 0xC000_0602 | 0x4000_0015 => Some(6),
+        // Any other abnormal (high-bit NTSTATUS) termination is reported as an abort.
+        _ if c & 0xC000_0000 == 0xC000_0000 || c & 0x8000_0000 != 0 => Some(6),
+        _ => None,
+    }
+}
+
+/// Windows: a bare `std::process::abort()` leaves no marker (abort is unobservable from inside
+/// the process), so when a child died of a fault/abort and recorded no death marker, the parent
+/// appends one. If a test thread was active (`H_ACTIVE_TID`), the marker is attributed to it;
+/// otherwise it is attributed to the body thread, as the Unix signal handler would have written.
+/// Returns the record to append, or `None` when a marker already exists.
+#[cfg(windows)]
+fn synthesise_abort_marker(
+    head: &[u8],
+    records: &[Record],
+    body_tid: u64,
+    signal: i32,
+) -> Option<Record> {
+    if records
+        .iter()
+        .any(|r| matches!(r.kind, RecordKind::Death(_)))
+    {
+        return None;
+    }
+    let active_tid = ne_u64(head, H_ACTIVE_TID);
+    let (tid, name, body) = if active_tid != 0 {
+        let len = (ne_u32(head, H_ACTIVE_NAME_LEN) as usize).min(12);
+        let name = text(head, H_ACTIVE_NAME, len);
+        (active_tid, name, active_tid == body_tid)
+    } else {
+        (body_tid, String::new(), true)
+    };
+    Some(Record {
+        kind: RecordKind::Death(signal),
+        text: String::new(),
+        thread: ThreadTag {
+            tid,
+            name,
+            body,
+        },
+    })
+}
 
 // ---------------------------------------------------------------------------------------------
 // The child.
@@ -253,8 +450,10 @@ pub fn trace(op: &str) {
 
 /// The actions the harness's handler replaced, by signal: the handler (`SIG_DFL` is 0) and its
 /// flags. Stored before the handler is installed; the handler only reads them.
+#[cfg(unix)]
 static PREV_HANDLER: [AtomicUsize; sys::NSIG] =
     [const { AtomicUsize::new(sys::SIG_DFL) }; sys::NSIG];
+#[cfg(unix)]
 static PREV_FLAGS: [AtomicU32; sys::NSIG] = [const { AtomicU32::new(0) }; sys::NSIG];
 
 /// The handler for the signals that end a child: it marks the death on the dying thread and
@@ -267,6 +466,7 @@ static PREV_FLAGS: [AtomicU32; sys::NSIG] = [const { AtomicU32::new(0) }; sys::N
 ///   overflow and aborts, so the death is marked by the `SIGABRT` it raises; for any other fault
 ///   it restores the default action and returns. If it returns, the handler appends the marker
 ///   and returns, and the faulting instruction runs again and ends the process.
+#[cfg(unix)]
 extern "C" fn on_fatal_signal(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
     let i = usize::try_from(sig).unwrap_or(0);
     let prev = PREV_HANDLER
@@ -296,6 +496,7 @@ extern "C" fn on_fatal_signal(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
 
 /// Sets `sig`'s action to `handler` (on the alternate stack, with `flags`), and returns the
 /// action it replaced.
+#[cfg(unix)]
 fn set_action(sig: c_int, handler: sys::Handler, flags: c_int) -> Option<sys::SigAction> {
     let act = sys::SigAction::new(handler, flags | sys::SA_ONSTACK);
     let mut old = sys::SigAction::new(sys::Handler { raw: sys::SIG_DFL }, 0);
@@ -306,6 +507,7 @@ fn set_action(sig: c_int, handler: sys::Handler, flags: c_int) -> Option<sys::Si
 
 /// Installs [`on_fatal_signal`] for `sig`, keeping the action it replaces for the handler to
 /// chain to. A signal the process ignores is left ignored.
+#[cfg(unix)]
 fn arm(sig: c_int) {
     let mut cur = sys::SigAction::new(sys::Handler { raw: sys::SIG_DFL }, 0);
     // SAFETY: a query: `act` is null and `old` is a live `struct sigaction`.
@@ -329,6 +531,14 @@ fn arm(sig: c_int) {
         },
         sys::SA_SIGINFO,
     );
+}
+
+/// Windows has no per-signal action: the one vectored exception handler marks every fault, so
+/// each `arm(sig)` the shared `enter` makes installs it once. The marker's signal comes from the
+/// fault's exception code inside the handler, not from `sig`.
+#[cfg(windows)]
+fn arm(_sig: c_int) {
+    sys::arm_vectored();
 }
 
 fn page_size() -> usize {
@@ -359,17 +569,21 @@ pub fn enter() -> Child {
         Err(e) => panic!("death harness: cannot open {}: {e}", path.display()),
     };
     // SAFETY: a fresh shared mapping of the file's first `RAM_OFF` bytes (the parent sized the
-    // file), at an address the kernel picks. It is never unmapped.
+    // file), at an address the OS picks. It is never unmapped.
+    #[cfg(unix)]
     let p = unsafe {
         sys::mmap(
             std::ptr::null_mut(),
             RAM_OFF,
             sys::PROT_READ | sys::PROT_WRITE,
             sys::MAP_SHARED,
-            file.as_raw_fd(),
+            raw_backing(&file),
             0,
         )
     };
+    // SAFETY: `file` is open and writable; a shared view of its first `RAM_OFF` bytes.
+    #[cfg(windows)]
+    let p = unsafe { sys::map_shared(raw_backing(&file), RAM_OFF, 0) };
     if p.addr() == usize::MAX || p.is_null() {
         panic!("death harness: cannot map {}", path.display());
     }
@@ -506,24 +720,32 @@ impl Child {
             // the copy keeps the bytes of any neighbouring allocation in those pages too, which
             // the remap below must not lose.
             let now = unsafe { std::slice::from_raw_parts(first, span) };
-            if let Err(e) = st.file.write_all_at(now, off) {
+            if let Err(e) = write_all_at(&st.file, now, off) {
                 panic!("death harness: cannot copy the region: {e}");
             }
             // SAFETY: replaces those same pages, at the same address, with a shared mapping of
             // the copy; every pointer into them stays valid and sees the same bytes.
-            let p = unsafe {
-                sys::mmap(
-                    std::ptr::with_exposed_provenance_mut::<c_void>(start),
-                    span,
-                    sys::PROT_READ | sys::PROT_WRITE,
-                    sys::MAP_SHARED | sys::MAP_FIXED,
-                    st.file.as_raw_fd(),
-                    off.cast_signed(),
-                )
-            };
-            if p.addr() != start {
-                panic!("death harness: cannot remap {start:#x}+{span:#x}");
+            #[cfg(unix)]
+            {
+                let p = unsafe {
+                    sys::mmap(
+                        std::ptr::with_exposed_provenance_mut::<c_void>(start),
+                        span,
+                        sys::PROT_READ | sys::PROT_WRITE,
+                        sys::MAP_SHARED | sys::MAP_FIXED,
+                        raw_backing(&st.file),
+                        off.cast_signed(),
+                    )
+                };
+                if p.addr() != start {
+                    panic!("death harness: cannot remap {start:#x}+{span:#x}");
+                }
             }
+            // Windows has no `mmap(MAP_FIXED)`, and the region is heap memory (`alloc_zeroed`,
+            // not a `VirtualAlloc` reservation), so it cannot be aliased onto the file in place.
+            // The bytes are copied here and re-copied when the death is marked
+            // ([`flush_shared_spans`]), so the parent still sees what the child wrote. The span
+            // is recorded below for that flush.
             a.spans.push((start, end, off));
             off
         };
@@ -1026,7 +1248,7 @@ impl Report {
 
     fn read_at(&self, off: u64, len: u64) -> Option<Vec<u8>> {
         let mut v = vec![0u8; usize::try_from(len).ok()?];
-        self.file.read_exact_at(&mut v, off).ok()?;
+        read_exact_at(&self.file, &mut v, off).ok()?;
         Some(v)
     }
 
@@ -1123,6 +1345,7 @@ pub fn parse_abort_lines(out: &str) -> Vec<String> {
             }) || l.contains("fatal runtime error: ")
                 || l.contains("panic. aborting.")
                 || (l.contains("memory allocation of ") && l.contains(" failed"))
+                || l.contains("overflowed its stack")
         })
         .map(str::to_owned)
         .collect()
@@ -1238,7 +1461,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
         .unwrap_or_else(|e| fail("cannot create the scratch file", e));
     if let Err(e) = file
         .set_len(RAM_OFF.to_u64())
-        .and_then(|()| file.write_all_at(&MAGIC.to_ne_bytes(), 0))
+        .and_then(|()| write_all_at(&file, &MAGIC.to_ne_bytes(), 0))
     {
         fail("cannot size the scratch file", e)
     }
@@ -1277,7 +1500,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
     let _ = std::fs::remove_file(&path);
 
     let mut head = vec![0u8; TRACE_OFF];
-    if let Err(e) = file.read_exact_at(&mut head, 0) {
+    if let Err(e) = read_exact_at(&file, &mut head, 0) {
         fail("cannot read the header", e)
     }
     let state = ne_u32(&head, H_STATE);
@@ -1287,7 +1510,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
         .min(SLOTS)
         .saturating_mul(SLOT);
     let mut t = vec![0u8; used];
-    if let Err(e) = file.read_exact_at(&mut t, TRACE_OFF.to_u64()) {
+    if let Err(e) = read_exact_at(&file, &mut t, TRACE_OFF.to_u64()) {
         fail("cannot read the trace", e)
     }
     let Trace {
@@ -1295,6 +1518,20 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
         torn,
         truncated,
     } = parse_trace(&t, body_tid);
+    // Windows: a bare `std::process::abort()` on the body thread leaves no marker (abort is
+    // unobservable in-process). When the child died of a fault/abort and recorded no death
+    // marker, append one for the body thread, as the Unix signal handler would have written —
+    // after the body's own ops, so `Died.op` is the op that preceded the abort.
+    #[cfg(windows)]
+    let records = {
+        let mut records = records;
+        if let Some(signal) = signal_of_status(&status) {
+            if let Some(m) = synthesise_abort_marker(&head, &records, body_tid, signal) {
+                records.push(m);
+            }
+        }
+        records
+    };
     let dir = (0..ne_u32(&head, H_DIR_COUNT).to_usize().min(DIR_MAX))
         .map(|i| {
             let e = DIR_OFF.saturating_add(i.saturating_mul(DIR_ENTRY));
@@ -1325,7 +1562,7 @@ pub fn spawn_command(mut cmd: Command, label: &str, opts: Options) -> Report {
     };
     let outcome = if timed_out {
         Outcome::TimedOut
-    } else if let Some(signal) = status.signal() {
+    } else if let Some(signal) = signal_of_status(&status) {
         let marker = records
             .iter()
             .enumerate()
@@ -1510,10 +1747,49 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    struct TestThreadGuard;
+
+    #[cfg(windows)]
+    impl TestThreadGuard {
+        fn enter(name: &str) -> Self {
+            let base = SHARED.load(Ordering::Acquire);
+            if !base.is_null() {
+                let tid = sys::current_thread_id();
+                header_u64(base, H_ACTIVE_TID).store(tid, Ordering::Release);
+                let bytes = name.as_bytes();
+                let len = bytes.len().min(12);
+                header_u32(base, H_ACTIVE_NAME_LEN).store(len as u32, Ordering::Release);
+                unsafe {
+                    let dst = base.wrapping_add(H_ACTIVE_NAME);
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
+                }
+            }
+            TestThreadGuard
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestThreadGuard {
+        fn drop(&mut self) {
+            let base = SHARED.load(Ordering::Acquire);
+            if !base.is_null() {
+                header_u64(base, H_ACTIVE_TID).store(0, Ordering::Release);
+                header_u32(base, H_ACTIVE_NAME_LEN).store(0, Ordering::Release);
+            }
+        }
+    }
+
     fn named(name: &str, f: impl FnOnce() + Send + 'static) {
+        #[cfg(windows)]
+        let name_owned = name.to_owned();
         let _ = std::thread::Builder::new()
             .name(name.into())
-            .spawn(f)
+            .spawn(move || {
+                #[cfg(windows)]
+                let _guard = TestThreadGuard::enter(&name_owned);
+                f()
+            })
             .unwrap();
     }
 
@@ -2063,7 +2339,7 @@ mod tests {
             .output()
             .unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.signal(), Some(6), "{err}");
+        assert_eq!(signal_of_status(&out.status), Some(6), "{err}");
         assert!(err.contains("overflowed its stack"), "{err}");
     }
 
@@ -2086,7 +2362,8 @@ mod tests {
             assert!(!d.raced, "{d:?}");
             assert_eq!(d.abort_lines.len(), 1, "{d:?}");
             assert!(
-                d.abort_lines[0].contains("fatal runtime error: stack overflow"),
+                d.abort_lines[0].contains("fatal runtime error: stack overflow")
+                    || (cfg!(windows) && d.abort_lines[0].contains("overflowed its stack")),
                 "{d:?}"
             );
         }

@@ -15,12 +15,20 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::FrameSink;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     Surface, close, cursor_changed, guest_mode_changed, host_screens, open, sdl as sdl_os,
+};
+#[cfg(target_os = "windows")]
+pub use windows::FrameSink;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{
+    Surface, close, cursor_changed, guest_mode_changed, host_screens, open,
 };
 #[cfg(target_os = "macos")]
 pub use macos::FrameSink;

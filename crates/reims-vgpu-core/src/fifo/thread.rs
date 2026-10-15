@@ -55,6 +55,7 @@ impl<P: Platform> Fifo<P> {
         // woken, sees the FIFO unquiesced and runs on. A child's new thread starts from the
         // node's read count while the FIFO's stays where the old thread left it. A root's new
         // thread reads on from the shared cursors.
+        log::info!("FIFO channel {}: thread spawning (is_root={})", self.stamp_index(), self.is_root_fifo());
         let me = Arc::clone(self);
         spawn_named(
             self.platform.threads(),

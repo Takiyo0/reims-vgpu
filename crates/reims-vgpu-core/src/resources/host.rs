@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::deserializer::Deserializer;
+use crate::guest::GuestPtr;
 use crate::guest::records::FeaturesRef;
 use crate::host::HostPtr;
 use crate::memory::cursor::{Cursor, WritableCursor};
@@ -204,6 +205,22 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<MappedAddress<P>>;
+
+    /// Resolves the host virtual address for each guest virtual page in offset..offset + length.
+    /// Answers None if pages could not be walked or are not in the guest memory map.
+    fn resolve_virtual_pages(
+        &self,
+        _hold: Hold<'_>,
+        _offset: u64,
+        _length: u64,
+    ) -> RaiseResult<Option<Vec<GuestPtr>>> {
+        Ok(None)
+    }
+
+    /// The guest memory map, if available.
+    fn memory_map(&self) -> Option<Arc<crate::memory::map::MemoryMap<P>>> {
+        None
+    }
 }
 
 /// A host address into task memory and the mapping that backs it: the address is valid while

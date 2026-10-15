@@ -224,6 +224,8 @@ pub struct RenderPipelineDesc<'a, P: Platform> {
     pub color0_pixel_format: u64,
     /// `setResourceIndex:` then `setForceResourceIndex:` (SPI), when set.
     pub resource_index: Option<(u64, bool)>,
+    /// Whether source-over alpha blending is enabled on color attachment 0.
+    pub blend_source_over: bool,
 }
 
 impl<P: Platform> fmt::Debug for RenderPipelineDesc<'_, P> {
@@ -234,6 +236,7 @@ impl<P: Platform> fmt::Debug for RenderPipelineDesc<'_, P> {
             .field("fragment", &self.fragment.id())
             .field("color0_pixel_format", &self.color0_pixel_format)
             .field("resource_index", &self.resource_index)
+            .field("blend_source_over", &self.blend_source_over)
             .finish()
     }
 }
@@ -678,6 +681,7 @@ mod tests {
                 fragment: &f,
                 color0_pixel_format: 80,
                 resource_index: Some((12, true)),
+                blend_source_over: false,
             })
             .unwrap()
             .unwrap();

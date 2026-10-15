@@ -289,6 +289,10 @@ pub trait ResourceClass<P: Platform>: Send + Sync {
     fn evict_with_cpu(&self, this: &Resource<P>) -> RaiseResult<()> {
         this.unrecognized(Op::EvictCpu)
     }
+    /// Flushes any modified host transfer buffer contents back to guest memory (e.g. for discontiguous WHPX allocations).
+    fn flush_to_guest(&self, this: &Resource<P>) {
+        let _ = this;
+    }
 }
 
 /// The kind's answers.
@@ -470,6 +474,10 @@ impl<P: Platform> Resource<P> {
     /// Writes back on the CPU before an eviction.
     pub fn evict_with_cpu(&self) -> RaiseResult<()> {
         self.class().evict_with_cpu(self)
+    }
+    /// Flushes any modified host transfer buffer contents back to guest memory.
+    pub fn flush_to_guest(&self) {
+        self.class().flush_to_guest(self);
     }
     /// Whether this is an IOSurface backing (the tasks' test before a backing's operations).
     pub fn is_backing(&self) -> bool {

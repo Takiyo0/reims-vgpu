@@ -246,8 +246,23 @@ impl<P: Platform> Fifo<P> {
     pub(crate) fn dispatch(self: &Arc<Self>, header: &FifoCommand, payload: &[u8]) {
         let payload = Payload::new(payload);
         let Some(op) = Opcode::from_id(header.command_id) else {
+            log::warn!(
+                "FIFO channel {}: unknown command_id={} len={} stamp={}",
+                self.stamp_index(),
+                header.command_id,
+                header.length,
+                header.stamp_value
+            );
             return misc::invalid(self, header, payload);
         };
+        log::info!(
+            "FIFO channel {}: dispatch command_id={} ({:?}) len={} stamp={}",
+            self.stamp_index(),
+            header.command_id,
+            op,
+            header.length,
+            header.stamp_value
+        );
         match op.handler::<P>() {
             // One pool and one holder per command: the holder releases what it holds, then the
             // pool pops.

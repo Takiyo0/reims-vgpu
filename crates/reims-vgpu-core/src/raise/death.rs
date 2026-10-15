@@ -268,6 +268,12 @@ pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     use std::io::Write as _;
     // One write, so the line never interleaves with another thread's.
     let _ = std::io::stderr().write_all(line.as_bytes());
+    // Windows has no signal handler to mark this abort (`std::process::abort` ends through
+    // `__fastfail`, which no in-process handler sees), so the one fatal path marks the death in
+    // the subprocess harness's trace itself before it aborts. A no-op outside a harness child
+    // and on every other platform.
+    #[cfg(all(windows, any(test, feature = "testkit")))]
+    crate::testkit::death::mark_abort_here();
     #[allow(clippy::disallowed_methods)] // the one fatal path's abort (6.4)
     std::process::abort()
 }

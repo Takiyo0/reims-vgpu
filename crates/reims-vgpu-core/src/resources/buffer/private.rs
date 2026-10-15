@@ -179,6 +179,14 @@ impl<P: Platform> ResourceClass<P> for PrivateBufferResource<P> {
             log::warn!("preparing a private buffer whose guest copy is not valid");
         }
         self.ensure_physical(hold)?;
+        if let Some(tb) = self.transfer_buffer.lock().as_ref() {
+            if let Some(t) = self.task.upgrade() {
+                if let Some(map) = t.memory_map() {
+                    use crate::platform::resource::Buffer as _;
+                    map.sync_range_from_guest(tb.contents(), tb.length());
+                }
+            }
+        }
         self.copy(encoder, true)?;
         // Encoded, not completed.
         this.state.set_host_valid(true);
@@ -213,6 +221,17 @@ impl<P: Platform> ResourceClass<P> for PrivateBufferResource<P> {
             .as_ref()
             .map_or(Ok(0), |b| b.set_purgeable_state(PURGEABLE_VOLATILE))?;
         Ok(())
+    }
+
+    fn flush_to_guest(&self, _this: &Resource<P>) {
+        if let Some(transfer_buffer) = self.transfer_buffer.lock().as_ref() {
+            if let Some(t) = self.task.upgrade() {
+                if let Some(map) = t.memory_map() {
+                    use crate::platform::resource::Buffer as _;
+                    map.sync_range_to_guest(transfer_buffer.contents(), transfer_buffer.length());
+                }
+            }
+        }
     }
 }
 

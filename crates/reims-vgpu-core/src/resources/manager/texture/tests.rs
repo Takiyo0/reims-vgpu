@@ -1233,6 +1233,17 @@ fn mapper_ref() {
     ]));
     let c = e.calls("newTextureWithDescriptor:iosurface:plane:");
     assert_eq!(c[0].args[1..], [Arg::Obj(Some(sf.id())), Arg::U64(0)]);
+    let c = e.calls("new_mapper_ref_texture_resource");
+    use crate::num::ToU64 as _;
+    assert_eq!(
+        c[0].args,
+        vec![
+            Arg::U64(0x33),
+            Arg::Obj(Some(r.texture.as_ref().unwrap().id())),
+            Arg::U64(sf.base_address().addr().to_u64()),
+            Arg::U64(sf.alloc_size()),
+        ]
+    );
     assert_eq!(e.calls("release_io_surface_with_mapping_id").len(), 0);
 }
 
@@ -1783,6 +1794,7 @@ fn backing_ref() {
     ));
     assert_eq!(r.class, "new_ref_texture_resource");
     assert_eq!(r.object_type, 5);
+    assert_eq!(r.plane, 0);
     assert_eq!(r.backing.as_ref().unwrap().class, "backing");
     assert!(e.p.call_log().contains_in_order(&[
         "backingForID:",

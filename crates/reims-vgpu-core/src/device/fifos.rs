@@ -140,12 +140,16 @@ impl<P: Platform> DeviceCore<P> {
                 info.next_waiting_index.load(Ordering::Relaxed) == NOT_WAITING,
                 DeviceDeath::CreateWhileWaiting
             );
+            log::info!("FIFO create_fifo: requested child slot {}", fifo_id);
             if d.create_fifo_internal(fifo_id, false) {
                 // Its result is ignored.
                 if let Some(child) = d.child_slot(fifo_id) {
-                    let _ = child.start(&d.platform);
+                    let started = child.start(&d.platform);
+                    log::info!("FIFO create_fifo: child slot {} start result={}", fifo_id, started);
                 }
                 return true;
+            } else {
+                log::warn!("FIFO create_fifo: create_fifo_internal returned false for slot {}", fifo_id);
             }
             false
         });
@@ -344,13 +348,20 @@ impl<P: Platform> DeviceCore<P> {
     /// Pokes child `fifo` on the FIFO queue, if there is one. The check is against the 64
     /// slots, not `maxFIFOCount`.
     pub fn wake_fifo(&self, fifo: u32) {
+        log::info!("FIFO wake_fifo: waking child slot {}", fifo);
         if fifo == 0 || fifo >= CHILD_FIFO_SLOTS {
             log::warn!("wake of FIFO {fifo} dropped: no such child slot");
             return;
         }
         self.on_fifo_queue(move |d| {
             if let Some(child) = d.child_slot(fifo) {
+                if !child.is_running() {
+                    let started = child.start(&d.platform);
+                    log::info!("FIFO wake_fifo: child slot {} was not running, start result={}", fifo, started);
+                }
                 child.poke();
+            } else {
+                log::warn!("wake of FIFO {fifo} dropped: slot is empty");
             }
         });
     }

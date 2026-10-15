@@ -341,6 +341,35 @@ impl<P: Platform> SinkDisplay<P> {
         }
         true
     }
+
+    /// DIAG(clear-test): draws a single clear pass of `color` (no guest frame) into the window
+    /// frame's texture, in a new command buffer, then signals and commits exactly as
+    /// [`SinkDisplay::encode`] does — the window present bypass of advisor experiment 3. `true`
+    /// once committed; `false` with nothing committed on the same conditions as `encode`.
+    pub(crate) fn clear_test(
+        &self,
+        color: reims_vgpu_core::platform::types::ClearColor,
+        mut frame: impl WindowFrame<P>,
+    ) -> bool {
+        entry::run(|_| {
+            let Some(display) = self.display.upgrade() else {
+                return false;
+            };
+            let Some(command_buffer) = no_catch(self.queue.command_buffer(OnFault::Die)) else {
+                return false;
+            };
+            let Some(texture) = frame.texture() else {
+                return false;
+            };
+            if !no_catch(display.clear_test_frame(&command_buffer, texture, color)) {
+                return false;
+            }
+            frame.encoded(&command_buffer);
+            no_catch(command_buffer.commit(OnFault::Die));
+            drop(display);
+            true
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]

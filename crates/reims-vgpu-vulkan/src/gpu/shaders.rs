@@ -120,8 +120,8 @@ mod tests {
         let committed = std::fs::read_to_string(dir.join("metallibs.toml"))
             .unwrap_or_else(|e| panic!("{}: {e}: {mend}", dir.display()));
         assert_eq!(
-            committed,
-            tree,
+            committed.replace("\r\n", "\n"),
+            tree.replace("\r\n", "\n"),
             "{}'s record is not this tree's: {mend}",
             dir.display()
         );

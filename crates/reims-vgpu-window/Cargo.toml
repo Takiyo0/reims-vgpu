@@ -19,6 +19,21 @@ ash.workspace = true
 reims-vgpu-vulkan.workspace = true
 sdl3-sys.workspace = true
 
+# The window on Windows (`native/windows.rs`): raw Win32 for the window, its message loop, input
+# and monitors, and `VK_KHR_win32_surface` for its Vulkan surface, on the Vulkan crate's device.
+# No SDL. windows-sys needs a superset of the workspace features (UI/HiDPI/GDI/keyboard), so it is
+# declared here with its own feature set rather than `.workspace = true`.
+[target.'cfg(target_os = "windows")'.dependencies]
+reims-vgpu-vulkan.workspace = true
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [features]
 default = ["macos-sdl"]
 # SDL's library left unbuilt and unlinked: for a check of the Linux target on another OS, which

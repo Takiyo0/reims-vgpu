@@ -68,6 +68,18 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
 mach2 = "0.7"
 libc = "0.2.180"
+# The Vulkan platform's OS services on Windows (reims-vgpu-vulkan/src/os/windows): Win32 memory
+# (VirtualAlloc2/MapViewOfFile3 placeholders, section objects), VirtualProtect, QPC clocks and
+# threads, in place of Linux's mmap/memfd/mprotect/CLOCK_BOOTTIME.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_IO",
+    "Win32_Security",
+] }
 # dev and tooling
 proptest = "1.7"
 loom = "0.7"
@@ -106,3 +118,24 @@ debug-assertions = true
 # suite's `checked` pass leaves them off, and release has none at all (D36).
 [profile.checked.package.objc2]
 debug-assertions = false
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY LOCAL PATCH (review/remove before merge) --------------------------
+# Redirects the pinned metal2vulkan git revision
+# (13b279df1bf87893d389f955a90c55b6ff3d0f9b) to a LOCAL working copy that ports
+# `host_memory::host_page()` to Windows (GetSystemInfo().dwPageSize). Without it,
+# the runtime returns None from host_page() on Windows and every
+# VK_EXT_external_memory_host import aborts Unsupported(HostMemory,NotImplemented),
+# which blocks the Windows guest-RAM bridge.
+#
+# The local copy is a verbatim copy of the cached pinned source with that one
+# change plus a windows-sys target dependency; see
+# C:\Users\takiyo\Documents\macos\dev\metal2vulkan-local. To drop this patch,
+# delete this whole block (and revert the Cargo.lock entries it introduces).
+# All three crates of that workspace are overridden together, since the main repo
+# pins all three to the same git revision.
+[patch."https://github.com/steelbrain/metal2vulkan"]
+metal2vulkan = { path = "../metal2vulkan-local/crates/metal2vulkan" }
+metal2vulkan-air = { path = "../metal2vulkan-local/crates/metal2vulkan-air" }
+metal2vulkan-runtime = { path = "../metal2vulkan-local/crates/metal2vulkan-runtime" }

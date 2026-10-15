@@ -132,6 +132,47 @@ impl<P: Platform> GpuTask<P> {
             .and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
     }
 
+    /// Resolves the host virtual address for each guest virtual page in `offset..offset + length`.
+    pub(super) fn resolve_pages(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<Option<Vec<crate::guest::GuestPtr>>> {
+        Self::check_task_range(offset, length, self.task_length())?;
+        if self.task_root_ptr().is_none() {
+            return Ok(None);
+        }
+        let Some(walker) = self.walker() else {
+            return Ok(None);
+        };
+        let Some(map) = self.map() else {
+            return Ok(None);
+        };
+        let mut pages = Vec::new();
+        let mut ok = true;
+        walker.visit_pages_in_range(
+            hold,
+            OnFault::Return,
+            offset,
+            length,
+            &mut |_address, page, _writable| {
+                let physical = u64::from(page).wrapping_shl(APV_PAGE_SHIFT);
+                let host_va = map.virtual_address_for_physical(physical, PAGE);
+                if host_va.is_null() {
+                    ok = false;
+                    return Ok(false);
+                }
+                pages.push(crate::guest::GuestPtr::new(host_va));
+                Ok(true)
+            },
+        )?;
+        if !ok {
+            return Ok(None);
+        }
+        Ok(Some(pages))
+    }
+
     /// The host address of task offset `offset`, through a mapping of the pages
     /// `offset..offset + length` covers, which comes back with it: the caller holds it while it
     /// uses the address. No range check of its own.

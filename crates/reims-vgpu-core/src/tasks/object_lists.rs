@@ -56,6 +56,8 @@ struct List<P: Platform> {
     mapping: Option<Arc<Mapping<P>>>,
     /// Where the list is in the host; NULL while unmapped.
     address: GuestPtr,
+    /// Resolved physical pages when contiguous host mapping is unavailable (WHPX discontiguous).
+    pages: Vec<GuestPtr>,
     /// Its offset in the task.
     offset: u64,
     /// Its length in bytes.
@@ -69,6 +71,7 @@ impl<P: Platform> List<P> {
         List {
             mapping: None,
             address: GuestPtr::default(),
+            pages: Vec::new(),
             offset: 0,
             length: 0,
             mapped_length: 0,
@@ -79,21 +82,26 @@ impl<P: Platform> List<P> {
     fn unmap(&mut self) -> Option<Arc<Mapping<P>>> {
         let released = self.mapping.take();
         self.address = GuestPtr::default();
+        self.pages.clear();
         released
     }
 
     /// Takes `mapping` as the list's host mapping: its address, if there is one (a nil mapping
     /// leaves the address as it was). Answers the previous mapping, for the caller to drop
     /// outside the leaf lock, and whether there was a mapping.
-    fn adopt(&mut self, mapping: Option<Arc<Mapping<P>>>) -> (Option<Arc<Mapping<P>>>, bool) {
+    fn adopt(&mut self, mapping: Option<Arc<Mapping<P>>>, pages: Vec<GuestPtr>) -> (Option<Arc<Mapping<P>>>, bool) {
         let address = mapping.as_ref().map(|m| GuestPtr::new(m.virtual_address()));
         let previous = std::mem::replace(&mut self.mapping, mapping);
-        let mapped = match address {
-            Some(a) => {
-                self.address = a;
-                true
-            }
-            None => false,
+        let mapped = if !pages.is_empty() {
+            self.address = GuestPtr::default();
+            self.pages = pages;
+            true
+        } else if let Some(a) = address {
+            self.address = a;
+            self.pages.clear();
+            true
+        } else {
+            false
         };
         (previous, mapped)
     }
@@ -116,14 +124,14 @@ impl<P: Platform> Lists<P> {
     fn object_list_mapped(&self) -> bool {
         match self.kind {
             ObjectListKind::Legacy { object_list_mapped } => object_list_mapped,
-            ObjectListKind::MemoryMap => !self.objects.address.is_null(),
+            ObjectListKind::MemoryMap => !self.objects.address.is_null() || !self.objects.pages.is_empty(),
         }
     }
 
     fn placement_list_mapped(&self) -> bool {
         match self.kind {
             ObjectListKind::Legacy { .. } => false,
-            ObjectListKind::MemoryMap => !self.placements.address.is_null(),
+            ObjectListKind::MemoryMap => !self.placements.address.is_null() || !self.placements.pages.is_empty(),
         }
     }
 
@@ -172,6 +180,34 @@ fn load_object_entry(entry: GuestPtr) -> ObjectEntry {
         type_and_length: low.low_u32(),
         offset: u64::from(high).wrapping_shl(32) | low.wrapping_shr(32),
     }
+}
+
+fn load_object_entry_from_pages(pages: &[GuestPtr], at: u64) -> ObjectEntry {
+    let page_idx = (at / APV_PAGE_SIZE) as usize;
+    let page_off = at % APV_PAGE_SIZE;
+    if page_off.wrapping_add(u64::from(OBJECT_ENTRY_SIZE)) <= APV_PAGE_SIZE {
+        if let Some(&page_ptr) = pages.get(page_idx) {
+            return load_object_entry(page_ptr.offset(page_off));
+        }
+    } else if let (Some(&page0), Some(&page1)) = (pages.get(page_idx), pages.get(page_idx + 1)) {
+        let high = if page_off + 8 < APV_PAGE_SIZE {
+            page0.read_u32(page_off + 8, DeathKind::UnmappedEntry)
+        } else {
+            page1.read_u32(page_off + 8 - APV_PAGE_SIZE, DeathKind::UnmappedEntry)
+        };
+        let low = if page_off + 8 <= APV_PAGE_SIZE {
+            page0.read_u64(page_off, DeathKind::UnmappedEntry)
+        } else {
+            let lo = page0.read_u32(page_off, DeathKind::UnmappedEntry);
+            let hi = page1.read_u32(0, DeathKind::UnmappedEntry);
+            u64::from(hi).wrapping_shl(32) | u64::from(lo)
+        };
+        return ObjectEntry {
+            type_and_length: low.low_u32(),
+            offset: u64::from(high).wrapping_shl(32) | low.wrapping_shr(32),
+        };
+    }
+    crate::fatal!(DeathKind::UnmappedEntry)
 }
 
 /// A list's mapped length: its end rounded up to a page, less its offset, in wrapping `u64`.
@@ -230,6 +266,20 @@ impl<P: Platform> ObjectLists<P> {
     /// A mapping of `length` bytes of the task at `offset` for a list: the memory-map kind's
     /// through the task, a raise swallowed as nil (no log); the legacy kind never has one.
     /// Called without the leaf lock.
+    fn resolve_pages(&self, hold: Hold<'_>, offset: u64, length: u64) -> Vec<GuestPtr> {
+        match self.task.upgrade() {
+            Some(task) => match task.resolve_virtual_pages(hold, offset, length) {
+                Ok(Some(pages)) => pages,
+                Ok(None) => Vec::new(),
+                Err(raised) => {
+                    hold.land(raised);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }
+    }
+
     fn new_mapping(
         &self,
         hold: Hold<'_>,
@@ -281,6 +331,9 @@ impl<P: Platform> ObjectLists<P> {
                 return Err(out_of_range(index, st.object_count));
             }
             let at = u64::from(index).wrapping_mul(u64::from(OBJECT_ENTRY_SIZE));
+            if !st.objects.pages.is_empty() {
+                return Ok(load_object_entry_from_pages(&st.objects.pages, at));
+            }
             return Ok(load_object_entry(st.objects.address.offset(at)));
         }
         Err("the object list is not mapped".to_owned())
@@ -296,6 +349,13 @@ impl<P: Platform> ObjectLists<P> {
                 return Err(out_of_range(index, st.object_count));
             }
             let at = u64::from(index).wrapping_mul(OBJECT_PLACEMENT_SIZE);
+            if !st.placements.pages.is_empty() {
+                let page_idx = (at / APV_PAGE_SIZE) as usize;
+                let page_off = at % APV_PAGE_SIZE;
+                if let Some(&page_ptr) = st.placements.pages.get(page_idx) {
+                    return Ok(Some(page_ptr.offset(page_off)));
+                }
+            }
             return Ok(Some(st.placements.address.offset(at)));
         }
         if self.supports_argument_buffers && st.placements.length != 0 {
@@ -412,13 +472,23 @@ impl<P: Platform> ObjectLists<P> {
             }
         }
         if pl_off != 0 && pl_len != 0 {
-            let mapping = self.new_mapping(hold, legacy, pl_off, pl_mapped_len, true);
-            let (previous, _) = self.st().placements.adopt(mapping);
+            let pages = if pl_mapped_len != 0 {
+                self.resolve_pages(hold, pl_off, pl_mapped_len)
+            } else {
+                Vec::new()
+            };
+            let mapping = if pages.is_empty() {
+                self.new_mapping(hold, legacy, pl_off, pl_mapped_len, true)
+            } else {
+                None
+            };
+            let (previous, _) = self.st().placements.adopt(mapping, pages);
             drop(previous);
         }
         let new_pl_address = self.st().placements.address;
+        let new_pl_has_pages = !self.st().placements.pages.is_empty();
         if (old_pl_len != 0 && old_pl_address.is_null())
-            || (new_pl_len != 0 && old_pl_len != 0 && new_pl_address.is_null())
+            || (new_pl_len != 0 && old_pl_len != 0 && new_pl_address.is_null() && !new_pl_has_pages)
         {
             log::warn!("object lists refused: the placement list to copy is not mapped");
             // All four root fields are zeroed here, whatever the flag; the members keep the new
@@ -508,16 +578,32 @@ impl<P: Platform> ObjectLists<P> {
             }
             return mapped;
         }
-        if !st.objects.address.is_null() {
+        if !st.objects.address.is_null() || !st.objects.pages.is_empty() {
             return true;
         }
         let (offset, length) = (st.objects.offset, st.objects.mapped_length);
         drop(st);
-        let mapping = self.new_mapping(hold, false, offset, length, false);
-        let (previous, mapped) = self.st().objects.adopt(mapping);
+        let pages = if length != 0 {
+            self.resolve_pages(hold, offset, length)
+        } else {
+            Vec::new()
+        };
+        let mapping = if pages.is_empty() {
+            self.new_mapping(hold, false, offset, length, false)
+        } else {
+            None
+        };
+        let mut st = self.st();
+        let (previous, mapped) = st.objects.adopt(mapping, pages);
+        drop(st);
         drop(previous);
         if !mapped {
             log::warn!("object list of {length:#x} bytes at {offset:#x} not mapped");
+        } else {
+            log::info!(
+                "object list of {length:#x} bytes at {offset:#x} mapped (pages={})",
+                self.st().objects.pages.len()
+            );
         }
         mapped
     }
@@ -529,16 +615,32 @@ impl<P: Platform> ObjectLists<P> {
         if st.is_legacy() {
             return st.placements.length == 0;
         }
-        if !st.placements.address.is_null() || st.placements.length == 0 {
+        if !st.placements.address.is_null() || !st.placements.pages.is_empty() || st.placements.length == 0 {
             return true;
         }
         let (offset, length) = (st.placements.offset, st.placements.mapped_length);
         drop(st);
-        let mapping = self.new_mapping(hold, false, offset, length, true);
-        let (previous, mapped) = self.st().placements.adopt(mapping);
+        let pages = if length != 0 {
+            self.resolve_pages(hold, offset, length)
+        } else {
+            Vec::new()
+        };
+        let mapping = if pages.is_empty() {
+            self.new_mapping(hold, false, offset, length, true)
+        } else {
+            None
+        };
+        let mut st = self.st();
+        let (previous, mapped) = st.placements.adopt(mapping, pages);
+        drop(st);
         drop(previous);
         if !mapped {
             log::warn!("placement list of {length:#x} bytes at {offset:#x} not mapped");
+        } else {
+            log::info!(
+                "placement list of {length:#x} bytes at {offset:#x} mapped (pages={})",
+                self.st().placements.pages.len()
+            );
         }
         mapped
     }

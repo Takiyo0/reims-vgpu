@@ -906,4 +906,17 @@ impl<P: Platform> ResourceHost<P> for LocalTask<P> {
     ) -> RaiseResult<MappedAddress<P>> {
         self.on_platform(|| self.mapped_address(hold, offset, length, need_writable))
     }
+
+    fn resolve_virtual_pages(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<Option<Vec<crate::guest::GuestPtr>>> {
+        self.on_platform(|| self.resolve_pages(hold, offset, length))
+    }
+
+    fn memory_map(&self) -> Option<Arc<crate::memory::map::MemoryMap<P>>> {
+        self.device.upgrade().and_then(|d| d.memory_map())
+    }
 }

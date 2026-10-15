@@ -2,6 +2,7 @@
 //! textures the deserializer makes ([`SerializerTextureResource`]: views, textures on buffers or
 //! in heaps, memoryless ones), which are never paged.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::platform::{Handle, Platform};
@@ -20,6 +21,12 @@ pub struct RefTextureResource<P: Platform> {
     texture: Option<P::Texture>,
     /// The backing, a backing resource of task 0.
     backing: Arc<Resource<P>>,
+    /// Plane index in the multi-plane backing.
+    plane: u16,
+    /// Whether host texture contains up-to-date contents of the backing plane.
+    host_valid: AtomicBool,
+    /// Generation of the backing when this view was last prepared.
+    last_generation: AtomicU64,
 }
 
 impl<P: Platform> RefTextureResource<P> {
@@ -34,12 +41,16 @@ impl<P: Platform> RefTextureResource<P> {
         object_type: u32,
         texture: P::Texture,
         backing: Arc<Resource<P>>,
+        plane: u16,
     ) -> RaiseResult<Option<Arc<Resource<P>>>> {
         let _ = (task, object_type);
         Ok(Some(Resource::new(ResourceKind::RefTexture(
             RefTextureResource {
                 texture: Some(texture),
                 backing,
+                plane,
+                host_valid: AtomicBool::new(false),
+                last_generation: AtomicU64::new(0),
             },
         ))))
     }
@@ -47,6 +58,11 @@ impl<P: Platform> RefTextureResource<P> {
     /// The backing it holds.
     pub fn backing(&self) -> &Arc<Resource<P>> {
         &self.backing
+    }
+
+    /// Plane index in the backing.
+    pub fn plane(&self) -> u16 {
+        self.plane
     }
 }
 
@@ -60,8 +76,32 @@ impl<P: Platform> ResourceClass<P> for RefTextureResource<P> {
         this: &Resource<P>,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        let _ = this;
-        Held::raising(|held| self.backing.prepare_in_encoder(Hold::of(held), encoder))
+        let was_valid = self.is_host_valid(this);
+        Held::raising(|held| {
+            let hold = Hold::of(held);
+            self.backing.prepare_in_encoder(hold, encoder)?;
+            let backing_gen = if let ResourceKind::Backing(backing) = &self.backing.kind {
+                backing.generation()
+            } else {
+                0
+            };
+            if was_valid && self.last_generation.load(Ordering::SeqCst) == backing_gen {
+                return Ok(());
+            }
+            if let Some(texture) = &self.texture {
+                if let ResourceKind::Backing(backing) = &self.backing.kind {
+                    backing.prepare_plane_in_encoder(
+                        hold,
+                        usize::from(self.plane),
+                        texture,
+                        encoder,
+                    )?;
+                }
+            }
+            self.last_generation.store(backing_gen, Ordering::SeqCst);
+            self.host_valid.store(true, Ordering::SeqCst);
+            Ok(())
+        })
     }
 
     /// The backing's synchronize, as a landing frame of its own, as for the prepare.
@@ -77,17 +117,33 @@ impl<P: Platform> ResourceClass<P> for RefTextureResource<P> {
 
     fn set_is_host_valid(&self, this: &Resource<P>, v: bool) {
         let _ = this;
-        self.backing.set_is_host_valid(v)
+        self.host_valid.store(v, Ordering::SeqCst);
+        if v {
+            if let ResourceKind::Backing(backing) = &self.backing.kind {
+                self.last_generation.store(backing.generation(), Ordering::SeqCst);
+            }
+        } else {
+            self.last_generation.store(0, Ordering::SeqCst);
+        }
+        self.backing.set_is_host_valid(v);
     }
 
     fn set_is_guest_valid(&self, this: &Resource<P>, v: bool) {
         let _ = this;
-        self.backing.set_is_guest_valid(v)
+        self.backing.set_is_guest_valid(v);
     }
 
     fn is_host_valid(&self, this: &Resource<P>) -> bool {
         let _ = this;
-        self.backing.is_host_valid()
+        let backing_valid = self.backing.is_host_valid();
+        if !backing_valid || !self.host_valid.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let ResourceKind::Backing(backing) = &self.backing.kind {
+            self.last_generation.load(Ordering::SeqCst) == backing.generation()
+        } else {
+            true
+        }
     }
 
     fn is_guest_valid(&self, this: &Resource<P>) -> bool {
@@ -123,6 +179,10 @@ impl<P: Platform> ResourceClass<P> for RefTextureResource<P> {
     fn supports_discard(&self, this: &Resource<P>) -> bool {
         let _ = this;
         false
+    }
+
+    fn flush_to_guest(&self, _this: &Resource<P>) {
+        self.backing.flush_to_guest();
     }
 }
 
@@ -279,7 +339,7 @@ mod tests {
         fn make(e: &Env, b: &Arc<Resource<P>>) -> (Arc<Resource<P>>, crate::platform::ObjId) {
             let t: Fk<kind::Texture> = e.p.world().new_obj(Model::None);
             let id = t.id();
-            let r = RefTextureResource::new(Arc::downgrade(&e.host), 5, t, b.clone())
+            let r = RefTextureResource::new(Arc::downgrade(&e.host), 5, t, b.clone(), 0)
                 .unwrap()
                 .unwrap();
             (r, id)
@@ -300,6 +360,7 @@ mod tests {
             let (r, id) = make(&e, &b);
             let x = kind_of(&r);
             assert!(Arc::ptr_eq(x.backing(), &b));
+            assert_eq!(x.plane(), 0);
             assert_eq!(Arc::strong_count(&b), 2);
             assert_eq!(r.get_texture().unwrap().unwrap().id(), id);
             match r.get_resource().unwrap().unwrap() {
@@ -350,28 +411,79 @@ mod tests {
             assert!(!b.state.guest_valid());
         }
 
-        /// Forwarded to the backing
+        /// Forwarded to the backing and prepares the ref texture's plane
         #[test]
         fn prepare_and_synchronize_forward() {
             let e = env();
             let b = backing(&e);
-            let (r, _) = make(&e, &b);
+            let (r, id) = make(&e, &b);
             let enc: Fk<kind::BlitEncoder> = e.p.world().new_obj(Model::None);
             r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
             assert!(b.state.host_valid());
+            assert!(r.is_host_valid());
             let calls = e.p.call_log().calls_on(enc.id());
-            assert_eq!(calls.len(), 1);
+            assert_eq!(calls.len(), 2);
             assert!(calls[0].sel.starts_with("copyFromBuffer:"));
             assert_eq!(
                 calls[0].args[0],
                 Arg::Obj(Some(e.p.world().live("MTLBuffer")[0]))
             );
+            assert!(calls[1].sel.starts_with("copyFromBuffer:"));
+            assert_eq!(
+                calls[1].args[0],
+                Arg::Obj(Some(e.p.world().live("MTLBuffer")[0]))
+            );
+            assert_eq!(calls[1].args[5], Arg::Obj(Some(id)));
+
+            // Redundant prepare does nothing
+            r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert_eq!(e.p.call_log().calls_on(enc.id()).len(), 2);
+
             b.state.set_guest_valid(false);
             r.synchronize_in_encoder(Hold::NONE, Some(&enc)).unwrap();
             assert!(b.state.guest_valid());
             let calls = e.p.call_log().calls_on(enc.id());
-            assert_eq!(calls.len(), 2);
-            assert!(calls[1].sel.starts_with("copyFromTexture:"));
+            assert_eq!(calls.len(), 3);
+            assert!(calls[2].sel.starts_with("copyFromTexture:"));
+        }
+
+        /// Invalidation of backing re-prepares sibling ref textures via generation tracking
+        #[test]
+        fn backing_invalidation_reprepares_sibling_ref_textures() {
+            let e = env();
+            let b = backing(&e);
+            let (r1, _id1) = make(&e, &b);
+            let (r2, _id2) = make(&e, &b);
+            let enc: Fk<kind::BlitEncoder> = e.p.world().new_obj(Model::None);
+
+            // Initial prepare of r1 copies backing + plane 0 to r1
+            r1.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert_eq!(e.p.call_log().calls_on(enc.id()).len(), 2);
+
+            // Initial prepare of r2 copies plane 0 to r2 (backing was already valid)
+            r2.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert_eq!(e.p.call_log().calls_on(enc.id()).len(), 3);
+
+            // Redundant prepare on both does nothing
+            r1.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            r2.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert_eq!(e.p.call_log().calls_on(enc.id()).len(), 3);
+
+            // Backing is invalidated (e.g. guest UI interaction / dirty rect)
+            b.set_is_host_valid(false);
+            assert!(!r1.is_host_valid());
+            assert!(!r2.is_host_valid());
+
+            // r1 prepares: re-prepares backing and plane 0 for r1
+            r1.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert_eq!(e.p.call_log().calls_on(enc.id()).len(), 5);
+            assert!(r1.is_host_valid());
+
+            // Backing is now host-valid, but r2 was not yet updated to new generation
+            assert!(!r2.is_host_valid());
+            r2.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert_eq!(e.p.call_log().calls_on(enc.id()).len(), 6);
+            assert!(r2.is_host_valid());
         }
 
         /// Forwarded; its own flags stay false

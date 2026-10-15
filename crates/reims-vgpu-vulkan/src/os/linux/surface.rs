@@ -126,6 +126,9 @@ impl LinuxSurface {
     fn data(&self) -> &Data {
         &self.0.0
     }
+
+    /// Marks the surface as written by the GPU.
+    pub fn mark_gpu_written(&self) {}
 }
 
 impl Handle for LinuxSurface {

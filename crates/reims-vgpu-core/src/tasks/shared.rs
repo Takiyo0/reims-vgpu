@@ -484,6 +484,8 @@ impl<P: Platform> TaskCore<P> {
                     raised.exception()
                 );
                 hold.land(raised);
+            } else {
+                resource.flush_to_guest();
             }
         }
         let command_buffer = match &self.paging_queue {
@@ -530,11 +532,21 @@ impl<P: Platform> TaskCore<P> {
                 }
             }
         }
+        let to_flush: Vec<Arc<Resource<P>>> = blit_resources
+            .iter()
+            .chain(&compute_resources)
+            .cloned()
+            .collect();
         // A nil buffer never runs the handler: no completion. The handler keeps the buffer
         // alive until it has run.
         if let Some(buffer) = &command_buffer {
             let captured = buffer.clone_ref();
             let handler = move |info: CompletedInfo| {
+                if info.status == CommandBufferStatus::COMPLETED {
+                    for r in &to_flush {
+                        r.flush_to_guest();
+                    }
+                }
                 completed(&done, info);
                 drop(captured);
             };

@@ -160,11 +160,20 @@ impl<P: Platform> ResourceClass<P> for MapperRefBufferResource<P> {
 
     fn prepare_with_cpu(&self, _hold: Hold<'_>, this: &Resource<P>) -> RaiseResult<()> {
         let _ = this;
-        self.ensure_physical()
+        self.ensure_physical()?;
+        if let Some(surface) = self.buffer.lock().as_ref().and_then(Buffer::iosurface) {
+            use crate::platform::os::surface::Surface as _;
+            surface.sync_from_guest();
+        }
+        Ok(())
     }
 
     fn synchronize_with_cpu(&self, this: &Resource<P>) -> RaiseResult<()> {
         let _ = this;
+        if let Some(surface) = self.buffer.lock().as_ref().and_then(Buffer::iosurface) {
+            use crate::platform::os::surface::Surface as _;
+            surface.sync_to_guest();
+        }
         Ok(())
     }
 
@@ -277,7 +286,8 @@ mod tests {
             assert_eq!(env.rec.log().count("retain_io_surface_with_mapping_id"), 1);
             let m = env.p.call_log().mark();
             r.synchronize_with_cpu().unwrap();
-            assert!(env.p.call_log().since(m).is_empty());
+            let calls = env.p.call_log().since(m);
+            assert!(calls.iter().all(|c| matches!(c.sel, "iosurface" | "CFRetain" | "CFRelease")));
         }
 
         #[test]

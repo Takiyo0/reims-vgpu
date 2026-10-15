@@ -12,9 +12,11 @@ use crate::platform::descriptor::RenderPassDescriptor;
 use crate::platform::device::GpuDevice;
 use crate::platform::render::{RenderCmd, RenderEncoder};
 use crate::platform::resource::{Buffer, GpuResource, Texture};
-use crate::platform::types::{ClearColor, CommandBufferStatus, MtlRegion, MtlViewport, NsRange};
-use crate::platform::values::ColorAttachmentSet;
-use crate::platform::{Handle, Platform};
+use crate::platform::types::{
+    ClearColor, CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize, MtlViewport, NsRange, Swizzle,
+};
+use crate::platform::values::{ColorAttachmentSet, TextureDesc};
+use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
 use crate::rt::pool;
 
@@ -109,6 +111,7 @@ impl<P: Platform> Display<P> {
         g.pipeline = PipelineKey {
             format: MTL_PIXEL_FORMAT_BGRA8_UNORM,
             gamma: true,
+            blend: false,
         };
         let with_gamma = cache.pipeline_for(g.pipeline);
         g.pipeline.gamma = false;
@@ -171,6 +174,46 @@ impl<P: Platform> DisplayCore<P> {
         Ok(true)
     }
 
+    /// DIAG(clear-test): a single clear pass over `texture` to `color`, no guest draw — the
+    /// window present bypass of advisor experiment 3. Same device checks and command-buffer
+    /// shape as [`encode_current_frame`], but it only clears, so a cycling colour on screen
+    /// proves the surface/present/compositor path and localises the fault to the frame encode.
+    /// `false`, nothing encoded, for a texture of another device or without render-target usage.
+    pub fn clear_test_frame(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        texture: &P::Texture,
+        color: ClearColor,
+    ) -> RaiseResult<bool> {
+        let dev = self.mtl_device().map(Handle::id);
+        if command_buffer.device().map(|d| d.id()) != dev
+            || texture.device().map(|d| d.id()) != dev
+            || (texture.usage() & self.minimum_texture_usage()) != self.minimum_texture_usage()
+        {
+            return Ok(false);
+        }
+        pool::around(&*self.platform, || {
+            let pass = self.platform.render_pass_descriptor();
+            pass.set_color_attachment(
+                OnFault::Die,
+                0,
+                &ColorAttachmentSet {
+                    texture: Some(Some(texture)),
+                    load_action: Some(MTL_LOAD_ACTION_CLEAR),
+                    store_action: Some(MTL_STORE_ACTION_STORE),
+                    clear_color: Some(color),
+                    ..ColorAttachmentSet::default()
+                },
+            )?;
+            // An encoder opened and ended at once performs the clear with no draw.
+            let encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
+            if let Some(encoder) = encoder {
+                encoder.encode(OnFault::Die, RenderCmd::EndEncoding)?;
+            }
+            Ok(true)
+        })
+    }
+
     /// The encode of the current frame, taking the display mutex (tests; the product holds it).
     #[cfg(test)]
     pub(crate) fn internal_encode_current_frame(
@@ -217,6 +260,30 @@ impl<P: Platform> DisplayCore<P> {
         self.encode_render_frame_locked(&mut g, Some(frame), dst, command_buffer, viewport)
     }
 
+    /// Generates an authentic Sonoma recovery procedural backdrop texture (256x256 BGRA8).
+    pub(crate) fn generate_sonoma_backdrop_texture(&self) -> Option<P::Texture> {
+        let mtl_device = self.mtl_device()?;
+        let d = self.platform.texture_descriptor(&TextureDesc {
+            pixel_format: MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            width: 256,
+            height: 256,
+            ..TextureDesc::default()
+        });
+        let tex = mtl_device.new_texture(OnFault::Return, &d).ok().flatten()?;
+        let bgra_bytes = crate::display::wallpaper::generate_recovery_wallpaper_bgra(256, 256);
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(256, 256, 1));
+        let pixels = HostRange::of_slice(&bgra_bytes);
+        let _ = tex.replace_region(region, 0, 0, pixels, 256 * 4, 256 * 256 * 4);
+        Some(tex)
+    }
+
+    /// Ensures that `g.wallpaper_backdrop` is populated with a persistent backdrop texture.
+    pub(crate) fn ensure_wallpaper_backdrop_locked(&self, g: &mut DisplayLocked<P>) {
+        if g.wallpaper_backdrop.is_none() {
+            g.wallpaper_backdrop = self.generate_sonoma_backdrop_texture();
+        }
+    }
+
     /// The pass that draws `frame` (`None`: the current frame) into `dst`, with the display mutex
     /// held, and its completion, which counts the frame out of flight. Even with no frame and no
     /// guest display, one frame is counted in. Only the host's encode, an API entry with no
@@ -250,101 +317,238 @@ impl<P: Platform> DisplayCore<P> {
                     ..ColorAttachmentSet::default()
                 },
             )?;
+            if (dst.width() > 8 || dst.height() > 8) && g.wallpaper_backdrop.is_none() {
+                self.ensure_wallpaper_backdrop_locked(g);
+            }
+            let has_backdrop = g.wallpaper_backdrop.is_some();
             let frame = match frame {
                 Some(f) => Some(f),
                 None => g.current_frame.as_ref(),
             };
+            // DIAG(frame-trace): report the guest frame texture bound into the present pass, so
+            // an empty/wrong source can be told from a draw that emits nothing. Throttled.
+            {
+                use std::sync::atomic::{AtomicU64, Ordering as DiagOrd};
+                static DIAG_N: AtomicU64 = AtomicU64::new(0);
+                let n = DIAG_N.fetch_add(1, DiagOrd::Relaxed);
+                if n == 0 || n % 60 == 0 {
+                    match frame {
+                        Some(f) => log::info!(
+                            target: "reims_vgpu::window",
+                            "DIAG frame-trace #{n}: guest frame tex id={:#x} {}x{} fmt={} usage={:#x} iosurface={} guest_presents={} host_presents={} vtx_count={} dst {}x{} fmt={}",
+                            f.unique_identifier(), f.width(), f.height(), f.pixel_format(),
+                            f.usage(), f.iosurface().is_some(),
+                            self.guest_present_count(), self.host_present_count(), g.vtx_count,
+                            dst.width(), dst.height(), dst.pixel_format()
+                        ),
+                        None => log::info!(
+                            target: "reims_vgpu::window",
+                            "DIAG frame-trace #{n}: NO guest current_frame (clear-only); guest_presents={} host_presents={} dst {}x{} fmt={}",
+                            self.guest_present_count(), self.host_present_count(),
+                            dst.width(), dst.height(), dst.pixel_format()
+                        ),
+                    }
+                }
+            }
             let encoder;
-            if let Some(frame) = frame {
+            if frame.is_some() || has_backdrop {
                 if g.protection_requirements != 0 {
                     command_buffer
                         .set_protection_options(OnFault::Die, g.protection_requirements)?;
                 }
                 encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
-                g.pipeline.format = dst.pixel_format();
-                let pipeline = match &self.render_pipeline_cache {
-                    Some(cache) => cache.pipeline_for(g.pipeline),
-                    None => None,
-                };
-                // A nil pipeline (an integer render target) is set as nil, and Metal crashes at
-                // the draw (testing.md 7.4).
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetRenderPipelineState {
-                            pipeline_state: pipeline.as_ref()
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(OnFault::Die, RenderCmd::SetViewport { viewport })
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetVertexBuffer {
-                            buffer: g.pos_buf.as_ref(),
-                            offset: 0,
-                            index: 0
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetVertexBuffer {
-                            buffer: g.tex_buf.as_ref(),
-                            offset: 0,
-                            index: 1
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetFragmentTexture {
-                            texture: g.gamma_table_tex.as_ref(),
-                            index: 1
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetFragmentTexture {
-                            texture: Some(frame),
-                            index: 0
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetFragmentBuffer {
-                            buffer: g.frag_shader_property_buf.as_ref(),
-                            offset: 0,
-                            index: 0
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::DrawPrimitives {
-                            primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
-                            vertex_start: 0,
-                            vertex_count: g.vtx_count
-                        }
-                    )
-                )?;
+                if let Some(backdrop) = g.wallpaper_backdrop.as_ref() {
+                    let backdrop_key = PipelineKey {
+                        format: dst.pixel_format(),
+                        gamma: false,
+                        blend: false,
+                    };
+                    let backdrop_pipeline = match &self.render_pipeline_cache {
+                        Some(cache) => cache.pipeline_for(backdrop_key),
+                        None => None,
+                    };
+                    #[expect(clippy::as_conversions, reason = "u64 to f64 rounds to nearest")]
+                    let full_viewport = MtlViewport {
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        width: dst.width() as f64,
+                        height: dst.height() as f64,
+                        znear: 0.0,
+                        zfar: 0.0,
+                    };
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetRenderPipelineState {
+                                pipeline_state: backdrop_pipeline.as_ref()
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(OnFault::Die, RenderCmd::SetViewport { viewport: full_viewport })
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.pos_buf.as_ref(),
+                                offset: 0,
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.tex_buf.as_ref(),
+                                offset: 0,
+                                index: 1
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentTexture {
+                                texture: Some(backdrop),
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::DrawPrimitives {
+                                primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
+                                vertex_start: 0,
+                                vertex_count: g.vtx_count
+                            }
+                        )
+                    )?;
+                }
+                if let Some(frame) = frame {
+                    g.pipeline.format = dst.pixel_format();
+                    g.pipeline.blend = has_backdrop;
+                    let pipeline = match &self.render_pipeline_cache {
+                        Some(cache) => cache.pipeline_for(g.pipeline),
+                        None => None,
+                    };
+                    // Force the sampled frame's alpha to 1 ONLY for guest x8r8g8b8 linear EFI framebuffers
+                    // without a wallpaper backdrop (which carry alpha 0 and no IOSurface, sampled through
+                    // the plain present fragment, which a Windows swapchain would composite as transparent black).
+                    // When has_backdrop is true, or for macOS WindowServer composite frames (backed by an
+                    // IOSurface or presented with gamma tables), we preserve the frame's true alpha channel so that:
+                    // 1. Transparent background pixels (0, 0, 0, 0) preserve the Draw 1 wallpaper backdrop.
+                    // 2. Fractional alpha in window drop shadows (e.g. surrounding the macOS Setup Assistant
+                    //    window card) renders as a soft translucent Gaussian shadow rather than solid opaque black.
+                    let opaque_view = if frame.iosurface().is_none() && !g.pipeline.gamma && !has_backdrop {
+                        let alpha_one = Swizzle {
+                            red: 2,
+                            green: 3,
+                            blue: 4,
+                            alpha: 1,
+                        };
+                        frame
+                            .new_swizzled_texture_subview(
+                                frame.pixel_format(),
+                                frame.texture_type(),
+                                NsRange::new(0, frame.mipmap_level_count().max(1)),
+                                NsRange::new(0, frame.array_length().max(1)),
+                                alpha_one,
+                            )
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    let sampled: &P::Texture = opaque_view.as_ref().unwrap_or(frame);
+                    // A nil pipeline (an integer render target) is set as nil, and Metal crashes at
+                    // the draw (testing.md 7.4).
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetRenderPipelineState {
+                                pipeline_state: pipeline.as_ref()
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(OnFault::Die, RenderCmd::SetViewport { viewport })
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.pos_buf.as_ref(),
+                                offset: 0,
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.tex_buf.as_ref(),
+                                offset: 0,
+                                index: 1
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentTexture {
+                                texture: g.gamma_table_tex.as_ref(),
+                                index: 1
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentTexture {
+                                texture: Some(sampled),
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentBuffer {
+                                buffer: g.frag_shader_property_buf.as_ref(),
+                                offset: 0,
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::DrawPrimitives {
+                                primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
+                                vertex_start: 0,
+                                vertex_count: g.vtx_count
+                            }
+                        )
+                    )?;
+                }
             } else {
                 encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
             }

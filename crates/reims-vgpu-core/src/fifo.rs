@@ -415,6 +415,11 @@ impl<P: Platform> Fifo<P> {
         self.quiesced.load(Ordering::SeqCst)
     }
 
+    /// Whether the FIFO's thread is running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
     /// The fault offset (a child's own copy, not its node's).
     pub fn fault_offset(&self) -> u32 {
         self.ring.fault_offset()

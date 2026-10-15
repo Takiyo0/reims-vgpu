@@ -63,7 +63,7 @@ pub struct PixelRect {
 }
 
 /// The guest's side of the window, as the display's callbacks last reported it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct GuestState {
     /// The guest's mode, once it has set one.
     pub(crate) mode: Option<(u16, u16)>,
@@ -71,6 +71,16 @@ pub(crate) struct GuestState {
     pub(crate) cursor: Option<Glyph>,
     /// Whether the guest shows its cursor.
     pub(crate) cursor_visible: bool,
+}
+
+impl Default for GuestState {
+    fn default() -> Self {
+        GuestState {
+            mode: None,
+            cursor: None,
+            cursor_visible: true,
+        }
+    }
 }
 
 /// A cursor glyph, copied from the guest's.
@@ -311,6 +321,7 @@ impl Window {
 
     /// The scale the guest runs `mode` at: 2 or 1 by the size the display tells it
     /// ([`policy::guest_scale`]), 1 before the display says.
+    #[allow(dead_code)]
     pub(crate) fn guest_scale(&self, mode: (u16, u16)) -> u8 {
         self.told_size
             .lock()

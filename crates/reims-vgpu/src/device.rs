@@ -19,8 +19,24 @@
 //! core handle.
 
 use std::any::Any;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+
+/// The OS handle behind one range of guest RAM in [`MemoryFile`]: a file descriptor on unix (the
+/// shared `MAP_SHARED` fd the library maps), and on Windows the Vulkan backend's section object
+/// ([`reims_vgpu_vulkan::os::BackingHandle`]), since Windows has no `std::os::fd`. The type unifies
+/// with `reims_vgpu_vulkan::os::GuestRamFile::fd`, which the Vulkan platform clones it into
+/// (`platform::vulkan`).
+///
+/// NOTE: on Windows this only makes the backing-table API type-check. Feeding real WHPX guest RAM
+/// through it is the separate fd→host-pointer memory bridge (see `docs/windows-whpx-feasibility.md`),
+/// not implemented here.
+#[cfg(unix)]
+pub type BackingHandle = OwnedFd;
+/// The OS handle behind guest RAM on Windows: the Vulkan backend's section object (the unix doc).
+#[cfg(windows)]
+pub type BackingHandle = reims_vgpu_vulkan::os::BackingHandle;
 
 use reims_vgpu_core::device::Device as CoreDevice;
 use reims_vgpu_core::device::config::DeviceConfig as CoreDeviceConfig;
@@ -56,8 +72,9 @@ pub struct MemoryMap {
 /// (`MAP_SHARED`) of `fd` from byte `offset`.
 #[derive(Clone, Debug)]
 pub struct MemoryFile {
-    /// The file, held open while any map or device holds it.
-    pub fd: Arc<OwnedFd>,
+    /// The file, held open while any map or device holds it. `OwnedFd` on unix; on Windows the
+    /// Vulkan backend's section object ([`BackingHandle`]).
+    pub fd: Arc<BackingHandle>,
     /// The file offset of the range's first byte, a multiple of the host's page size.
     pub offset: u64,
 }
@@ -623,6 +640,7 @@ mod tests {
     }
 
     /// The memory map keeps its ranges in order, and the file behind each beside it
+    #[cfg(unix)]
     #[test]
     fn memory_map_ranges() {
         let mut m = MemoryMap::new();

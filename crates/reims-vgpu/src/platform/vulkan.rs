@@ -37,19 +37,31 @@ impl ApiPlatform for VulkanPlatform {
         reims_vgpu_vulkan::api::read_pixels(texture, dst, bytes_per_row);
     }
 
-    /// The files behind the map's ranges, registered while the device lives
-    /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
-    /// guest's pages of them. A range without a file is not registered, and a view of its pages
-    /// is refused as a failed remap is. On macOS nothing is registered, since Mach makes a view
-    /// by remapping addresses.
+    /// The guest's RAM, registered while the device lives
+    /// (`reims_vgpu_vulkan::os::lease_guest_memory`).
+    ///
+    /// On Linux the platform makes its views of the guest's pages from the files the host named,
+    /// so a range is leased with its backing fd (a range without a file is not registered, and a
+    /// view of its pages is refused as a failed remap). On macOS nothing is registered, since Mach
+    /// remaps addresses. On Windows (WHPX) the host already mapped every range at its
+    /// `host_address` (`VirtualAlloc`), which the runtime imports directly through
+    /// `VK_EXT_external_memory_host`; there is no backing object, so every range is leased by its
+    /// host VA with `fd: None`, regardless of `memory_files` (which the Windows C API does not use).
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
-        let ranges = map.ranges().iter().zip(map.files());
-        let files = ranges.filter_map(|(range, file)| {
+        #[cfg(windows)]
+        let files = map.ranges().iter().map(|range| GuestRamFile {
+            host: range.host_address.addr().to_u64(),
+            length: range.physical_length,
+            fd: None,
+            offset: 0,
+        });
+        #[cfg(not(windows))]
+        let files = map.ranges().iter().zip(map.files()).filter_map(|(range, file)| {
             let file = file.as_ref()?;
             Some(GuestRamFile {
                 host: range.host_address.addr().to_u64(),
                 length: range.physical_length,
-                fd: Arc::clone(&file.fd),
+                fd: Some(Arc::clone(&file.fd)),
                 offset: file.offset,
             })
         });

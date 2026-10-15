@@ -18,15 +18,24 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod surface;
+#[cfg(target_os = "windows")]
+mod windows;
 mod wsi;
 
 #[cfg(target_os = "linux")]
 use linux as host_os;
 #[cfg(target_os = "macos")]
 use macos as host_os;
+#[cfg(target_os = "windows")]
+use windows as host_os;
 
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
+
+/// The OS handle behind one range of the guest's RAM in [`GuestRamFile`]: a file descriptor the
+/// view is mapped from on Linux (`OwnedFd`), a section object on Windows ([`host_os::Section`]),
+/// and unused on macOS, where Mach makes a view by remapping addresses rather than mapping a
+/// backing object.
+pub use host_os::BackingHandle;
 
 pub(crate) use host_os::{
     Drawables, METAL_LEVEL, TWINS_READ_ONLY, allocate_zeros, import_view, plane_shape, shown_at,
@@ -47,18 +56,24 @@ pub(crate) use surface::{
     surface_bytes_memory, surface_memory, surface_offset, write_surface_bytes, ycbcr_facts,
 };
 
-/// One range of the guest's RAM as the host maps it, and the file behind it: `length` bytes at
-/// `host`, a shared mapping (`MAP_SHARED`) of `fd` from byte `offset`. A device's lease of the
-/// guest's RAM ([`lease_guest_memory`]) is made of these.
+/// One range of the guest's RAM as the host maps it, and the backing object behind it, if any:
+/// `length` bytes at `host`. On Linux `fd` is `Some` file descriptor the range is a `MAP_SHARED`
+/// view of from byte `offset`, which the library maps to build its views of guest pages. On
+/// Windows under WHPX there is no backing object — the host (QEMU) already mapped the range at
+/// `host` (`VirtualAlloc`), which the runtime imports directly through `VK_EXT_external_memory_host`
+/// — so `fd` is `None` and `offset` is 0. On macOS it is checked and not used. A device's lease of
+/// the guest's RAM ([`lease_guest_memory`]) is made of these.
 #[derive(Clone, Debug)]
 pub struct GuestRamFile {
     /// The host address of the range's first byte.
     pub host: u64,
     /// The range's length in bytes.
     pub length: u64,
-    /// The file.
-    pub fd: Arc<OwnedFd>,
-    /// The file offset of the range's first byte.
+    /// The backing object (a file descriptor on Linux, a section object on Windows), or `None`
+    /// where the host already mapped the range and the runtime imports its host pointer directly
+    /// (Windows/WHPX guest RAM).
+    pub fd: Option<Arc<BackingHandle>>,
+    /// The file offset of the range's first byte (0 where `fd` is `None`).
     pub offset: u64,
 }
 
