@@ -2,8 +2,8 @@
 //! textures the deserializer makes ([`SerializerTextureResource`]: views, textures on buffers or
 //! in heaps, memoryless ones), which are never paged.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::platform::{Handle, Platform};
 use crate::raise::RaiseResult;
@@ -88,7 +88,12 @@ impl<P: Platform> ResourceClass<P> for RefTextureResource<P> {
             if was_valid && self.last_generation.load(Ordering::SeqCst) == backing_gen {
                 return Ok(());
             }
-            if let Some(texture) = &self.texture {
+            // The view aliases the backing's IOSurface. When the GPU owns the current
+            // contents, uploading the guest transfer buffer would overwrite those newer
+            // pixels through the alias, even though backing preparation correctly skipped it.
+            if !self.backing.is_guest_valid() {
+                log::debug!("backing view preserves GPU contents: plane={} generation={backing_gen}", self.plane);
+            } else if let Some(texture) = &self.texture {
                 if let ResourceKind::Backing(backing) = &self.backing.kind {
                     backing.prepare_plane_in_encoder(
                         hold,
@@ -120,7 +125,8 @@ impl<P: Platform> ResourceClass<P> for RefTextureResource<P> {
         self.host_valid.store(v, Ordering::SeqCst);
         if v {
             if let ResourceKind::Backing(backing) = &self.backing.kind {
-                self.last_generation.store(backing.generation(), Ordering::SeqCst);
+                self.last_generation
+                    .store(backing.generation(), Ordering::SeqCst);
             }
         } else {
             self.last_generation.store(0, Ordering::SeqCst);
@@ -445,6 +451,42 @@ mod tests {
             let calls = e.p.call_log().calls_on(enc.id());
             assert_eq!(calls.len(), 3);
             assert!(calls[2].sel.starts_with("copyFromTexture:"));
+        }
+
+        /// A new alias must not upload stale guest pages over a GPU-owned backing.
+        #[test]
+        fn new_backing_view_preserves_gpu_owned_contents() {
+            let e = env();
+            let b = backing(&e);
+            b.set_is_host_valid(true);
+            b.set_is_guest_valid(false);
+            let (r, _) = make(&e, &b);
+            let enc: Fk<kind::BlitEncoder> = e.p.world().new_obj(Model::None);
+            let mark = e.p.call_log().mark();
+            r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert!(r.is_host_valid());
+            assert!(!b.is_guest_valid());
+            assert!(e.p.call_log().since(mark).iter().all(
+                |call| !call.sel.starts_with("copyFromBuffer:")),
+                "preparing a new alias reloaded stale guest bytes over GPU contents");
+            r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert!(e.p.call_log().since(mark).iter().all(
+                |call| !call.sel.starts_with("copyFromBuffer:")));
+        }
+
+        #[test]
+        fn new_backing_view_still_uploads_current_guest_contents() {
+            let e = env();
+            let b = backing(&e);
+            b.set_is_host_valid(true);
+            assert!(b.is_guest_valid());
+            let (r, _) = make(&e, &b);
+            let enc: Fk<kind::BlitEncoder> = e.p.world().new_obj(Model::None);
+            let mark = e.p.call_log().mark();
+            r.prepare_in_encoder(Hold::NONE, Some(&enc)).unwrap();
+            assert!(r.is_host_valid());
+            assert_eq!(e.p.call_log().since(mark).iter().filter(
+                |call| call.sel.starts_with("copyFromBuffer:")).count(), 1);
         }
 
         /// Invalidation of backing re-prepares sibling ref textures via generation tracking
