@@ -456,5 +456,6 @@ pub unsafe extern "C" fn rvg_display_present_counts(
     })
 }
 
-#[cfg(test)]
+// Unix-specific fixtures (fd-backed memory maps, fork+signal death tests); see device.rs.
+#[cfg(all(test, unix))]
 mod tests;

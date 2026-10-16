@@ -104,7 +104,7 @@ fn paged() -> Paged {
             .unwrap()
             .unwrap();
         let texture = td.platform.world().new_obj::<kind::Texture>(Model::None);
-        RefTextureResource::new(Arc::downgrade(&host), 0, texture, buffer)
+        RefTextureResource::new(Arc::downgrade(&host), 0, texture, buffer, 0)
             .unwrap()
             .unwrap()
     });

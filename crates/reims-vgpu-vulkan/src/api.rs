@@ -65,4 +65,40 @@ mod tests {
         assert_eq!(&padded[12..16], &[0xaa; 4]);
         assert_eq!(&padded[16..], &px[12..]);
     }
+
+    #[test]
+    fn backdrop_texture_descriptor_and_replace_region_succeeds() {
+        use reims_vgpu_core::platform::device::GpuDevice;
+        use reims_vgpu_core::platform::resource::Texture;
+        use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+        use reims_vgpu_core::platform::values::TextureDesc;
+        use reims_vgpu_core::platform::HostRange;
+        use reims_vgpu_core::raise::OnFault;
+        use crate::gpu::desc::{TextureDescriptorObject, TextureFields};
+
+        let desc = TextureDesc {
+            pixel_format: 80, // MTL_PIXEL_FORMAT_BGRA8_UNORM
+            width: 256,
+            height: 256,
+            ..TextureDesc::default()
+        };
+        let d = Obj::new(TextureDescriptorObject::new(TextureFields::of(&desc)));
+        let mtl_device = dev();
+        let tex = mtl_device
+            .new_texture(OnFault::Return, &d)
+            .expect("new_texture failed")
+            .expect("new_texture returned None");
+
+        let bgra_bytes = reims_vgpu_core::display::wallpaper::generate_recovery_wallpaper_bgra(256, 256);
+        assert!(!bgra_bytes.is_empty());
+        assert!(bgra_bytes.iter().any(|&b| b > 0), "wallpaper bytes are all zero!");
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(256, 256, 1));
+        let pixels = HostRange::of_slice(&bgra_bytes);
+        let res = tex.replace_region(region, 0, 0, pixels, 256 * 4, 256 * 256 * 4);
+        assert!(res.is_ok(), "replace_region failed: {:?}", res);
+
+        let mut readback = vec![0u8; 256 * 256 * 4];
+        read_pixels(&tex, &mut readback, 256 * 4);
+        assert_eq!(&readback[..], &bgra_bytes[..]);
+    }
 }

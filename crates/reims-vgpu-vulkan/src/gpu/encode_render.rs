@@ -3755,6 +3755,13 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 }
                 encoded(&mut |e| e.use_resources(&some, usage, VERTEX_AND_FRAGMENT))?;
                 if usage.contains(ResourceUsage::WRITE) {
+                    for r in list.iter().flatten() {
+                        match r {
+                            ResourceRef::Buffer(b) => b.mark_gpu_written(),
+                            ResourceRef::Texture(t) => t.mark_gpu_written(),
+                            _ => {}
+                        }
+                    }
                     // A function of the encoder's may write their records.
                     for icb in &icbs {
                         icb.may_be_written(self.encoder.progress(sel));
@@ -3784,6 +3791,13 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 }
                 encoded(&mut |e| e.use_resources(&some, usage, stages))?;
                 if usage.contains(ResourceUsage::WRITE) {
+                    for r in list.iter().flatten() {
+                        match r {
+                            ResourceRef::Buffer(b) => b.mark_gpu_written(),
+                            ResourceRef::Texture(t) => t.mark_gpu_written(),
+                            _ => {}
+                        }
+                    }
                     // A function of the encoder's may write their records.
                     for icb in &icbs {
                         icb.may_be_written(self.encoder.progress(sel));
@@ -3979,6 +3993,9 @@ impl VulkanRenderEncoder {
         texture: Option<&VulkanTexture>,
         at: (u64, u64, u64),
     ) -> Option<rt::ResolveTarget> {
+        if let Some(t) = texture {
+            t.mark_gpu_written();
+        }
         let unsent = texture.and_then(Unsent::of);
         let kept = plain(|| {
             let mut undecided = self.undecided.lock();
@@ -4608,6 +4625,7 @@ pub(crate) mod tests {
             fragment: &f,
             color0_pixel_format: BGRA8,
             resource_index: None,
+            blend_source_over: false,
         })
         .unwrap()
         .unwrap()
@@ -5962,6 +5980,7 @@ pub(crate) mod tests {
         let key = PipelineKey {
             format: BGRA8,
             gamma: false,
+            blend: false,
         };
         let first = DisplayPipelineCache::<VulkanPlatform>::new(d.clone_ref()).unwrap();
         let second = DisplayPipelineCache::<VulkanPlatform>::new(d.clone_ref()).unwrap();

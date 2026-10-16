@@ -82,12 +82,25 @@ pub(crate) fn reach(offset: u64, length: u64) -> Option<std::ops::Range<u64>> {
 }
 
 impl BufferObject {
+    /// Marks the underlying surface as GPU-written.
+    pub fn mark_gpu_written(&self) {
+        if let Some(surface) = &self.surface {
+            surface.mark_gpu_written();
+        }
+    }
+
     /// A command's use `sel` of the buffer's bytes `bytes`, all of them where `bytes` is `None`,
     /// as for a bind, whose reach a shader decides. It dies where they lie over the guest's pages
     /// under a texture of a heap nothing may share a byte with that lives
     /// ([`crate::gpu::over_pages`]). The use is kept where the buffer is over the guest's pages:
     /// given them by a replace, or made over them ([`BufferObject::over_guest_pages`]).
     pub(crate) fn used(&self, sel: &'static str, bytes: Option<std::ops::Range<u64>>) {
+        if let Some(surface) = &self.surface {
+            surface.refresh();
+        }
+        if sel.contains("toBuffer") || sel.contains("fillBuffer") {
+            self.mark_gpu_written();
+        }
         // A placed buffer's bytes lie in its heap's, whose use it is.
         let owner = self
             .heap
@@ -295,8 +308,43 @@ impl TextureObject {
     /// runtime's too, which stores and loads a pass's texels turned in the surface's bytes as
     /// Metal does, and refuses what it does not build (a view of one, CPU access or a blit whose
     /// rows run past its buffer), each refusal dying at its send ([`crate::gpu::desc`]).
-    pub fn texels(&self, _sel: &'static str) -> &rt::Texture {
+    pub fn texels(&self, sel: &'static str) -> &rt::Texture {
+        if let Some(surface) = &self.surface {
+            surface.refresh();
+        }
+        if let Some(Under::Buffer(buffer, _)) = &self.under {
+            if let Some(surface) = &buffer.surface {
+                surface.refresh();
+            }
+        }
+        if sel.contains("Attachment")
+            || sel.contains("Resolve")
+            || sel.contains("ComputeTexture")
+            || sel.contains("toTexture")
+            || sel.contains("fillTexture")
+            || self.usage() & 0x2 != 0
+        {
+            self.mark_gpu_written();
+        }
         &self.raw
+    }
+
+    /// Marks the underlying surface (or buffer's surface) as GPU-written.
+    pub fn mark_gpu_written(&self) {
+        if let Some(surface) = &self.surface {
+            surface.mark_gpu_written();
+        }
+        if let Some(Under::Buffer(buffer, _)) = &self.under {
+            buffer.mark_gpu_written();
+        }
+    }
+
+    /// The texture's usage flags.
+    pub fn usage(&self) -> u64 {
+        if self.gpu_read_only() {
+            return self.private_usage;
+        }
+        u64::from(plain(|| self.raw.usage()).as_raw()) | self.private_usage
     }
 
     /// The runtime's texture, for `sel`, a blit or a CPU access that reads or writes its texels,
@@ -1271,6 +1319,9 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// range past the buffer, as Metal's validation refuses it. A range whose end passes
     /// `u64::MAX` dies.
     fn did_modify_range(&self, _on: OnFault, range: NsRange) -> RaiseResult<()> {
+        if let Some(surface) = &self.surface {
+            surface.sync_to_guest();
+        }
         let sel = "didModifyRange:";
         let range = crate::gpu::range(range)
             .unwrap_or_else(|| unrepresentable(sel, &format!("the range {range:?}")));
@@ -1834,10 +1885,7 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// ([`TextureObject::private_usage`]); for one whose GPU writes never reach its memory, whose
     /// runtime texture is made of another usage, its whole usage alone ([`read_only_usage`]).
     fn usage(&self) -> u64 {
-        if self.gpu_read_only() {
-            return self.private_usage;
-        }
-        u64::from(plain(|| self.raw.usage()).as_raw()) | self.private_usage
+        TextureObject::usage(self)
     }
 
     fn width(&self) -> u64 {
@@ -2516,6 +2564,84 @@ pub(crate) mod tests {
             assert!(made.is_none(), "{length}");
         }
         b.set_label("reims-vgpu.test").unwrap();
+    }
+
+    /// The Windows guest-RAM→Vulkan bridge, end to end on this GPU. A region the host already
+    /// mapped (`VirtualAlloc`, standing in for WHPX guest RAM) is leased by its host VA
+    /// (`fd: None`) — the bridge's own plumbing — then imported into a GPU buffer through
+    /// `new_buffer_over_host_memory` (`VK_EXT_external_memory_host`).
+    ///
+    /// This asserts the import SUCCEEDS: the leased host pointer is imported by the RTX 4060 and
+    /// the buffer answers that pointer as its contents. It FAILS if the runtime aborts or refuses
+    /// the import (e.g. the pre-port `host_page()==None` → `Unsupported(HostMemory,NotImplemented)`
+    /// path). The buffer is kept until after the import is checked, then released.
+    /// Ignored by default: it builds a device and talks to the GPU; run manually on the host.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "builds a device and imports host memory on the GPU: run manually on the host"]
+    fn bridge_leases_host_va_and_runtime_import_is_the_only_gap() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let d = dev();
+        let len: usize = 2 * 1024 * 1024;
+        // SAFETY: a fresh committed read-write region owned here; freed at the end.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        };
+        assert!(!base.is_null(), "VirtualAlloc failed");
+        let host = base as u64;
+        // The bridge: lease it as the C API would under WHPX — no backing object, host VA only.
+        let lease = crate::os::lease_guest_memory([crate::os::GuestRamFile {
+            host,
+            length: len as u64,
+            fd: None,
+            offset: 0,
+        }]);
+        // Import a sub-range into a GPU buffer (the apple-gfx no-copy path). The runtime may abort
+        // on an unported host_page(); catch_death turns that into a failure, not a crash.
+        use reims_vgpu_core::testkit::capture::catch_death;
+        // SAFETY: the region outlives the buffer (freed after it drops, below).
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr((host + 0x4000) as *mut u8), 0x1000) };
+        let caught = catch_death(|| {
+            match d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, None) {
+                Ok(Some(b)) => {
+                    // The buffer must answer the imported host pointer and length, and must stay
+                    // valid here, before it is released at the end of this closure.
+                    let contents = b.contents();
+                    let length = b.length();
+                    let matches_ptr = contents == bytes.ptr();
+                    drop(b);
+                    Some((length, matches_ptr))
+                }
+                _ => None,
+            }
+        });
+        let imported = match &caught {
+            Ok(Some((length, matches_ptr))) => {
+                println!(
+                    "bridge: IMPORTED leased host VA {host:#x} into a GPU buffer; length={length} contents==host_ptr:{matches_ptr}"
+                );
+                assert_eq!(*length, 0x1000, "the buffer's length is the imported length");
+                assert!(*matches_ptr, "the buffer's contents is the imported host pointer");
+                true
+            }
+            Ok(None) => {
+                println!("bridge: REFUSED (runtime returned Ok(None)/Err)");
+                false
+            }
+            Err(site) => {
+                println!("bridge: ABORTED by the runtime: {:?} @ {}", site.kind, site.file);
+                false
+            }
+        };
+        drop(lease);
+        // SAFETY: the region this test reserved; the buffer was released inside the closure.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+        assert!(
+            imported,
+            "the RTX 4060 did not import the leased host VA — bridge not proven live"
+        );
     }
 
     /// A no-copy buffer's contents are the memory, at any offset into a page; its deallocator

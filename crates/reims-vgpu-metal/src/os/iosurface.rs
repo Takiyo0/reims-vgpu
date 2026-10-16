@@ -149,6 +149,9 @@ impl MetalSurface {
         // SAFETY: the pointer is a live IOSurfaceRef this value holds one reference to.
         unsafe { self.ptr.as_ref() }
     }
+
+    /// Marks the surface as written by the GPU.
+    pub fn mark_gpu_written(&self) {}
 }
 
 impl Drop for MetalSurface {

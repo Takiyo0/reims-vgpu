@@ -664,6 +664,68 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
+        match &cmd {
+            BlitCmd::CopyBufferToTexture {
+                destination_texture,
+                ..
+            }
+            | BlitCmd::CopyTextureRegion {
+                destination_texture,
+                ..
+            }
+            | BlitCmd::CopyTextureRegionOptions {
+                destination_texture,
+                ..
+            }
+            | BlitCmd::CopyTextureSlices {
+                destination_texture,
+                ..
+            } => {
+                destination_texture.mark_gpu_written();
+            }
+            BlitCmd::CopyBufferToTextureOptions {
+                destination_texture,
+                ..
+            } => {
+                if let Some(t) = destination_texture {
+                    t.mark_gpu_written();
+                }
+            }
+            BlitCmd::CopyBufferToBuffer {
+                destination_buffer,
+                ..
+            }
+            | BlitCmd::CopyTextureToBufferOptions {
+                destination_buffer,
+                ..
+            } => {
+                if let Some(b) = destination_buffer {
+                    b.mark_gpu_written();
+                }
+            }
+            BlitCmd::CopyTextureToBuffer {
+                destination_buffer,
+                ..
+            } => {
+                destination_buffer.mark_gpu_written();
+            }
+            BlitCmd::FillBuffer { buffer: b, .. }
+            | BlitCmd::FillBufferPattern4 { buffer: b, .. } => {
+                b.mark_gpu_written();
+            }
+            BlitCmd::FillTexture { texture: t, .. }
+            | BlitCmd::FillTextureColor { texture: t, .. }
+            | BlitCmd::InvalidateCompressedTexture { texture: t }
+            | BlitCmd::InvalidateCompressedTextureSlice { texture: t, .. } => {
+                t.mark_gpu_written();
+            }
+            BlitCmd::GenerateMipmaps { texture: t } => {
+                if let Some(t) = t {
+                    t.mark_gpu_written();
+                }
+            }
+            _ => {}
+        }
         for (buffer, bytes) in named_buffers(&cmd) {
             if let Some(buffer) = buffer {
                 buffer.used(sel, bytes);

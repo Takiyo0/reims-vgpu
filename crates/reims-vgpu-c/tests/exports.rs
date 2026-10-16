@@ -13,8 +13,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 fn crate_dir() -> PathBuf {
@@ -203,6 +205,7 @@ fn every_export_runs_its_body_inside_ffi_export() {
 }
 
 /// The directory holding this crate's dynamic library (this test binary's own).
+#[cfg(unix)]
 fn deps_dir() -> PathBuf {
     std::env::current_exe()
         .unwrap()
@@ -212,7 +215,15 @@ fn deps_dir() -> PathBuf {
 }
 
 /// The dylib exports every function the header declares, and no other `rvg_` function: its
-/// defined external symbols, which carry a leading `_` on macOS and none on Linux
+/// defined external symbols, which carry a leading `_` on macOS and none on Linux.
+///
+/// Unix only: it reads the dylib's symbols with `nm -gU`. The Windows equivalent would use
+/// `dumpbin /EXPORTS` AND first ensure the `cdylib` actually places the `#[no_mangle]` symbols in
+/// the PE export table (Rust does not do this automatically on Windows as it does on unix — a
+/// `.def` file or `/EXPORT:` linker args are needed). That is a tracked follow-up; the staticlib
+/// (`reims_vgpu_c.lib`), which the custom QEMU links, DOES carry every `rvg_` symbol, confirmed by
+/// `dumpbin /EXPORTS reims_vgpu_c.dll.lib`.
+#[cfg(unix)]
 #[test]
 fn the_dylib_exports_every_header_function() {
     let dylib = deps_dir().join(format!("{DLL_PREFIX}reims_vgpu_c{DLL_SUFFIX}"));

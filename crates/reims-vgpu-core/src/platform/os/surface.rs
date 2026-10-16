@@ -44,6 +44,17 @@ pub trait Surface: Handle {
     fn lookup_by_port(&self) -> Option<Self>
     where
         Self: Sized;
+    /// Refreshes host surface memory from guest physical pages when the surface uses a separate host buffer
+    /// (e.g. WHPX multi-range fallback).
+    fn refresh(&self) {}
+    /// Synchronizes from guest memory to host surface memory.
+    fn sync_from_guest(&self) {
+        self.refresh();
+    }
+    /// Synchronizes from host surface memory back to guest memory.
+    fn sync_to_guest(&self) {}
+    /// Marks the surface as written by the GPU.
+    fn mark_gpu_written(&self) {}
 }
 
 /// Creates IOSurfaces. The private keys a spec can carry (client address ranges, direction,

@@ -669,6 +669,7 @@ impl<P: Platform> GuestDisplay<P> {
     /// (bit 0 of the pending byte) or for another number than expected; else stores it, clears the
     /// pending byte and runs the state machine.
     pub fn ack(&self, ack: u32) -> RaiseResult<()> {
+        log::info!("guest display on port {}: received ack {}", self.port, ack);
         let mut l = self.guest_display_mutex.lock();
         // A display command while paused dies (testing.md 7.4).
         Self::assert_running(&l);
@@ -785,9 +786,14 @@ impl<P: Platform> GuestDisplay<P> {
         if interrupt != 0 {
             let enabled = self.page(l).load(sp::ENABLED_INTERRUPTS);
             self.page(l).fetch_or(sp::RAISED_INTERRUPTS, interrupt);
-            if enabled & interrupt != 0 {
-                self.poke();
-            }
+            log::info!(
+                "guest display on port {}: raising interrupt {:#x} (enabled={:#x}, state={}), poking port",
+                self.port,
+                interrupt,
+                enabled,
+                state
+            );
+            self.poke();
         }
         // Written after the interrupt.
         self.page(l).w32(sp::STATE, state);

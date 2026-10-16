@@ -849,6 +849,19 @@ impl<P: Platform> ResourceHost<P> for GpuTask<P> {
     ) -> RaiseResult<MappedAddress<P>> {
         GpuTask::mapped_address_for_offset(self, hold, offset, length, need_writable)
     }
+
+    fn resolve_virtual_pages(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<Option<Vec<crate::guest::GuestPtr>>> {
+        self.resolve_pages(hold, offset, length)
+    }
+
+    fn memory_map(&self) -> Option<Arc<crate::memory::map::MemoryMap<P>>> {
+        self.map()
+    }
 }
 
 #[cfg(test)]

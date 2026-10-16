@@ -1,7 +1,11 @@
 //! Builds `tests/c/harness.c` against the committed `include/reims_vgpu.h`, links it to this
 //! crate's dynamic library, and runs it. The harness uses the platform the library is built on, as
 //! a C host does: `MetalPlatform`, or `VulkanPlatform` with the `vulkan` feature.
-
+//!
+//! Unix only: the harness build/link/run here uses `ExitStatusExt` and a POSIX dylib convention.
+//! The Windows C-ABI smoke is a separate follow-up (the library itself builds and exports its C
+//! API on Windows — see docs/windows-windowing-plan.md and the Stage 4 notes).
+#![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};

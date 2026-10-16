@@ -41,6 +41,10 @@ tikv-jemallocator.workspace = true
 # `exception::catch` around every call of a host function (`ffi::host_call`, `ffi/catch/macos.rs`).
 objc2.workspace = true
 
+# The host's page size via GetSystemInfo on Windows (`device::host_page_size`).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 reims-vgpu = { workspace = true, features = ["testkit"] }
 reims-vgpu-core = { workspace = true, features = ["testkit"] }

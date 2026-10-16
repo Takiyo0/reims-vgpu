@@ -27,12 +27,36 @@ pub struct MemoryMapRange {
     pub virtual_address: HostPtr,
 }
 
+/// One chunk of a discontiguous mapping.
+#[derive(Debug, Clone)]
+pub struct DiscontiguousChunk {
+    /// The guest physical address of this chunk.
+    pub cur_phys: u64,
+    /// Offset inside the contiguous host allocation.
+    pub host_offset: u64,
+    /// Number of bytes in this chunk.
+    pub chunk_size: usize,
+}
+
+/// A contiguous host buffer backing scattered guest physical pages under WHPX.
+#[derive(Debug)]
+pub struct DiscontiguousBuffer {
+    /// Host virtual address of the allocated buffer.
+    pub host_addr: HostPtr,
+    /// Total buffer length in bytes.
+    pub total_length: u64,
+    /// The physical chunks copied into this buffer.
+    pub chunks: Vec<DiscontiguousChunk>,
+}
+
 /// The guest's physical ranges, sorted at init by start and then length, and looked up first match
 /// in stored order. Shared as `Arc`; [`MemoryMap::copy`] gives a new map with the same ranges.
 /// Mappings it makes tear down through `P`'s `HostVm`.
 pub struct MemoryMap<P: Platform> {
     platform: Arc<P>,
     ranges: Vec<MemoryMapRange>,
+    pub(crate) this: crate::sync::Mutex<std::sync::Weak<MemoryMap<P>>>,
+    pub(crate) discontiguous: Arc<crate::sync::Mutex<Vec<Arc<DiscontiguousBuffer>>>>,
 }
 
 impl<P: Platform> std::fmt::Debug for MemoryMap<P> {
@@ -130,15 +154,26 @@ impl<P: Platform> MemoryMap<P> {
             return None;
         }
 
-        Some(Arc::new(MemoryMap { platform, ranges }))
+        let map = Arc::new(MemoryMap {
+            platform,
+            ranges,
+            this: crate::sync::Mutex::new(std::sync::Weak::new()),
+            discontiguous: Arc::new(crate::sync::Mutex::new(Vec::new())),
+        });
+        *map.this.lock() = Arc::downgrade(&map);
+        Some(map)
     }
 
     /// A plain init (no validation): the same ranges.
     pub fn copy(&self) -> Arc<Self> {
-        Arc::new(MemoryMap {
+        let map = Arc::new(MemoryMap {
             platform: self.platform.clone(),
             ranges: self.ranges.clone(),
-        })
+            this: crate::sync::Mutex::new(std::sync::Weak::new()),
+            discontiguous: Arc::clone(&self.discontiguous),
+        });
+        *map.this.lock() = Arc::downgrade(&map);
+        map
     }
 
     /// The ranges, in stored (sorted) order.
@@ -264,7 +299,238 @@ impl<P: Platform> MemoryMap<P> {
     /// A fresh VM allocation with each request range remapped into it, in request order; every
     /// refusal after the allocation deallocates it, except a failed protect. A length that is not
     /// whole pages dies.
+    ///
+    /// Public entry point. First tries the alloc+remap path (`remap_range_mapping`), which aliases
+    /// each guest range's host pages (section-backed memory, as macOS/Linux give). When that path
+    /// fails AND the request is a single contiguous span inside one stored range — as the GPU FIFO
+    /// root page and the EFI framebuffer are — it falls back to a BORROWED mapping that points
+    /// straight at the guest range's existing host address (`host_address`), with no alias and no
+    /// teardown. This is the WHPX case: QEMU guest RAM is anonymous VirtualAlloc with no section to
+    /// remap, but its host pointer is valid and shared, which is all the FIFO/framebuffer need.
+    #[allow(unsafe_code)]
     pub fn new_range_mapping(
+        &self,
+        ranges: &[PhysRange],
+        total_length: u64,
+        read_only: u32,
+    ) -> Option<Arc<Mapping<P>>> {
+        if let Some(m) = self.remap_range_mapping(ranges, total_length, read_only) {
+            return Some(m);
+        }
+        // Fallback 1: a single contiguous span within one stored range -> borrow its host address.
+        if let Some(host_va) = self.contiguous_host_address(ranges, total_length) {
+            log::debug!(
+                "range mapping: no section to remap; borrowing guest host address {:#x} for \
+                 {total_length:#x} bytes (WHPX direct host-VA)",
+                host_va.addr().to_u64()
+            );
+            return Some(Mapping::new(host_va, total_length, read_only == 0, Teardown::None));
+        }
+
+        // Fallback 2 (WHPX discontiguous): copy guest pages into a contiguous host buffer.
+        if total_length == 0 {
+            return Some(Mapping::new(HostPtr::NULL, 0, read_only == 0, Teardown::None));
+        }
+        let vm = self.platform.vm();
+        if let Ok(host_addr) = vm.allocate_anywhere(total_length) {
+            let mut offset = 0u64;
+            let mut ok = true;
+            let mut chunks = Vec::new();
+            for (i, r) in ranges.iter().enumerate() {
+                if r.physical_length == 0 {
+                    continue;
+                }
+                if r.physical_address == 0 {
+                    log::warn!("discontiguous copy fallback: range[{i}] physical_address is 0");
+                    ok = false;
+                    break;
+                }
+                let mut copied = 0u64;
+                while copied < r.physical_length {
+                    let cur_phys = r.physical_address.wrapping_add(copied);
+                    let rem = r.physical_length.wrapping_sub(copied);
+                    let chunk = self
+                        .ranges
+                        .iter()
+                        .find(|mr| cur_phys >= mr.physical_address && cur_phys < mr.physical_end)
+                        .map(|mr| (mr.physical_end - cur_phys).min(rem))
+                        .unwrap_or(0);
+                    if chunk == 0 {
+                        log::warn!(
+                            "discontiguous copy fallback: no map range for guest phys {cur_phys:#x}"
+                        );
+                        ok = false;
+                        break;
+                    }
+                    let dst_slice = unsafe {
+                        let dst_ptr = (host_addr.addr() + (offset + copied) as usize) as *mut u8;
+                        std::slice::from_raw_parts_mut(dst_ptr, chunk as usize)
+                    };
+                    if !self.read(cur_phys, dst_slice) {
+                        log::warn!(
+                            "discontiguous copy fallback: failed to read {chunk:#x} bytes from guest phys {cur_phys:#x}"
+                        );
+                        ok = false;
+                        break;
+                    }
+                    chunks.push(DiscontiguousChunk {
+                        cur_phys,
+                        host_offset: offset + copied,
+                        chunk_size: chunk as usize,
+                    });
+                    copied = copied.wrapping_add(chunk);
+                }
+                if !ok {
+                    break;
+                }
+                offset = offset.wrapping_add(r.physical_length);
+            }
+            if ok && offset == total_length {
+                log::debug!(
+                    "range mapping: discontiguous copy fallback: allocated {total_length:#x} bytes at host address {:#x} (chunks={})",
+                    host_addr.addr().to_u64(),
+                    chunks.len()
+                );
+                let discontig_buf = Arc::new(DiscontiguousBuffer {
+                    host_addr: HostPtr::from_addr(host_addr.addr()),
+                    total_length,
+                    chunks,
+                });
+                self.discontiguous.lock().push(Arc::clone(&discontig_buf));
+                let discontiguous = Arc::downgrade(&self.discontiguous);
+                return Some(Mapping::new(
+                    HostPtr::from_addr(host_addr.addr()),
+                    total_length,
+                    read_only == 0,
+                    Teardown::Discontiguous {
+                        platform: Arc::clone(&self.platform),
+                        buffer: discontig_buf,
+                        discontiguous,
+                    },
+                ));
+            } else {
+                let _ = vm.deallocate(host_addr, total_length);
+            }
+        }
+
+        None
+    }
+
+    /// Synchronizes from guest physical RAM any discontiguous buffers that intersect `[ptr, ptr + len)`.
+    #[allow(unsafe_code)]
+    pub fn sync_range_from_guest(&self, ptr: HostPtr, len: u64) {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        let addr = ptr.addr().to_u64();
+        let end = addr.saturating_add(len);
+        let buffers = self.discontiguous.lock().clone();
+        for b in &buffers {
+            let b_addr = b.host_addr.addr().to_u64();
+            let b_end = b_addr.saturating_add(b.total_length);
+            if addr < b_end && end > b_addr {
+                for chunk in &b.chunks {
+                    let chunk_addr = b_addr.wrapping_add(chunk.host_offset);
+                    let chunk_end = chunk_addr.saturating_add(chunk.chunk_size as u64);
+                    if addr < chunk_end && end > chunk_addr {
+                        let dst_slice = unsafe {
+                            let dst_ptr = (b.host_addr.addr() + chunk.host_offset as usize) as *mut u8;
+                            std::slice::from_raw_parts_mut(dst_ptr, chunk.chunk_size)
+                        };
+                        self.read(chunk.cur_phys, dst_slice);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Synchronizes to guest physical RAM any discontiguous buffers that intersect `[ptr, ptr + len)`.
+    #[allow(unsafe_code)]
+    pub fn sync_range_to_guest(&self, ptr: HostPtr, len: u64) {
+        if ptr.is_null() || len == 0 {
+            return;
+        }
+        let addr = ptr.addr().to_u64();
+        let end = addr.saturating_add(len);
+        let buffers = self.discontiguous.lock().clone();
+        for b in &buffers {
+            let b_addr = b.host_addr.addr().to_u64();
+            let b_end = b_addr.saturating_add(b.total_length);
+            if addr < b_end && end > b_addr {
+                for chunk in &b.chunks {
+                    let chunk_addr = b_addr.wrapping_add(chunk.host_offset);
+                    let chunk_end = chunk_addr.saturating_add(chunk.chunk_size as u64);
+                    if addr < chunk_end && end > chunk_addr {
+                        let src_slice = unsafe {
+                            let src_ptr = (b.host_addr.addr() + chunk.host_offset as usize) as *const u8;
+                            std::slice::from_raw_parts(src_ptr, chunk.chunk_size)
+                        };
+                        self.write(chunk.cur_phys, src_slice);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The single contiguous host address covering exactly `[.., total_length)` of `ranges`, when
+    /// the request is one contiguous guest span that lies wholly inside one stored map range;
+    /// `None` otherwise (scattered ranges, a gap, or a span crossing stored ranges — those need a
+    /// real alias and cannot be borrowed). `physical_address == 0` is refused, as elsewhere.
+    fn contiguous_host_address(&self, ranges: &[PhysRange], total_length: u64) -> Option<HostPtr> {
+        // Collapse the request to one [start, end) span; refuse gaps / out-of-order / zero start.
+        let mut start: Option<u64> = None;
+        let mut cursor: u64 = 0;
+        let mut sum: u64 = 0;
+        for (i, r) in ranges.iter().enumerate() {
+            if r.physical_length == 0 {
+                continue;
+            }
+            if r.physical_address == 0 {
+                log::warn!("contiguous_host_address: range[{}] physical_address is 0", i);
+                return None;
+            }
+            match start {
+                None => {
+                    start = Some(r.physical_address);
+                    cursor = r.physical_address.checked_add(r.physical_length)?;
+                }
+                Some(_) => {
+                    // Must be exactly contiguous with what we have so far.
+                    if r.physical_address != cursor {
+                        log::warn!(
+                            "contiguous_host_address: discontiguous at range[{}]: {:#x} != cursor {:#x}",
+                            i,
+                            r.physical_address,
+                            cursor
+                        );
+                        return None;
+                    }
+                    cursor = cursor.checked_add(r.physical_length)?;
+                }
+            }
+            sum = sum.checked_add(r.physical_length)?;
+        }
+        let start = start?;
+        if sum != total_length {
+            log::warn!("contiguous_host_address: sum {:#x} != total_length {:#x}", sum, total_length);
+            return None;
+        }
+        let end = start.checked_add(total_length)?;
+        // The whole span must lie inside ONE stored range.
+        for map_range in &self.ranges {
+            if start >= map_range.physical_address && end <= map_range.physical_end {
+                let off = start.wrapping_sub(map_range.physical_address);
+                return Some(ptr_u64(addr_u64(map_range.virtual_address).wrapping_add(off)));
+            }
+        }
+        log::warn!("contiguous_host_address: span [{:#x}..{:#x}) not in any stored map range (ranges={})", start, end, self.ranges.len());
+        None
+    }
+
+    /// A fresh VM allocation with each request range remapped into it, in request order; every
+    /// refusal after the allocation deallocates it, except a failed protect. A length that is not
+    /// whole pages dies.
+    fn remap_range_mapping(
         &self,
         ranges: &[PhysRange],
         total_length: u64,

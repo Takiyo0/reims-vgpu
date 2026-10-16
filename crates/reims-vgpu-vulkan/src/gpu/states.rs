@@ -445,7 +445,7 @@ fn color_attachment(raw: u64) -> Option<ColorAttachmentDescriptor> {
 }
 
 /// `newRenderPipelineStateWithDescriptor:error:` of the display's value: its two functions and
-/// colour 0's format, blending off, no vertex descriptor, the resource index as the placement.
+/// colour 0's format, source-over blending when configured, no vertex descriptor, the resource index as the placement.
 /// The compile's refusal of a format the functions cannot write (an integer target) is the
 /// `NSError`, as Metal answers nil and an error there; no path reaches it under a handler, so
 /// every other refusal dies at the send.
@@ -458,6 +458,18 @@ pub(crate) fn new_render_pipeline_state(
         RenderPipelineDescriptor::new(StageSource::Function(desc.vertex.function_descriptor()));
     d.fragment = Some(StageSource::Function(desc.fragment.function_descriptor()));
     d.color_attachments[0] = color_attachment(desc.color0_pixel_format);
+    if let Some(c) = d.color_attachments[0].as_mut() {
+        if desc.blend_source_over {
+            use metal2vulkan::metal::{BlendFactor, BlendOperation};
+            c.blending_enabled = true;
+            c.source_rgb_blend_factor = BlendFactor::One;
+            c.destination_rgb_blend_factor = BlendFactor::OneMinusSourceColor;
+            c.source_alpha_blend_factor = BlendFactor::One;
+            c.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
+            c.rgb_blend_operation = BlendOperation::Add;
+            c.alpha_blend_operation = BlendOperation::Add;
+        }
+    }
     let mut options = rt::PipelineOptions::default();
     options.placement = placement(desc.resource_index);
     options.label = desc.label.map(str::to_owned);
@@ -1045,10 +1057,23 @@ mod tests {
                 fragment,
                 color0_pixel_format: 80,
                 resource_index: None,
+                blend_source_over: false,
             })
             .unwrap()
             .unwrap();
         assert_eq!(value.raw.label(), Some("display"));
+        let blended = d
+            .new_render_pipeline_state(&RenderPipelineDesc {
+                label: Some("display-blended"),
+                vertex,
+                fragment,
+                color0_pixel_format: 80,
+                resource_index: None,
+                blend_source_over: true,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(blended.raw.label(), Some("display-blended"));
     }
 
     /// A tile descriptor whose tile function is no kernel is refused, as Metal's compile refuses

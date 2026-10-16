@@ -582,6 +582,7 @@ impl VulkanDevice {
         nil: Nil,
     ) -> RaiseResult<Option<rt::Buffer>> {
         use reims_vgpu_core::platform::os::surface::Surface as _;
+        surface.refresh();
         let held = Arc::clone(surface);
         let run: rt::Deallocator = Box::new(move |_, _| {
             let _env = BlockEnv::foreign();
@@ -1373,6 +1374,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
         let plane = at;
         let surface = Arc::new(surface.clone_ref());
+        reims_vgpu_core::platform::os::surface::Surface::refresh(&*surface);
         // The texture's hold on its surface's range, which the range token of the buffer it is
         // over holds too: the range goes once the runtime frees that buffer, after the last
         // command buffer that used the texture completed, as Metal frees it ([`metal_space::Hold`]).

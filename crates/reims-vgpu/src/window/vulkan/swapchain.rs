@@ -1,4 +1,4 @@
-//! [`SwapchainSink`]: what draws a window display's frames on the Vulkan platform, on either OS,
+﻿//! [`SwapchainSink`]: what draws a window display's frames on the Vulkan platform, on either OS,
 //! into the window's swapchain on the runtime's own device, with no copy.
 //!
 //! The window's render thread asks the sink for a presenter at its first draw: the sink makes the
@@ -27,9 +27,11 @@
 //! **Statistics.** With `REIMS_VGPU_STATS` on, each frame committed counts as a window frame, as
 //! every sink's does, and its command buffer's GPU time is the window's ([`crate::stats`]).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use reims_vgpu_core::display::Display as CoreDisplay;
+use reims_vgpu_core::platform::types::ClearColor;
 use reims_vgpu_core::platform::{Handle as _, Platform};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::swapchain::{self, Acquired, Frame, Swapchain};
@@ -38,6 +40,22 @@ use reims_vgpu_window::{Drawn, FrameSink, PixelRect, Presenter, VulkanTarget};
 use crate::entry;
 use crate::stats::DisplayStats;
 use crate::window::{SinkDisplay, WindowFrame};
+
+
+/// DIAG(clear-test): whether `REIMS_VGPU_CLEAR_TEST=1` is set — bypass the display encode and
+/// clear each acquired image to a cycling colour, to tell a present/compositing fault from a
+/// frame-content fault (advisor experiment 3). Read once, cached.
+fn clear_test_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_CLEAR_TEST")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// DIAG(clear-test): a running frame counter, so the clear colour cycles frame to frame.
+static CLEAR_TEST_FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// The platform's command queue.
 type Queue = <VulkanPlatform as Platform>::CommandQueue;
@@ -141,6 +159,33 @@ impl Presenter for SwapchainPresenter {
                 stats: self.display.stats(),
                 ready: None,
             };
+            // DIAG(clear-test): bypass the guest encode and clear to a cycling colour instead.
+            if clear_test_on() {
+                let n = CLEAR_TEST_FRAME.fetch_add(1, Ordering::Relaxed);
+                // Cycle red → green → blue → … so motion is unmistakable on screen.
+                let phase = (n / 30) % 3;
+                let color = ClearColor {
+                    red: if phase == 0 { 1.0 } else { 0.0 },
+                    green: if phase == 1 { 1.0 } else { 0.0 },
+                    blue: if phase == 2 { 1.0 } else { 0.0 },
+                    alpha: 1.0,
+                };
+                if n == 0 || n % 30 == 0 {
+                    log::info!(
+                        target: "reims_vgpu::window",
+                        "DIAG clear-test frame #{n}: clearing to rgb({},{},{})",
+                        color.red, color.green, color.blue
+                    );
+                }
+                if !self.display.clear_test(color, &mut image) {
+                    return Drawn::Nothing;
+                }
+                let Some(command_buffer) = image.ready else {
+                    return Drawn::Nothing;
+                };
+                self.swapchain.present(frame, command_buffer);
+                return Drawn::Presented;
+            }
             if !self.display.encode(region, &mut image) {
                 return Drawn::Nothing;
             }

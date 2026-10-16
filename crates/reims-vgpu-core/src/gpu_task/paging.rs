@@ -16,7 +16,8 @@ use crate::fifo::wire::Records;
 use crate::guest::records::CmdExecIndirectResource3;
 use crate::platform::Platform;
 use crate::platform::blit::{BlitCmd, BlitEncoder};
-use crate::platform::command::{CommandBuffer, CommandQueue, CompletedHandler};
+use crate::platform::command::{CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo};
+use crate::platform::types::CommandBufferStatus;
 use crate::platform::compute::{ComputeCmd, ComputeEncoder};
 use crate::platform::event::EventRef;
 use crate::raise::{OnFault, RaiseResult};
@@ -229,6 +230,19 @@ impl<P: Platform> GpuTask<P> {
             None => None,
         };
         fatal_unless!(sync.event.is_some(), DeathKind::SyncWithoutFifoEvent);
+        let to_flush: Vec<Arc<Resource<P>>> = blit_resources
+            .iter()
+            .chain(&compute_resources)
+            .cloned()
+            .collect();
+        let completion_handler: CompletedHandler = Box::new(move |info: CompletedInfo| {
+            if info.status == CommandBufferStatus::COMPLETED {
+                for r in &to_flush {
+                    r.flush_to_guest();
+                }
+            }
+            completion_handler(info);
+        });
         if let Some(b) = &command_buffer {
             b.encode_wait(sync.event.as_ref().map(EventRef::Shared), sync.value)?;
         }

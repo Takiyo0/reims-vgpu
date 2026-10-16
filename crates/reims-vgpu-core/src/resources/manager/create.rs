@@ -159,6 +159,8 @@ pub(crate) trait CreateEnv<P: Platform> {
         &self,
         mapping_id: u64,
         texture: P::Texture,
+        surface_base: u64,
+        surface_size: u64,
     ) -> RaiseResult<Option<Self::Res>>;
     /// A texture resource over another task's shared backing.
     fn new_shared_texture_resource(
@@ -172,6 +174,7 @@ pub(crate) trait CreateEnv<P: Platform> {
         object_type: u32,
         texture: P::Texture,
         backing: Self::Res,
+        plane: u16,
     ) -> RaiseResult<Option<Self::Res>>;
     /// An IOSurface backing of up to three planes.
     fn new_backing_resource(
@@ -332,9 +335,11 @@ impl<P: Platform> CreateEnv<P> for ResourceManager<P> {
         &self,
         mapping_id: u64,
         texture: P::Texture,
+        surface_base: u64,
+        surface_size: u64,
     ) -> RaiseResult<Option<Self::Res>> {
         let task = Arc::downgrade(&self.live_task());
-        MapperRefTextureResource::new(task, mapping_id, texture)
+        MapperRefTextureResource::new(task, mapping_id, texture, surface_base, surface_size)
     }
     fn new_shared_texture_resource(
         &self,
@@ -349,9 +354,10 @@ impl<P: Platform> CreateEnv<P> for ResourceManager<P> {
         object_type: u32,
         texture: P::Texture,
         backing: Self::Res,
+        plane: u16,
     ) -> RaiseResult<Option<Self::Res>> {
         let task = Arc::downgrade(&self.live_task());
-        RefTextureResource::new(task, object_type, texture, backing)
+        RefTextureResource::new(task, object_type, texture, backing, plane)
     }
     fn new_backing_resource(
         &self,
@@ -1155,8 +1161,11 @@ mod tests {
                 &self,
                 mapping_id: u64,
                 texture: Fk<kind::Texture>,
+                surface_base: u64,
+                surface_size: u64,
             ) -> RaiseResult<Option<Res>> {
-                self.0.new_mapper_ref_texture_resource(mapping_id, texture)
+                self.0
+                    .new_mapper_ref_texture_resource(mapping_id, texture, surface_base, surface_size)
             }
             fn new_shared_texture_resource(
                 &self,
@@ -1171,9 +1180,10 @@ mod tests {
                 object_type: u32,
                 texture: Fk<kind::Texture>,
                 backing: Res,
+                plane: u16,
             ) -> RaiseResult<Option<Res>> {
                 self.0
-                    .new_ref_texture_resource(object_type, texture, backing)
+                    .new_ref_texture_resource(object_type, texture, backing, plane)
             }
             fn new_backing_resource(
                 &self,

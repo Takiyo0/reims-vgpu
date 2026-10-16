@@ -424,6 +424,14 @@ impl<P: Platform> PagedTexture<P> {
         }
         if self.texture.protection_options() == 0 {
             ensure()?;
+            if let Some(tb) = self.transfer_buffer.lock().as_ref() {
+                if let Some(t) = self.task.upgrade() {
+                    if let Some(map) = t.memory_map() {
+                        use crate::platform::resource::Buffer as _;
+                        map.sync_range_from_guest(tb.contents(), tb.length());
+                    }
+                }
+            }
             page()?;
         }
         state.set_host_valid(true);
@@ -450,6 +458,17 @@ impl<P: Platform> PagedTexture<P> {
         }
         state.set_guest_valid(true);
         Ok(())
+    }
+
+    pub(crate) fn flush_to_guest(&self) {
+        if let Some(tb) = self.transfer_buffer.lock().as_ref() {
+            if let Some(t) = self.task.upgrade() {
+                if let Some(map) = t.memory_map() {
+                    use crate::platform::resource::Buffer as _;
+                    map.sync_range_to_guest(tb.contents(), tb.length());
+                }
+            }
+        }
     }
 
     /// The Metal texture.
@@ -544,6 +563,10 @@ impl<P: Platform> ResourceClass<P> for TextureResource<P> {
     fn get_texture(&self, this: &Resource<P>) -> RaiseResult<Option<P::Texture>> {
         let _ = this;
         Ok(Some(self.paged.texture()))
+    }
+
+    fn flush_to_guest(&self, _this: &Resource<P>) {
+        self.paged.flush_to_guest();
     }
 }
 

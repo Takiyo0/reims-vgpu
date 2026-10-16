@@ -243,6 +243,51 @@ impl<P: Platform> LocalTask<P> {
         Ok(memory_map.and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
     }
 
+    /// Resolves the host virtual address for each guest virtual page in `offset..offset + length`.
+    pub(super) fn resolve_pages(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<Option<Vec<crate::guest::GuestPtr>>> {
+        check_mappable(offset, length, self.length, !self.task_root.is_null())?;
+        let Some(walker) = &self.walker else {
+            return Ok(None);
+        };
+        let Some(device) = self.device.upgrade() else {
+            return Ok(None);
+        };
+        let Some(memory_map) = device.memory_map() else {
+            return Ok(None);
+        };
+        let mut pages = Vec::new();
+        let mut ok = true;
+        walker.visit_pages_in_range(
+            hold,
+            OnFault::Return,
+            offset,
+            length,
+            &mut |_address, page, _writable| {
+                let physical = page_address(page);
+                let host_va = memory_map.virtual_address_for_physical(physical, PAGE);
+                if host_va.is_null() {
+                    log::warn!(
+                        "task {}: page {page:#x} phys {physical:#x} host_va is NULL",
+                        self.task_id
+                    );
+                    ok = false;
+                    return Ok(false);
+                }
+                pages.push(crate::guest::GuestPtr::new(host_va));
+                Ok(true)
+            },
+        )?;
+        if !ok {
+            return Ok(None);
+        }
+        Ok(Some(pages))
+    }
+
     /// The host address of task memory at `offset`, mapped for `length` bytes. In the map setup
     /// the covering pages get a fresh mapping, which comes back with the address (the caller
     /// holds it while it uses the address); a writability check that then raises carries it

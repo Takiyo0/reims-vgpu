@@ -10,6 +10,9 @@ __pycache__/
 
 # Editor / OS
 .DS_Store
+.idea/
+probes/
+target/.rustc_info.json
 
 # The Cargo workspace's build trees (target, and any target-* beside it), and
 # reims-ctl's, which is a workspace of its own.

@@ -48,6 +48,7 @@ pub struct TRes {
     pub object_type: u32,
     pub record: Option<(TextureDimensionRecord, u64, TexturePagingInfo)>,
     pub backing: Option<Res>,
+    pub plane: u16,
     pub value: u64,
 }
 
@@ -557,10 +558,17 @@ impl CreateEnv<Fp> for TestEnv {
         &self,
         mapping_id: u64,
         texture: Fk<kind::Texture>,
+        surface_base: u64,
+        surface_size: u64,
     ) -> RaiseResult<Option<Res>> {
         self.make(
             "new_mapper_ref_texture_resource",
-            vec![Arg::U64(mapping_id), Arg::obj(&texture)],
+            vec![
+                Arg::U64(mapping_id),
+                Arg::obj(&texture),
+                Arg::U64(surface_base),
+                Arg::U64(surface_size),
+            ],
             || TRes {
                 texture: Some(texture),
                 value: mapping_id,
@@ -588,6 +596,7 @@ impl CreateEnv<Fp> for TestEnv {
         object_type: u32,
         texture: Fk<kind::Texture>,
         backing: Res,
+        plane: u16,
     ) -> RaiseResult<Option<Res>> {
         self.make(
             "new_ref_texture_resource",
@@ -595,11 +604,13 @@ impl CreateEnv<Fp> for TestEnv {
                 Arg::U32(object_type),
                 Arg::obj(&texture),
                 Arg::Str(backing.class.to_owned()),
+                Arg::U16(plane),
             ],
             || TRes {
                 object_type,
                 texture: Some(texture),
                 backing: Some(backing),
+                plane,
                 ..TRes::default()
             },
         )

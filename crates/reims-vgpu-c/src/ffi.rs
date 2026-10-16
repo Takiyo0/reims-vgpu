@@ -46,5 +46,6 @@ pub(crate) fn host_call<R>(call: &'static str, f: impl FnOnce() -> R) -> R {
     }
 }
 
-#[cfg(test)]
+// The ffi tests assert POSIX signal deaths of forked children (`ExitStatusExt`); unix only.
+#[cfg(all(test, unix))]
 mod tests;

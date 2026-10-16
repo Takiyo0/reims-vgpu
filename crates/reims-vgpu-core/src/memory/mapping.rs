@@ -33,6 +33,15 @@ pub enum Teardown<P: Platform> {
         /// The host task.
         task: HostTask,
     },
+    /// A discontiguous host allocation under WHPX fallback: unregisters from the memory map on drop.
+    Discontiguous {
+        /// The platform whose `vm()` deallocates.
+        platform: Arc<P>,
+        /// The discontiguous buffer details.
+        buffer: Arc<crate::memory::map::DiscontiguousBuffer>,
+        /// Weak reference to the discontiguous buffers list for unregistration.
+        discontiguous: std::sync::Weak<crate::sync::Mutex<Vec<Arc<crate::memory::map::DiscontiguousBuffer>>>>,
+    },
 }
 
 /// A host range over guest memory. Shared as `Arc<Mapping<P>>`; the last drop runs the
@@ -76,7 +85,7 @@ impl<P: Platform> Mapping<P> {
                 true
             }
             Teardown::Task { .. } => true,
-            Teardown::None | Teardown::Vm { .. } => writable,
+            Teardown::None | Teardown::Vm { .. } | Teardown::Discontiguous { .. } => writable,
         };
         Arc::new(Mapping {
             virtual_address,
@@ -108,6 +117,16 @@ impl<P: Platform> Drop for Mapping<P> {
             Teardown::None => {}
             Teardown::Vm { platform } => {
                 // The result is ignored.
+                let _ = platform.vm().deallocate(self.virtual_address, self.length);
+            }
+            Teardown::Discontiguous {
+                platform,
+                buffer,
+                discontiguous,
+            } => {
+                if let Some(d) = discontiguous.upgrade() {
+                    d.lock().retain(|b| !Arc::ptr_eq(b, buffer));
+                }
                 let _ = platform.vm().deallocate(self.virtual_address, self.length);
             }
             Teardown::RootTask { device } => {
