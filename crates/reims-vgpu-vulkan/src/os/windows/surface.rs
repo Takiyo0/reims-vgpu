@@ -171,43 +171,27 @@ impl WindowsSurface {
             }
             offset += now;
         }
+        data.gpu_written.store(false, Ordering::Release);
     }
 
-    /// Unconditionally synchronizes changes from `source_ranges` (guest memory) into `own`
-    /// memory, resetting the `gpu_written` latch.
+    /// Synchronizes guest changes into `own` unless the GPU owns newer contents. A writeback
+    /// makes both copies agree, after which subsequent guest writes may be refreshed.
     pub fn sync_from_guest(&self) {
-        let data = self.data();
-        let Some(own) = &data.own else { return };
-        if data.source_ranges.is_empty() {
-            return;
-        }
-        let _guard = data.sync_lock.lock();
-        let length = own.length();
-        let dst = own.first() as *mut u8;
-        let mut offset = 0usize;
-        for r in &data.source_ranges {
-            if offset as u64 >= length {
-                break;
-            }
-            let now = (r.physical_length.min(length.saturating_sub(offset as u64))) as usize;
-            let src = r.physical_address as *const u8;
-            // SAFETY: Under WHPX, physical_address is the direct host VA within QEMU's guest RAM allocation.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src, dst.add(offset), now);
-            }
-            offset += now;
-        }
-        data.gpu_written.store(false, Ordering::Release);
+        self.refresh();
     }
 
     /// Marks the surface as written by the GPU.
     pub fn mark_gpu_written(&self) {
-        self.data().gpu_written.store(true, Ordering::Release);
+        let data = self.data();
+        let _guard = data.sync_lock.lock();
+        data.gpu_written.store(true, Ordering::Release);
     }
 
     /// Clears the GPU-written flag, allowing subsequent `refresh()` calls to update from guest RAM.
     pub fn clear_gpu_written(&self) {
-        self.data().gpu_written.store(false, Ordering::Release);
+        let data = self.data();
+        let _guard = data.sync_lock.lock();
+        data.gpu_written.store(false, Ordering::Release);
     }
 
     /// Whether this surface was marked as written by the GPU.
@@ -979,9 +963,9 @@ mod tests {
         free(at, 4 * page);
     }
 
-    /// A multi-range surface over pages with no section falls back to OwnMemory under WHPX,
-    /// and refresh() synchronizes updated guest pixel data into OwnMemory, while sync_to_guest()
-    /// synchronizes changes back.
+    /// A multi-range surface over pages with no section falls back to OwnMemory under WHPX;
+    /// guest changes refresh it, GPU-owned contents survive guest refreshes, and writeback
+    /// returns ownership to the guest.
     #[test]
     fn pages_without_a_section_fall_back_to_own_memory_and_refresh() {
         let vm = WindowsVm::new();
@@ -1027,7 +1011,7 @@ mod tests {
         surface.refresh();
         assert_eq!(read(base), 0x42);
 
-        // Host writes to OwnMemory (0x77).
+        // A GPU write is newer than the guest's copy. Refresh must not replace it.
         unsafe {
             std::ptr::write_bytes(
                 std::ptr::with_exposed_provenance_mut::<u8>(base.to_usize()),
@@ -1035,11 +1019,35 @@ mod tests {
                 (2 * page).to_usize(),
             );
         }
-        assert_eq!(read(at), 0x42);
+        surface.mark_gpu_written();
+        unsafe {
+            std::ptr::write_bytes(
+                std::ptr::with_exposed_provenance_mut::<u8>(at.to_usize()),
+                0x55,
+                (2 * page).to_usize(),
+            );
+        }
+        surface.sync_from_guest();
+        assert_eq!(read(base), 0x77);
+        assert!(surface.is_gpu_written());
 
-        // After sync_to_guest, guest memory has 0x77.
+        assert_eq!(read(at), 0x55);
+
+        // After sync_to_guest, guest memory has 0x77 and both copies agree.
         surface.sync_to_guest();
         assert_eq!(read(at), 0x77);
+        assert!(!surface.is_gpu_written());
+
+        // A subsequent guest write can now refresh the host copy.
+        unsafe {
+            std::ptr::write_bytes(
+                std::ptr::with_exposed_provenance_mut::<u8>(at.to_usize()),
+                0x33,
+                (2 * page).to_usize(),
+            );
+        }
+        surface.sync_from_guest();
+        assert_eq!(read(base), 0x33);
 
         drop(surface);
         free(at, 2 * page);

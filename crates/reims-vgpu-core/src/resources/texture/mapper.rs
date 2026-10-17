@@ -66,10 +66,8 @@ impl<P: Platform> MapperRefTextureResource<P> {
 
     /// Synchronizes guest memory into the host surface.
     fn sync_from_guest(&self) {
-        if let Some(surface) = self.texture.as_ref().and_then(Texture::iosurface) {
-            use crate::platform::os::surface::Surface as _;
-            surface.sync_from_guest();
-        }
+        // Refresh the guest-memory staging first. A WHPX surface can itself have a second
+        // staging allocation, so copying it before this step would import stale guest bytes.
         if let Some(t) = self.task.upgrade() {
             if let Some(map) = t.memory_map() {
                 if self.surface_base != 0 && self.surface_size != 0 {
@@ -79,6 +77,10 @@ impl<P: Platform> MapperRefTextureResource<P> {
                     map.sync_range_from_guest(ptr, self.surface_size);
                 }
             }
+        }
+        if let Some(surface) = self.texture.as_ref().and_then(Texture::iosurface) {
+            use crate::platform::os::surface::Surface as _;
+            surface.sync_from_guest();
         }
     }
 

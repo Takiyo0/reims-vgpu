@@ -322,7 +322,6 @@ impl TextureObject {
             || sel.contains("ComputeTexture")
             || sel.contains("toTexture")
             || sel.contains("fillTexture")
-            || self.usage() & 0x2 != 0
         {
             self.mark_gpu_written();
         }

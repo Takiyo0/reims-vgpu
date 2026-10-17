@@ -463,7 +463,7 @@ pub(crate) fn new_render_pipeline_state(
             use metal2vulkan::metal::{BlendFactor, BlendOperation};
             c.blending_enabled = true;
             c.source_rgb_blend_factor = BlendFactor::One;
-            c.destination_rgb_blend_factor = BlendFactor::OneMinusSourceColor;
+            c.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
             c.source_alpha_blend_factor = BlendFactor::One;
             c.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
             c.rgb_blend_operation = BlendOperation::Add;

@@ -435,25 +435,41 @@ impl<P: Platform> DisplayCore<P> {
                 }
                 if let Some(frame) = frame {
                     g.pipeline.format = dst.pixel_format();
-                    g.pipeline.blend = has_backdrop;
+                    // A macOS display frame is already the guest's complete, composited screen.
+                    // Its alpha is not a layer opacity and must not blend the screen over the
+                    // host's generated recovery backdrop. The EFI framebuffer is the one path
+                    // that may use that backdrop to fill its transparent pixels.
+                    g.pipeline.blend = has_backdrop && frame.iosurface().is_none();
                     let pipeline = match &self.render_pipeline_cache {
                         Some(cache) => cache.pipeline_for(g.pipeline),
                         None => None,
                     };
-                    // Force the sampled frame's alpha to 1 ONLY for guest x8r8g8b8 linear EFI framebuffers
-                    // without a wallpaper backdrop (which carry alpha 0 and no IOSurface, sampled through
-                    // the plain present fragment, which a Windows swapchain would composite as transparent black).
-                    // When has_backdrop is true, or for macOS WindowServer composite frames (backed by an
-                    // IOSurface or presented with gamma tables), we preserve the frame's true alpha channel so that:
-                    // 1. Transparent background pixels (0, 0, 0, 0) preserve the Draw 1 wallpaper backdrop.
-                    // 2. Fractional alpha in window drop shadows (e.g. surrounding the macOS Setup Assistant
-                    //    window card) renders as a soft translucent Gaussian shadow rather than solid opaque black.
-                    let opaque_view = if frame.iosurface().is_none() && !g.pipeline.gamma && !has_backdrop {
-                        let alpha_one = Swizzle {
-                            red: 2,
-                            green: 3,
-                            blue: 4,
-                            alpha: 1,
+                    // A complete IOSurface-backed guest composite must reach the host as an opaque
+                    // image. Keep RGB untouched and force only the sampled alpha to one; guest
+                    // shadows are already composited into the guest frame. EFI may retain alpha
+                    // when a backdrop is present so its transparent pixels reveal that fallback.
+                    let alpha_probe = frame.iosurface().is_some()
+                        && std::env::var_os("REIMS_VGPU_PROBE_ALPHA").is_some();
+                    let opaque_view = if frame.iosurface().is_some()
+                        || (frame.iosurface().is_none() && !g.pipeline.gamma && !has_backdrop)
+                    {
+                        // The opt-in probe turns sampled alpha into visible grayscale so a
+                        // script-captured VNC frame can distinguish transparent black guest
+                        // pixels from opaque black guest pixels without changing the shader.
+                        let swizzle = if alpha_probe {
+                            Swizzle {
+                                red: 5,
+                                green: 5,
+                                blue: 5,
+                                alpha: 1,
+                            }
+                        } else {
+                            Swizzle {
+                                red: 2,
+                                green: 3,
+                                blue: 4,
+                                alpha: 1,
+                            }
                         };
                         frame
                             .new_swizzled_texture_subview(
@@ -461,7 +477,7 @@ impl<P: Platform> DisplayCore<P> {
                                 frame.texture_type(),
                                 NsRange::new(0, frame.mipmap_level_count().max(1)),
                                 NsRange::new(0, frame.array_length().max(1)),
-                                alpha_one,
+                                swizzle,
                             )
                             .ok()
                             .flatten()
