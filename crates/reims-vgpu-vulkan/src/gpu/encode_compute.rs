@@ -463,9 +463,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 range,
             } => {
                 let at = first(sel, range, &[buffers.len(), offsets.len(), strides.len()]);
-                for &b in buffers.iter().flatten() {
-                    b.mark_gpu_written();
-                }
                 let buffers: Vec<_> = buffers.iter().map(|b| b.map(|b| &b.raw)).collect();
                 caught(&mut |e| e.set_buffers_with_strides(&buffers, offsets, strides, at))
             }
@@ -475,9 +472,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 range,
             } => {
                 let at = first(sel, range, &[buffers.len(), offsets.len()]);
-                for &b in buffers.iter().flatten() {
-                    b.mark_gpu_written();
-                }
                 let buffers: Vec<_> = buffers.iter().map(|b| b.map(|b| &b.raw)).collect();
                 caught(&mut |e| e.set_buffers(&buffers, offsets, at))
             }
@@ -527,17 +521,11 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }),
             ComputeCmd::SetTexture { texture, index } => {
                 let index = small(sel, index);
-                if let Some(t) = texture {
-                    t.mark_gpu_written();
-                }
                 let texture = texture.map(|t| t.texels(sel));
                 caught(&mut |e| e.set_texture(texture, index))
             }
             ComputeCmd::SetTextures { textures, range } => {
                 let at = first(sel, range, &[textures.len()]);
-                for &t in textures.iter().flatten() {
-                    t.mark_gpu_written();
-                }
                 let textures: Vec<_> = textures.iter().map(|t| t.map(|t| t.texels(sel))).collect();
                 caught(&mut |e| e.set_textures(&textures, at))
             }
@@ -581,13 +569,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 }
                 caught(&mut |e| e.use_resources(&some, usage))?;
                 if usage.contains(ResourceUsage::WRITE) {
-                    for r in list.iter().flatten() {
-                        match r {
-                            ResourceRef::Buffer(b) => b.mark_gpu_written(),
-                            ResourceRef::Texture(t) => t.mark_gpu_written(),
-                            _ => {}
-                        }
-                    }
                     plain(|| {
                         let mut writable = self.writable_icbs.lock();
                         writable.extend(icbs.iter().map(|icb| icb.clone_ref()));

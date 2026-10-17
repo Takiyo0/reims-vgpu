@@ -300,6 +300,10 @@ impl<P: Platform> DisplayCore<P> {
         // Metal's `+0`), which a raise leaves pushed.
         pool::around(&*self.platform, || {
             let pass = self.platform.render_pass_descriptor();
+            // Opt-in coverage probe: a magenta clear with the synthetic backdrop bypassed makes
+            // any part of the target the present draw misses visible in the VNC capture.
+            let debug_present_coverage =
+                std::env::var_os("REIMS_VGPU_DEBUG_PRESENT_COVERAGE").is_some();
             // The whole destination is cleared, not only the region.
             pass.set_color_attachment(
                 OnFault::Die,
@@ -309,18 +313,39 @@ impl<P: Platform> DisplayCore<P> {
                     load_action: Some(MTL_LOAD_ACTION_CLEAR),
                     store_action: Some(MTL_STORE_ACTION_STORE),
                     clear_color: Some(ClearColor {
-                        red: 0.0,
+                        red: if debug_present_coverage { 1.0 } else { 0.0 },
                         green: 0.0,
-                        blue: 0.0,
+                        blue: if debug_present_coverage { 1.0 } else { 0.0 },
                         alpha: 1.0,
                     }),
                     ..ColorAttachmentSet::default()
                 },
             )?;
-            if (dst.width() > 8 || dst.height() > 8) && g.wallpaper_backdrop.is_none() {
+            // Completed guest frames supply their own wallpaper. Keep the fallback
+            // confined to firmware frames, which do not have an IOSurface.
+            let firmware_backdrop = frame
+                .or(g.current_frame.as_ref())
+                .is_some_and(|frame| frame.iosurface().is_none());
+            if !debug_present_coverage
+                && firmware_backdrop
+                && (dst.width() > 8 || dst.height() > 8)
+                && g.wallpaper_backdrop.is_none()
+            {
                 self.ensure_wallpaper_backdrop_locked(g);
             }
-            let has_backdrop = g.wallpaper_backdrop.is_some();
+            let has_backdrop = !debug_present_coverage
+                && firmware_backdrop
+                && g.wallpaper_backdrop.is_some();
+            if debug_present_coverage {
+                static NOTICE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if NOTICE.fetch_add(1, Ordering::Relaxed) == 0 {
+                    log::warn!(
+                        target: "reims_vgpu::window",
+                        "DIAG present-coverage: magenta clear, generated backdrop skipped"
+                    );
+                }
+            }
             let frame = match frame {
                 Some(f) => Some(f),
                 None => g.current_frame.as_ref(),
@@ -357,7 +382,7 @@ impl<P: Platform> DisplayCore<P> {
                         .set_protection_options(OnFault::Die, g.protection_requirements)?;
                 }
                 encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
-                if let Some(backdrop) = g.wallpaper_backdrop.as_ref() {
+                if let Some(backdrop) = g.wallpaper_backdrop.as_ref().filter(|_| has_backdrop) {
                     let backdrop_key = PipelineKey {
                         format: dst.pixel_format(),
                         gamma: false,
@@ -387,7 +412,12 @@ impl<P: Platform> DisplayCore<P> {
                     )?;
                     crate::nil_send!(
                         encoder,
-                        encode(OnFault::Die, RenderCmd::SetViewport { viewport: full_viewport })
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetViewport {
+                                viewport: full_viewport
+                            }
+                        )
                     )?;
                     crate::nil_send!(
                         encoder,
@@ -435,21 +465,23 @@ impl<P: Platform> DisplayCore<P> {
                 }
                 if let Some(frame) = frame {
                     g.pipeline.format = dst.pixel_format();
-                    g.pipeline.blend = has_backdrop;
+                    // A macOS display frame is already the guest's complete, composited screen.
+                    // Its alpha is not a layer opacity and must not blend the screen over the
+                    // host's generated recovery backdrop. The EFI framebuffer is the one path
+                    // that may use that backdrop to fill its transparent pixels.
+                    g.pipeline.blend = has_backdrop && frame.iosurface().is_none();
                     let pipeline = match &self.render_pipeline_cache {
                         Some(cache) => cache.pipeline_for(g.pipeline),
                         None => None,
                     };
-                    // Force the sampled frame's alpha to 1 ONLY for guest x8r8g8b8 linear EFI framebuffers
-                    // without a wallpaper backdrop (which carry alpha 0 and no IOSurface, sampled through
-                    // the plain present fragment, which a Windows swapchain would composite as transparent black).
-                    // When has_backdrop is true, or for macOS WindowServer composite frames (backed by an
-                    // IOSurface or presented with gamma tables), we preserve the frame's true alpha channel so that:
-                    // 1. Transparent background pixels (0, 0, 0, 0) preserve the Draw 1 wallpaper backdrop.
-                    // 2. Fractional alpha in window drop shadows (e.g. surrounding the macOS Setup Assistant
-                    //    window card) renders as a soft translucent Gaussian shadow rather than solid opaque black.
-                    let opaque_view = if frame.iosurface().is_none() && !g.pipeline.gamma && !has_backdrop {
-                        let alpha_one = Swizzle {
+                    // A complete IOSurface-backed guest composite must reach the host as an opaque
+                    // image. Keep RGB untouched and force only the sampled alpha to one; guest
+                    // shadows are already composited into the guest frame. EFI may retain alpha
+                    // when a backdrop is present so its transparent pixels reveal that fallback.
+                    let opaque_view = if frame.iosurface().is_some()
+                        || (frame.iosurface().is_none() && !g.pipeline.gamma && !has_backdrop)
+                    {
+                        let swizzle = Swizzle {
                             red: 2,
                             green: 3,
                             blue: 4,
@@ -461,7 +493,7 @@ impl<P: Platform> DisplayCore<P> {
                                 frame.texture_type(),
                                 NsRange::new(0, frame.mipmap_level_count().max(1)),
                                 NsRange::new(0, frame.array_length().max(1)),
-                                alpha_one,
+                                swizzle,
                             )
                             .ok()
                             .flatten()
@@ -556,6 +588,15 @@ impl<P: Platform> DisplayCore<P> {
             // The encoder and the pass go before the pool pops.
             drop(encoder);
             drop(pass);
+            if let Some(frame) = frame {
+                super::probe::encode(
+                    &*self.platform,
+                    frame,
+                    dst,
+                    command_buffer,
+                    g.pipeline.gamma,
+                )?;
+            }
             Ok(())
         })?;
         self.in_flight_frame_count.fetch_add(1, Ordering::SeqCst);

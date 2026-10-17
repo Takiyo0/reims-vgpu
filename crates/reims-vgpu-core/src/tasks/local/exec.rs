@@ -69,7 +69,18 @@ impl<P: Platform> LocalTask<P> {
         event: Option<&P::SharedEvent>,
         value: u64,
     ) -> RaiseResult<PrepareSync<P>> {
+        // DIAG(prepare-steps): each step's time, written at debug where it takes 5 ms or more.
+        let diag = log::log_enabled!(log::Level::Debug);
+        let t0 = std::time::Instant::now();
+        let mut steps: Vec<(&'static str, f64)> = Vec::new();
+        let mut mark = |label: &'static str| {
+            if diag {
+                steps.push((label, t0.elapsed().as_secs_f64() * 1000.0));
+            }
+        };
         let _prepare = self.prepare_mutex.lock();
+        crate::perfstats::PREPARE_MUTEX.add(t0.elapsed());
+        mark("prepare_mutex");
         let mut sync = PrepareSync::<P> {
             needs_sync: false,
             needs_complete: false,
@@ -84,7 +95,12 @@ impl<P: Platform> LocalTask<P> {
         for i in 0..resources.count() {
             let resource = resources.get(i)?;
             // Made on first use; a raise abandons the rest
+            let t_get = std::time::Instant::now();
             let host_resource = self.base.get_host_resource(hold, resource.reference)?;
+            let took = t_get.elapsed();
+            if took >= std::time::Duration::from_micros(20) {
+                crate::perfstats::LOOKUP_SLOW.add(took);
+            }
             if resource.invalidate_host()
                 && let Some(r) = &host_resource
             {
@@ -109,48 +125,107 @@ impl<P: Platform> LocalTask<P> {
                 sync.needs_complete = true;
             }
         }
+        mark("resources");
+        let t_lookup = t0.elapsed();
+        crate::perfstats::PREPARE_LOOKUP.add(t_lookup);
+        crate::perfstats::PREPARE_RESOURCES
+            .fetch_add(resources.count(), std::sync::atomic::Ordering::Relaxed);
+        // A volatile resource whose host copy is valid only needs making non-volatile, a CPU call:
+        // done here, it needs no paging buffer, and an exec with nothing else to page builds none
+        // (a paging buffer, its wait and its commit cost ~1 ms an exec, on every video frame).
+        let devolatilized = |list: Vec<Arc<Resource<P>>>| -> RaiseResult<Vec<Arc<Resource<P>>>> {
+            let mut kept = Vec::with_capacity(list.len());
+            for r in list {
+                if r.is_host_valid() && r.state.is_volatile() {
+                    r.devolatilize_now()?;
+                    if !r.needs_prepare() {
+                        continue;
+                    }
+                }
+                kept.push(r);
+            }
+            Ok(kept)
+        };
+        let blit_resources = devolatilized(blit_resources)?;
+        let compute_resources = devolatilized(compute_resources)?;
+        let (n_blit, n_compute, n_cpu) =
+            (blit_resources.len(), compute_resources.len(), cpu_resources.len());
         if !blit_resources.is_empty() || !compute_resources.is_empty() {
+            let t_round = std::time::Instant::now();
+            crate::perfstats::PAGING_PREPARES.fetch_add(
+                (n_blit + n_compute) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            use crate::perfstats::PAGING_STEP as PS;
+            let mut t_step = std::time::Instant::now();
+            let mut step = |i: usize| {
+                PS[i].add(t_step.elapsed());
+                t_step = std::time::Instant::now();
+            };
             let command_buffer = match &self.base.paging_queue {
                 Some(queue) => queue.command_buffer(OnFault::Return)?,
                 None => None,
             };
+            mark("paging command_buffer");
+            step(0);
             if let Some(event) = event
                 && let Some(buffer) = &command_buffer
             {
                 buffer.encode_wait(Some(EventRef::Shared(event)), value)?;
             }
+            mark("paging encode_wait");
+            step(1);
             sync.needs_sync = true;
             let mut blit_encoder: Option<P::BlitEncoder> = None;
             let mut compute_encoder: Option<P::ComputeEncoder> = None;
-            let mut prepared = (|| -> RaiseResult<_> {
+            let (mut prepared, fills) = crate::memory::map::with_deferred_syncs(|| -> RaiseResult<_> {
                 if !blit_resources.is_empty() {
                     blit_encoder = match &command_buffer {
                         Some(buffer) => buffer.blit_encoder(OnFault::Return)?,
                         None => None,
                     };
+                    mark("paging blit_encoder");
+                    step(2);
                     for r in &blit_resources {
-                        r.prepare_in_encoder(hold, blit_encoder.as_ref())?;
+                        let t = std::time::Instant::now();
+                        let done = r.prepare_in_encoder(hold, blit_encoder.as_ref());
+                        crate::perfstats::PAGING_BLIT[r.kind_slot()].add(t.elapsed());
+                        done?;
                     }
+                    step(2);
+                    mark("paging prepares");
                     if let Some(encoder) = &blit_encoder {
                         encoder.encode(OnFault::Return, BlitCmd::EndEncoding)?;
                     }
                     blit_encoder = None;
+                    mark("paging end_encoding");
+                    step(3);
                 }
                 if !compute_resources.is_empty() {
                     compute_encoder = match &command_buffer {
                         Some(buffer) => buffer.compute_encoder(OnFault::Return)?,
                         None => None,
                     };
+                    step(4);
                     for r in &compute_resources {
-                        r.prepare_in_compute_encoder(hold, compute_encoder.as_ref())?;
+                        let t = std::time::Instant::now();
+                        let done = r.prepare_in_compute_encoder(hold, compute_encoder.as_ref());
+                        crate::perfstats::PAGING_COMPUTE[r.kind_slot()].add(t.elapsed());
+                        done?;
                     }
+                    step(4);
                     if let Some(encoder) = &compute_encoder {
                         encoder.encode(OnFault::Return, ComputeCmd::EndEncoding)?;
                     }
                     compute_encoder = None;
                 }
                 Ok(())
-            })();
+            });
+            // The transfer buffers' fills, one thread per texture, before the commit whose
+            // copies read them.
+            crate::memory::map::run_deferred_syncs(fills);
+            mark("paging fills");
+            step(5);
             // Whatever the prepares did: an encoder a raise left open is ended, the paging event
             // is signalled at the next counter value, and the buffer is committed; a raise here
             // goes on in place of the prepare's, which ends there
@@ -178,17 +253,25 @@ impl<P: Platform> LocalTask<P> {
                     sync.value,
                 );
                 hold.cleanup_step(&mut prepared, signalled)?;
+                mark("paging encode_signal");
                 hold.cleanup_step(&mut prepared, buffer.commit(OnFault::Return))?;
+                mark("paging commit");
             }
+            step(6);
+            crate::perfstats::PAGING_ROUNDS.add(t_round.elapsed());
             // Every caller is under a handler (an exec's or an info's): the raise goes on
             prepared?;
         }
+        mark("gpu_paging");
+        let t_paging = t0.elapsed();
+        crate::perfstats::PREPARE_PAGING.add(t_paging - t_lookup);
         (|| -> RaiseResult<_> {
             for r in &cpu_resources {
                 r.prepare_with_cpu(hold)?;
             }
             Ok(())
         })()?;
+        mark("cpu_paging");
         for (identifier, host_resource) in &invalidated {
             let Some(r) = host_resource else {
                 // Nothing to mark, and no host copy either
@@ -218,6 +301,22 @@ impl<P: Platform> LocalTask<P> {
         {
             // A user task's go to the kernel task, under its lock
             self.invalidate_guest(hold, records)?;
+        }
+        mark("invalidate_guest");
+        crate::perfstats::PREPARE_TAIL.add(t0.elapsed() - t_paging);
+        crate::perfstats::PREPARE.add(t0.elapsed());
+        if diag && t0.elapsed().as_secs_f64() >= 0.005 {
+            let mut line = String::new();
+            let mut last = 0.0;
+            for (label, at) in &steps {
+                line.push_str(&format!(" {label}={:.1}", at - last));
+                last = *at;
+            }
+            log::debug!(
+                "task {}: prepare steps (ms):{line}; blit {n_blit} compute {n_compute} cpu {n_cpu} of {}",
+                self.task_id,
+                resources.count()
+            );
         }
         crate::fatal_unless!(
             !sync.needs_sync || sync.event.is_some(),
@@ -399,9 +498,28 @@ impl<P: Platform> LocalTask<P> {
         fifo_event_value: &Arc<AtomicU64>,
         done: Completion,
     ) -> RaiseResult<()> {
+        // DIAG(exec-steps): each step's time, written at debug where the exec takes 5 ms or more.
+        let diag = log::log_enabled!(log::Level::Debug);
+        let t0 = std::time::Instant::now();
+        let steps = std::cell::RefCell::new(Vec::<(&'static str, f64)>::new());
+        // Each step's time also goes to the per-step counters, always (`perfstats`).
+        let last = std::cell::Cell::new(std::time::Duration::ZERO);
+        let mark = |label: &'static str| {
+            let now = t0.elapsed();
+            crate::perfstats::exec_step(label, now.saturating_sub(last.replace(now)));
+            if diag {
+                steps.borrow_mut().push((label, now.as_secs_f64() * 1000.0));
+            }
+        };
         let _lock = self.base.mutex.read();
+        mark("lock");
         let (deserializer, _, lists) = self.parts();
-        if !lists.ensure_mapped(hold) {
+        // Whether the task's list was set within the last few seconds, as this exec starts: only
+        // then can a missing object be a dead process's leftover (below).
+        let young = lists.is_young();
+        let mapped = lists.ensure_mapped(hold);
+        mark("ensure_mapped");
+        if !mapped {
             done(ExecStatus::FAIL, None);
             return Ok(());
         }
@@ -412,6 +530,7 @@ impl<P: Platform> LocalTask<P> {
                 fifo_event,
                 fifo_event_value.load(Ordering::SeqCst),
             )?;
+            mark("prepare_resources");
             let queue = self.device.upgrade().and_then(|d| d.exec_queue());
             let command_buffer = match &queue {
                 Some(queue) => queue.command_buffer(OnFault::Return)?,
@@ -427,9 +546,11 @@ impl<P: Platform> LocalTask<P> {
             }
             // Every copy now, before the decode
             let mut cursors = self.cursors(hold, &cmd_buffers);
+            mark("cursors");
             // Held past the commit, to the end of the exec (`Decoders`).
             let _decoders =
                 deserializer.decode_segments(hold, &mut cursors, command_buffer.as_ref())?;
+            mark("decode");
             if let Some(buffer) = &command_buffer {
                 let exec_buffer = buffer.clone_ref();
                 let handler = Arc::clone(&done);
@@ -449,6 +570,7 @@ impl<P: Platform> LocalTask<P> {
                 buffer.encode_signal(fifo_event.map(EventRef::Shared), value)?;
                 buffer.commit(OnFault::Return)?;
             }
+            mark("commit");
             let complete_sync = CompleteSync::<P> {
                 needs_complete: prepare_sync.needs_complete,
                 event: fifo_event,
@@ -465,7 +587,48 @@ impl<P: Platform> LocalTask<P> {
                 }),
             )
         })();
+        mark("complete_resources");
+        crate::perfstats::EXEC.add(t0.elapsed());
+        crate::perfstats::task_exec(self.task_id, t0.elapsed());
+        if diag && t0.elapsed().as_secs_f64() >= 0.005 {
+            let mut line = String::new();
+            let mut last = 0.0;
+            for (label, at) in steps.borrow().iter() {
+                line.push_str(&format!(" {label}={:.1}", at - last));
+                last = *at;
+            }
+            log::debug!(
+                "task {}: exec steps (ms):{line}; total {:.1}",
+                self.task_id,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         if let Err(raised) = executed {
+            // An exec whose objects are missing from the task's list (an empty entry, a failed
+            // lookup) is, as measured on WHPX, a dead process's leftover: the guest deletes a
+            // task, defines its id again for a new process within milliseconds, and still drains
+            // the old process's queued commands into the FIFOs. Run against the new process's
+            // fresh list they fault, and the fault, reported against the id, gets the new process
+            // killed, which repeats (blank icons, windows that never open, a restart that waits
+            // on them). Such an exec is dropped as done instead, but only while the task is young
+            // (its list set within the last seconds, when leftovers drain): a missing object in
+            // an established task is a real fault and is reported as one.
+            // REIMS_VGPU_EMPTY_ENTRY_FAULTS=1 reports every one as before.
+            static REPORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let report = *REPORT.get_or_init(|| {
+                std::env::var("REIMS_VGPU_EMPTY_ENTRY_FAULTS").is_ok_and(|v| v == "1")
+            });
+            let what = raised.exception();
+            let missing = what.contains("has an empty entry") || what.ends_with("lookup failed");
+            if missing && young && !report {
+                log::warn!(
+                    "task {}: exec dropped (an object it names is not in the task's list): {what}",
+                    self.task_id
+                );
+                done(ExecStatus::OK, None);
+                drop(raised);
+                return Ok(());
+            }
             // A raise after `complete_resources` committed its buffer reports 2 here, and that
             // buffer's handler reports again later.
             log::warn!(

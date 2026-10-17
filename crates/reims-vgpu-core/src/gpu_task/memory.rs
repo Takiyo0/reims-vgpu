@@ -530,12 +530,16 @@ impl<P: Platform> GpuTask<P> {
         page: u32,
         length: u64,
     ) -> RaiseResult<P::Buffer> {
+        // DIAG(bind-steps): a bind of 1 MiB or more taking 0.5 ms or more is written at debug,
+        // split into its mapping and its buffer.
+        let t0 = std::time::Instant::now();
         let mapping = self.new_virtual_mapping(
             hold,
             u64::from(page).wrapping_shl(APV_PAGE_SHIFT),
             length,
             false,
         )?;
+        let t_map = t0.elapsed();
         let Some(mapping) = mapping else {
             return raise_caught(
                 RaiseKind::NoBufferMapping,
@@ -554,6 +558,14 @@ impl<P: Platform> GpuTask<P> {
             );
         };
         let buffer = Self::no_copy_buffer(&device, address, length, mapping)?;
+        if length >= 1 << 20 && t0.elapsed().as_secs_f64() >= 0.0005 {
+            log::debug!(
+                target: "reims_vgpu_core::tasks::local::exec",
+                "bind steps: mapping={:.2} buffer={:.2} ms for {length:#x} bytes",
+                t_map.as_secs_f64() * 1000.0,
+                (t0.elapsed() - t_map).as_secs_f64() * 1000.0
+            );
+        }
         let Some(buffer) = buffer else {
             // Metal released the deallocator's reference; the kept one stays
             keep_forever(kept, Kept::AddressSpace);

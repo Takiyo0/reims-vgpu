@@ -87,10 +87,9 @@ impl Backing {
     /// Whether two backings name the same object and offset (registration counting, run joining).
     fn same(&self, other: &Backing) -> bool {
         match (self, other) {
-            (
-                Backing::Section { fd: a, offset: ao },
-                Backing::Section { fd: b, offset: bo },
-            ) => Arc::ptr_eq(a, b) && ao == bo,
+            (Backing::Section { fd: a, offset: ao }, Backing::Section { fd: b, offset: bo }) => {
+                Arc::ptr_eq(a, b) && ao == bo
+            }
             (Backing::HostVa { base: a }, Backing::HostVa { base: b }) => a == b,
             _ => false,
         }
@@ -342,10 +341,20 @@ pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> Gue
         .map(|r| {
             let backing = match r.fd {
                 // The host already mapped this guest RAM (WHPX): back it by its host VA, which the
-                // runtime imports directly through VK_EXT_external_memory_host. No section.
-                None => Backing::HostVa { base: r.host },
+                // runtime imports directly through VK_EXT_external_memory_host. No section. It
+                // stays mapped while the host runs the guest, so the runtime may keep imports of
+                // it and bind buffers over its pages into them (`register_persistent_host_range`).
+                None => {
+                    if let Some(start) = std::ptr::NonNull::new(r.host as *mut u8) {
+                        metal2vulkan_runtime::register_persistent_host_range(start, r.length);
+                    }
+                    Backing::HostVa { base: r.host }
+                }
                 // A section-backed range (a host that hands sections): a view is mapped from it.
-                Some(fd) => Backing::Section { fd, offset: r.offset },
+                Some(fd) => Backing::Section {
+                    fd,
+                    offset: r.offset,
+                },
             };
             Registration::new(r.host, r.length, backing)
         })
@@ -411,7 +420,10 @@ mod tests {
     fn a_range_resolves_through_runs_then_registrations() {
         let f = file();
         let base = 0x7a00_0000_0000;
-        let backing = |offset| Backing::Section { fd: Arc::clone(&f), offset };
+        let backing = |offset| Backing::Section {
+            fd: Arc::clone(&f),
+            offset,
+        };
         let held = Registration::new(base, 0x10_000, backing(0x100_000));
         record(base + 0x20_000, 0x2000, backing(0x5000), Prot::READ);
         assert_eq!(
@@ -445,7 +457,10 @@ mod tests {
     fn runs_never_overlap() {
         let f = file();
         let base = 0x7b00_0000_0000;
-        let backing = |offset| Backing::Section { fd: Arc::clone(&f), offset };
+        let backing = |offset| Backing::Section {
+            fd: Arc::clone(&f),
+            offset,
+        };
         record(base, 0x4000, backing(0x10_000), Prot::READ_WRITE);
         record(base + 0x1000, 0x1000, backing(0x90_000), Prot::READ);
         assert_eq!(
@@ -512,7 +527,10 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].prot, Prot::READ_WRITE);
         assert_eq!(p[0].backing.host_va(), Some(base + 0x1000));
-        assert!(p[0].backing.section().is_none(), "no section backs borrowed RAM");
+        assert!(
+            p[0].backing.section().is_none(),
+            "no section backs borrowed RAM"
+        );
         // readable() answers true, so a gather/import of these pages is not refused.
         assert_eq!(readable(base, 0x4000), Some(true));
         assert_eq!(readable(base + 0x10_000, 0x2000), Some(true));
@@ -555,7 +573,10 @@ mod tests {
     fn registrations_are_counted() {
         let f = file();
         let base = 0x7c00_0000_0000;
-        let backing = || Backing::Section { fd: Arc::clone(&f), offset: 0 };
+        let backing = || Backing::Section {
+            fd: Arc::clone(&f),
+            offset: 0,
+        };
         let first = Registration::new(base, 0x1000, backing());
         let second = Registration::new(base, 0x1000, backing());
         drop(first);

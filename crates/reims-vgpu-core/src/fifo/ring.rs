@@ -1,4 +1,3 @@
-
 //! The ring cursors: where the thread reads the next command, what it has published back to the
 //! guest, and where a rejected command rewinds to.
 //!
@@ -415,12 +414,20 @@ impl<P: Platform> Fifo<P> {
         let device = self.device.upgrade();
         // The node's page list is read again at every start.
         let list_page = c.node.read_u32(NODE_PAGE_LIST_PAGE, DeathKind::NodeNull);
-        log::info!("FIFO channel {}: mapping child ring, list_page={:#x}", self.stamp_index(), list_page);
+        log::info!(
+            "FIFO channel {}: mapping child ring, list_page={:#x}",
+            self.stamp_index(),
+            list_page
+        );
         let list_mapping = device
             .as_ref()
             .and_then(|d| d.new_contiguous_mapping(list_page, APV_PAGE_SIZE));
         let Some(list_mapping) = list_mapping else {
-            log::warn!("FIFO channel {}: failed to map list_page {:#x}", self.stamp_index(), list_page);
+            log::warn!(
+                "FIFO channel {}: failed to map list_page {:#x}",
+                self.stamp_index(),
+                list_page
+            );
             return false;
         };
         let list = GuestPtr::new(list_mapping.virtual_address());
@@ -438,7 +445,13 @@ impl<P: Platform> Fifo<P> {
             use std::fmt::Write as _;
             let _ = write!(entries_str, " {:#x}", entry(i));
         }
-        log::info!("FIFO channel {}: list_page={:#x} page_count={} entries:{}", self.stamp_index(), list_page, page_count, entries_str);
+        log::info!(
+            "FIFO channel {}: list_page={:#x} page_count={} entries:{}",
+            self.stamp_index(),
+            list_page,
+            page_count,
+            entries_str
+        );
         if page_count == 0 {
             drop(list_mapping);
             return false;
@@ -460,7 +473,12 @@ impl<P: Platform> Fifo<P> {
                     let phys = u64::from(entry(i)).wrapping_mul(APV_PAGE_SIZE);
                     let host_va = map.virtual_address_for_physical(phys, APV_PAGE_SIZE);
                     if host_va.is_null() {
-                        log::warn!("FIFO channel {}: page {} phys={:#x} host_va is NULL", self.stamp_index(), i, phys);
+                        log::warn!(
+                            "FIFO channel {}: page {} phys={:#x} host_va is NULL",
+                            self.stamp_index(),
+                            i,
+                            phys
+                        );
                         ok = false;
                         break;
                     }
@@ -496,7 +514,12 @@ impl<P: Platform> Fifo<P> {
         let read_offset = num::rem0(node_read_count, length);
         c.read_offset.store(read_offset, Ordering::Relaxed);
         c.last_read_offset.store(read_offset, Ordering::Relaxed);
-        log::info!("FIFO channel {}: map_child_ring final mapped={} (all_resolved={})", self.stamp_index(), mapped, all_pages_resolved);
+        log::info!(
+            "FIFO channel {}: map_child_ring final mapped={} (all_resolved={})",
+            self.stamp_index(),
+            mapped,
+            all_pages_resolved
+        );
         mapped
     }
 

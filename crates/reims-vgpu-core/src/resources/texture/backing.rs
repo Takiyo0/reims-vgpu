@@ -2,8 +2,8 @@
 //! backing record and paged plane by plane between the guest pages and one texture per plane
 //! over a new IOSurface. It answers no getter: getting its texture or resource is unrecognized.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -127,6 +127,9 @@ pub struct BackingResource<P: Platform> {
     page: u32,
     /// Generation counter incremented whenever backing data changes or is invalidated.
     generation: AtomicU64,
+    /// The generation the transfer buffer was last filled from the guest at (0: never): a view's
+    /// plane prepare at that generation needs no fill of its own.
+    synced_generation: AtomicU64,
 }
 
 impl<P: Platform> BackingResource<P> {
@@ -261,6 +264,7 @@ impl<P: Platform> BackingResource<P> {
                     length,
                     page,
                     generation: AtomicU64::new(1),
+            synced_generation: AtomicU64::new(0),
                 },
             ))))
         })
@@ -308,7 +312,9 @@ impl<P: Platform> BackingResource<P> {
 
     /// Advances the generation counter and returns the new value.
     pub fn bump_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+        self.generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
     }
 
     /// Prepare and copy a specific plane to a destination texture using the backing transfer buffer.
@@ -319,7 +325,6 @@ impl<P: Platform> BackingResource<P> {
         destination_texture: &P::Texture,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        use crate::platform::resource::Texture as _;
 
         let Some(plane) = self.planes.get(plane_index) else {
             log::warn!(
@@ -328,13 +333,35 @@ impl<P: Platform> BackingResource<P> {
             );
             return Ok(());
         };
+        let t_fill = std::time::Instant::now();
         let transfer_buffer = self.ensure_physical(hold)?;
-        if let Some(t) = self.task.upgrade() {
-            if let Some(map) = t.memory_map() {
-                use crate::platform::resource::Buffer as _;
-                map.sync_range_from_guest(transfer_buffer.contents(), transfer_buffer.length());
+        // The backing's own prepare of this generation filled it already (each frame's views
+        // follow it): a 4K frame's fill is ~2 ms, once per view otherwise.
+        if self.synced_generation.load(Ordering::SeqCst) != self.generation() {
+            if let Some(t) = self.task.upgrade() {
+                if let Some(map) = t.memory_map() {
+                    use crate::platform::resource::Buffer as _;
+                    map.sync_range_from_guest(transfer_buffer.contents(), transfer_buffer.length());
+                }
             }
+            self.synced_generation.store(self.generation(), Ordering::SeqCst);
         }
+        crate::perfstats::PLANE_FILL.add(t_fill.elapsed());
+        let t_copy = std::time::Instant::now();
+        let copied = self.encode_plane_copy(plane, &transfer_buffer, destination_texture, encoder);
+        crate::perfstats::PLANE_COPY.add(t_copy.elapsed());
+        copied
+    }
+
+    /// The copy of `plane` from `transfer_buffer` into `destination_texture`.
+    fn encode_plane_copy(
+        &self,
+        plane: &BackingPlane,
+        transfer_buffer: &P::Buffer,
+        destination_texture: &P::Texture,
+        encoder: Option<&P::BlitEncoder>,
+    ) -> RaiseResult<()> {
+        use crate::platform::resource::Texture as _;
         let mut copy_size = MtlSize {
             width: destination_texture.width(),
             height: destination_texture.height(),
@@ -358,7 +385,7 @@ impl<P: Platform> BackingResource<P> {
             encode(
                 OnFault::Return,
                 BlitCmd::CopyBufferToTexture {
-                    source_buffer: &transfer_buffer,
+                    source_buffer: transfer_buffer,
                     source_offset: u64::from(plane.offset),
                     source_bytes_per_row: bytes_per_row,
                     source_bytes_per_image: bytes_per_image,
@@ -491,7 +518,8 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
             )?;
         }
         state.set_host_valid(true);
-        self.bump_generation();
+        let generation = self.bump_generation();
+        self.synced_generation.store(generation, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1161,6 +1189,7 @@ mod tests {
             length: 4,
             page: 0,
             generation: AtomicU64::new(1),
+            synced_generation: AtomicU64::new(0),
         };
         let e = lone.ensure_physical(hold).err().unwrap();
         assert_eq!(

@@ -45,8 +45,103 @@ pub struct DiscontiguousBuffer {
     pub host_addr: HostPtr,
     /// Total buffer length in bytes.
     pub total_length: u64,
+    /// The length of the host range under it, `total_length` rounded up to its scratch size
+    /// class ([`scratch_length`]): what the teardown gives back.
+    pub alloc_length: u64,
     /// The physical chunks copied into this buffer.
     pub chunks: Vec<DiscontiguousChunk>,
+}
+
+thread_local! {
+    /// Whether a copy fallback made on this thread leaves its buffer unfilled
+    /// ([`with_lazy_fallback`]).
+    static LAZY_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the copy fallback leaving the buffers it makes unfilled: their chunks are
+/// planned and listed, but no guest byte is copied. The caller fills every byte before anything
+/// reads one: a texture's prepare, which gathers the pages into its transfer buffer on the GPU or
+/// copies them with [`MemoryMap::sync_range_from_guest`].
+pub fn with_lazy_fallback<T>(f: impl FnOnce() -> T) -> T {
+    LAZY_FALLBACK.with(|lazy| {
+        let before = lazy.replace(true);
+        let made = f();
+        lazy.set(before);
+        made
+    })
+}
+
+/// A deferred fill of a transfer buffer: the copy of its guest pages ([`defer_sync`]).
+pub type DeferredSync = Box<dyn FnOnce() + Send>;
+
+thread_local! {
+    /// The fills deferred on this thread, where [`with_deferred_syncs`] collects them.
+    static DEFERRED_SYNCS: std::cell::RefCell<Option<Vec<DeferredSync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, collecting the transfer-buffer fills its prepares defer ([`defer_sync`]) instead of
+/// running them in place; the caller runs them ([`run_deferred_syncs`]) before anything reads the
+/// buffers (the commit of the command buffer whose copies read them).
+pub fn with_deferred_syncs<T>(f: impl FnOnce() -> T) -> (T, Vec<DeferredSync>) {
+    // Opt-in (`REIMS_VGPU_PARALLEL_FILLS=1`) while a hang seen with it on (WindowServer stuck
+    // after Setup Assistant's language page, 2026-10-16) is unexplained: off, each fill runs in
+    // place as before.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("REIMS_VGPU_PARALLEL_FILLS").is_ok_and(|v| v == "1")) {
+        return (f(), Vec::new());
+    }
+    let before = DEFERRED_SYNCS.with(|d| d.replace(Some(Vec::new())));
+    let made = f();
+    let jobs = DEFERRED_SYNCS.with(|d| d.replace(before)).unwrap_or_default();
+    (made, jobs)
+}
+
+/// Defers `job` to the enclosing [`with_deferred_syncs`]; runs it now where there is none.
+pub fn defer_sync(job: DeferredSync) {
+    let job = DEFERRED_SYNCS.with(|d| match d.borrow_mut().as_mut() {
+        Some(list) => {
+            list.push(job);
+            None
+        }
+        None => Some(job),
+    });
+    if let Some(job) = job {
+        job();
+    }
+}
+
+/// Runs the deferred fills, independent textures' guest pages, on parallel threads (one each, at
+/// most 8), and returns when every one is done.
+pub fn run_deferred_syncs(jobs: Vec<DeferredSync>) {
+    match jobs.len() {
+        0 => {}
+        1 => jobs.into_iter().for_each(|job| job()),
+        n => {
+            let threads = n.min(8);
+            let queue = crate::sync::Mutex::new(jobs);
+            std::thread::scope(|scope| {
+                for _ in 1..threads {
+                    scope.spawn(|| while let Some(job) = queue.lock().pop() {
+                        job();
+                    });
+                }
+                while let Some(job) = queue.lock().pop() {
+                    job();
+                }
+            });
+        }
+    }
+}
+
+/// The scratch size class of a copy-fallback buffer of `len` bytes: whole MiB from 1 MiB, whole
+/// 64 KiB below, so that buffers of nearly one size (a display surface's allocations differ by a
+/// few pages) reuse each other's host ranges ([`HostVm::allocate_scratch`]).
+pub fn scratch_length(len: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GRANULE: u64 = 64 << 10;
+    let class = if len >= MIB { MIB } else { GRANULE };
+    len.checked_next_multiple_of(class).unwrap_or(len)
 }
 
 /// The guest's physical ranges, sorted at init by start and then length, and looked up first match
@@ -57,6 +152,11 @@ pub struct MemoryMap<P: Platform> {
     ranges: Vec<MemoryMapRange>,
     pub(crate) this: crate::sync::Mutex<std::sync::Weak<MemoryMap<P>>>,
     pub(crate) discontiguous: Arc<crate::sync::Mutex<Vec<Arc<DiscontiguousBuffer>>>>,
+    /// Whether the host refused a remap of the guest's pages: on Windows (WHPX) the guest's RAM
+    /// is the host's own `VirtualAlloc` memory, with no section a view can be made of, so every
+    /// remap fails after its allocation of a fresh range (a new section, zero-filled: 8.7 ms p50
+    /// for 8 MB, measured). Once one is refused there, the remap path is skipped for the fallbacks.
+    remap_refused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<P: Platform> std::fmt::Debug for MemoryMap<P> {
@@ -159,6 +259,7 @@ impl<P: Platform> MemoryMap<P> {
             ranges,
             this: crate::sync::Mutex::new(std::sync::Weak::new()),
             discontiguous: Arc::new(crate::sync::Mutex::new(Vec::new())),
+            remap_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         *map.this.lock() = Arc::downgrade(&map);
         Some(map)
@@ -171,9 +272,48 @@ impl<P: Platform> MemoryMap<P> {
             ranges: self.ranges.clone(),
             this: crate::sync::Mutex::new(std::sync::Weak::new()),
             discontiguous: Arc::clone(&self.discontiguous),
+            remap_refused: Arc::clone(&self.remap_refused),
         });
         *map.this.lock() = Arc::downgrade(&map);
         map
+    }
+
+    /// Copies each planned chunk from the guest's RAM into the buffer at `base`: `false` where a
+    /// read fails, after logging which.
+    #[allow(unsafe_code)]
+    fn copy_chunks(&self, base: usize, chunks: &[DiscontiguousChunk], total_length: u64) -> bool {
+        let copy = |part: &[DiscontiguousChunk]| -> bool {
+            part.iter().all(|c| {
+                // SAFETY: the chunk lies in the fallback's own buffer at `base`, which it just
+                // allocated for `total_length` bytes; chunks never overlap.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut((base + c.host_offset as usize) as *mut u8, c.chunk_size)
+                };
+                let read = self.read_bulk(c.cur_phys, dst);
+                if !read {
+                    log::warn!(
+                        "discontiguous copy fallback: failed to read {:#x} bytes from guest phys {:#x}",
+                        c.chunk_size,
+                        c.cur_phys
+                    );
+                }
+                read
+            })
+        };
+        // One thread: splitting it across 4 (measured) moved the p50 from 1.85 to 1.47 ms and the
+        // p90 of a whole bind from 3.5 to 5.0 ms; the copy is bound by memory, not a core.
+        let _ = total_length;
+        copy(chunks)
+    }
+
+    /// Records that the host refused a remap of the guest's pages (Windows only: see
+    /// `remap_refused`).
+    fn note_remap_refused(&self) {
+        if cfg!(windows) && !self.remap_refused.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "memory map: the host refused a remap of the guest's pages; later mappings take the fallbacks directly"
+            );
+        }
     }
 
     /// The ranges, in stored (sorted) order.
@@ -324,15 +464,33 @@ impl<P: Platform> MemoryMap<P> {
                  {total_length:#x} bytes (WHPX direct host-VA)",
                 host_va.addr().to_u64()
             );
-            return Some(Mapping::new(host_va, total_length, read_only == 0, Teardown::None));
+            return Some(Mapping::new(
+                host_va,
+                total_length,
+                read_only == 0,
+                Teardown::None,
+            ));
         }
 
         // Fallback 2 (WHPX discontiguous): copy guest pages into a contiguous host buffer.
         if total_length == 0 {
-            return Some(Mapping::new(HostPtr::NULL, 0, read_only == 0, Teardown::None));
+            return Some(Mapping::new(
+                HostPtr::NULL,
+                0,
+                read_only == 0,
+                Teardown::None,
+            ));
         }
         let vm = self.platform.vm();
-        if let Ok(host_addr) = vm.allocate_anywhere(total_length) {
+        // DIAG(pool-a): the fallback's allocation and copy times, written on its debug line.
+        let alloc_start = std::time::Instant::now();
+        // Every byte of the buffer is written from the guest below, so a reused scratch range,
+        // whose old contents are not zeroed, serves as well as a fresh one.
+        let alloc_length = scratch_length(total_length);
+        let allocated = vm.allocate_scratch(alloc_length);
+        let alloc_ms = alloc_start.elapsed().as_secs_f64() * 1000.0;
+        let copy_start = std::time::Instant::now();
+        if let Ok(host_addr) = allocated {
             let mut offset = 0u64;
             let mut ok = true;
             let mut chunks = Vec::new();
@@ -362,17 +520,7 @@ impl<P: Platform> MemoryMap<P> {
                         ok = false;
                         break;
                     }
-                    let dst_slice = unsafe {
-                        let dst_ptr = (host_addr.addr() + (offset + copied) as usize) as *mut u8;
-                        std::slice::from_raw_parts_mut(dst_ptr, chunk as usize)
-                    };
-                    if !self.read(cur_phys, dst_slice) {
-                        log::warn!(
-                            "discontiguous copy fallback: failed to read {chunk:#x} bytes from guest phys {cur_phys:#x}"
-                        );
-                        ok = false;
-                        break;
-                    }
+                    // Planned here, copied below, in parallel for a large buffer.
                     chunks.push(DiscontiguousChunk {
                         cur_phys,
                         host_offset: offset + copied,
@@ -385,18 +533,37 @@ impl<P: Platform> MemoryMap<P> {
                 }
                 offset = offset.wrapping_add(r.physical_length);
             }
+            let lazy = LAZY_FALLBACK.with(std::cell::Cell::get);
+            if ok && offset == total_length && !lazy {
+                ok = self.copy_chunks(host_addr.addr(), &chunks, total_length);
+            }
             if ok && offset == total_length {
+                crate::perfstats::COPY_FALLBACK.add(alloc_start.elapsed());
+                crate::perfstats::COPY_FALLBACK_BYTES
+                    .fetch_add(total_length, std::sync::atomic::Ordering::Relaxed);
                 log::debug!(
-                    "range mapping: discontiguous copy fallback: allocated {total_length:#x} bytes at host address {:#x} (chunks={})",
+                    "range mapping: discontiguous copy fallback: allocated {total_length:#x} bytes at host address {:#x} (chunks={}; alloc {alloc_ms:.2} ms, copy {:.2} ms; lazy {lazy})",
                     host_addr.addr().to_u64(),
-                    chunks.len()
+                    chunks.len(),
+                    copy_start.elapsed().as_secs_f64() * 1000.0
                 );
                 let discontig_buf = Arc::new(DiscontiguousBuffer {
                     host_addr: HostPtr::from_addr(host_addr.addr()),
                     total_length,
+                    alloc_length,
                     chunks,
                 });
-                self.discontiguous.lock().push(Arc::clone(&discontig_buf));
+                // DIAG(list-lock): a push that waits 1 ms or more is written, with the list's length.
+                let push_start = std::time::Instant::now();
+                let listed = {
+                    let mut list = self.discontiguous.lock();
+                    list.push(Arc::clone(&discontig_buf));
+                    list.len()
+                };
+                let push_ms = push_start.elapsed().as_secs_f64() * 1000.0;
+                if push_ms >= 1.0 {
+                    log::debug!("discontiguous list push: {push_ms:.2} ms, {listed} buffers listed");
+                }
                 let discontiguous = Arc::downgrade(&self.discontiguous);
                 return Some(Mapping::new(
                     HostPtr::from_addr(host_addr.addr()),
@@ -409,11 +576,34 @@ impl<P: Platform> MemoryMap<P> {
                     },
                 ));
             } else {
-                let _ = vm.deallocate(host_addr, total_length);
+                let _ = vm.free_scratch(host_addr, alloc_length);
             }
         }
 
         None
+    }
+
+    /// The guest's memory behind the copy-fallback buffer that starts at `ptr`, `len` bytes long:
+    /// each chunk as (its host address in the guest's RAM, its offset in the buffer, its length).
+    /// `None` where no fallback buffer starts there with that length, or a chunk has no host
+    /// address.
+    pub fn discontiguous_ranges(&self, ptr: HostPtr, len: u64) -> Option<Vec<(HostPtr, u64, u64)>> {
+        let addr = ptr.addr().to_u64();
+        let buffer = self
+            .discontiguous
+            .lock()
+            .iter()
+            .find(|b| b.host_addr.addr().to_u64() == addr && b.total_length == len)
+            .cloned()?;
+        let mut ranges = Vec::with_capacity(buffer.chunks.len());
+        for c in &buffer.chunks {
+            let host = self.virtual_address_for_physical(c.cur_phys, c.chunk_size as u64);
+            if host.is_null() {
+                return None;
+            }
+            ranges.push((host, c.host_offset, c.chunk_size as u64));
+        }
+        Some(ranges)
     }
 
     /// Synchronizes from guest physical RAM any discontiguous buffers that intersect `[ptr, ptr + len)`.
@@ -424,6 +614,10 @@ impl<P: Platform> MemoryMap<P> {
         }
         let addr = ptr.addr().to_u64();
         let end = addr.saturating_add(len);
+        // DIAG(pool-a): a sync of 1 ms or more is written, with the buffers it scanned and the
+        // bytes it read.
+        let start = std::time::Instant::now();
+        let mut read_bytes = 0usize;
         let buffers = self.discontiguous.lock().clone();
         for b in &buffers {
             let b_addr = b.host_addr.addr().to_u64();
@@ -434,13 +628,22 @@ impl<P: Platform> MemoryMap<P> {
                     let chunk_end = chunk_addr.saturating_add(chunk.chunk_size as u64);
                     if addr < chunk_end && end > chunk_addr {
                         let dst_slice = unsafe {
-                            let dst_ptr = (b.host_addr.addr() + chunk.host_offset as usize) as *mut u8;
+                            let dst_ptr =
+                                (b.host_addr.addr() + chunk.host_offset as usize) as *mut u8;
                             std::slice::from_raw_parts_mut(dst_ptr, chunk.chunk_size)
                         };
-                        self.read(chunk.cur_phys, dst_slice);
+                        self.read_bulk(chunk.cur_phys, dst_slice);
+                        read_bytes += chunk.chunk_size;
                     }
                 }
             }
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        if ms >= 1.0 {
+            log::debug!(
+                "sync_range_from_guest: {ms:.2} ms, {read_bytes:#x} bytes read, {} buffers scanned, for {len:#x} bytes",
+                buffers.len()
+            );
         }
     }
 
@@ -462,7 +665,8 @@ impl<P: Platform> MemoryMap<P> {
                     let chunk_end = chunk_addr.saturating_add(chunk.chunk_size as u64);
                     if addr < chunk_end && end > chunk_addr {
                         let src_slice = unsafe {
-                            let src_ptr = (b.host_addr.addr() + chunk.host_offset as usize) as *const u8;
+                            let src_ptr =
+                                (b.host_addr.addr() + chunk.host_offset as usize) as *const u8;
                             std::slice::from_raw_parts(src_ptr, chunk.chunk_size)
                         };
                         self.write(chunk.cur_phys, src_slice);
@@ -486,7 +690,10 @@ impl<P: Platform> MemoryMap<P> {
                 continue;
             }
             if r.physical_address == 0 {
-                log::warn!("contiguous_host_address: range[{}] physical_address is 0", i);
+                log::warn!(
+                    "contiguous_host_address: range[{}] physical_address is 0",
+                    i
+                );
                 return None;
             }
             match start {
@@ -497,7 +704,10 @@ impl<P: Platform> MemoryMap<P> {
                 Some(_) => {
                     // Must be exactly contiguous with what we have so far.
                     if r.physical_address != cursor {
-                        log::warn!(
+                        // Debug, not warn: under WHPX nearly every multi-page mapping is
+                        // scattered (about 200 a second during an animation), and a line each
+                        // on the FIFO thread costs frame time.
+                        log::debug!(
                             "contiguous_host_address: discontiguous at range[{}]: {:#x} != cursor {:#x}",
                             i,
                             r.physical_address,
@@ -512,7 +722,11 @@ impl<P: Platform> MemoryMap<P> {
         }
         let start = start?;
         if sum != total_length {
-            log::warn!("contiguous_host_address: sum {:#x} != total_length {:#x}", sum, total_length);
+            log::warn!(
+                "contiguous_host_address: sum {:#x} != total_length {:#x}",
+                sum,
+                total_length
+            );
             return None;
         }
         let end = start.checked_add(total_length)?;
@@ -520,10 +734,17 @@ impl<P: Platform> MemoryMap<P> {
         for map_range in &self.ranges {
             if start >= map_range.physical_address && end <= map_range.physical_end {
                 let off = start.wrapping_sub(map_range.physical_address);
-                return Some(ptr_u64(addr_u64(map_range.virtual_address).wrapping_add(off)));
+                return Some(ptr_u64(
+                    addr_u64(map_range.virtual_address).wrapping_add(off),
+                ));
             }
         }
-        log::warn!("contiguous_host_address: span [{:#x}..{:#x}) not in any stored map range (ranges={})", start, end, self.ranges.len());
+        log::warn!(
+            "contiguous_host_address: span [{:#x}..{:#x}) not in any stored map range (ranges={})",
+            start,
+            end,
+            self.ranges.len()
+        );
         None
     }
 
@@ -536,6 +757,10 @@ impl<P: Platform> MemoryMap<P> {
         total_length: u64,
         read_only: u32,
     ) -> Option<Arc<Mapping<P>>> {
+        // Windows: a host that refused one remap of the guest's pages refuses them all.
+        if cfg!(windows) && self.remap_refused.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         let vm = self.platform.vm();
         // A total length of 0 passes the assert.
         crate::fatal_unless!(
@@ -586,6 +811,7 @@ impl<P: Platform> MemoryMap<P> {
                 let length = map_range.physical_end.wrapping_sub(range.physical_address);
                 if map_range.physical_end < end {
                     if !self.map_physical_range(map_range, range.physical_address, length, target) {
+                        self.note_remap_refused();
                         free_all();
                         return None;
                     }
@@ -600,6 +826,7 @@ impl<P: Platform> MemoryMap<P> {
                     range.physical_length,
                     target,
                 ) {
+                    self.note_remap_refused();
                     free_all();
                     return None;
                 }
@@ -635,6 +862,40 @@ impl<P: Platform> MemoryMap<P> {
                 platform: self.platform.clone(),
             },
         ))
+    }
+
+    /// [`Self::read`] for a bulk copy (a texture's pages): on x86_64 one `rep movsb` (ERMSB)
+    /// per call in place of a volatile load per word, which held a 16 MiB texture's copy of
+    /// scattered 4 KiB pages to about 5 GB/s (3 ms). The copy is inline assembly, so the compiler
+    /// assumes nothing of the guest's bytes, as with the volatile loads; a byte the guest writes
+    /// meanwhile may be either value, as before.
+    #[allow(unsafe_code)]
+    pub fn read_bulk(&self, physical: u64, dst: &mut [u8]) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let source = self.virtual_address_for_physical(physical, dst.len().to_u64());
+            if source.is_null() {
+                return false;
+            }
+            if !dst.is_empty() {
+                // SAFETY: `source` maps `dst.len()` bytes of guest RAM (the map's range, checked
+                // above), `dst` is writable for its length, and they do not overlap.
+                unsafe {
+                    core::arch::asm!(
+                        "rep movsb",
+                        inout("rsi") source.addr() => _,
+                        inout("rdi") dst.as_mut_ptr() => _,
+                        inout("rcx") dst.len() => _,
+                        options(nostack, preserves_flags)
+                    );
+                }
+            }
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.read(physical, dst)
+        }
     }
 
     /// Copies `dst.len()` bytes from guest physical `physical`; false when no range holds them.
@@ -690,6 +951,17 @@ impl<P: Platform> MemoryMap<P> {
 
 #[cfg(test)]
 mod tests {
+    /// Scratch classes: whole MiB from 1 MiB, whole 64 KiB below
+    #[test]
+    fn scratch_length_rounds_to_its_class() {
+        assert_eq!(super::scratch_length(0x1000), 0x1_0000);
+        assert_eq!(super::scratch_length(0x1_0000), 0x1_0000);
+        assert_eq!(super::scratch_length(0xf_f000), 0x10_0000);
+        assert_eq!(super::scratch_length(0x7e_9000), 0x80_0000);
+        assert_eq!(super::scratch_length(0x7f_8000), 0x80_0000);
+        assert_eq!(super::scratch_length(0x80_0000), 0x80_0000);
+    }
+
     use super::*;
     use crate::memory::descriptor::GuestPhysicalRange;
     use crate::platform::os::vm::KernReturn;

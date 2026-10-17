@@ -206,7 +206,17 @@ impl<P: Platform> InfoDecoder<P> {
             max_total_threads_per_threadgroup: u64::from(
                 pipeline.max_total_threads_per_threadgroup().low_u32(),
             ),
-            thread_execution_width: u64::from(pipeline.thread_execution_width().low_u32()),
+            // Never 0, which a guest divides by unchecked (WindowServer's luma kernel).
+            thread_execution_width: match pipeline.thread_execution_width().low_u32() {
+                0 => {
+                    log::warn!(
+                        "compute pipeline {} answered threadExecutionWidth 0: 32 given",
+                        command.pipeline_state_reference
+                    );
+                    32
+                }
+                width => u64::from(width),
+            },
             static_threadgroup_memory_length: u64::from(
                 pipeline.static_threadgroup_memory_length().low_u32(),
             ),

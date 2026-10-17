@@ -35,7 +35,7 @@ use crate::resources::manager::ResourceManager;
 use crate::resources::manager::create::Resources;
 use crate::resources::resource::Resource;
 use crate::rt::Hold;
-use crate::sync::WriterPrefRwLock;
+use crate::sync::{ReadGuard, WriteGuard, WriterPrefRwLock};
 use crate::tasks::isolation::TaskLife;
 use crate::tasks::object_lists::ObjectLists;
 use crate::tasks::{
@@ -253,11 +253,23 @@ impl<P: Platform> TaskCore<P> {
         }
     }
 
-    /// Deletes `resource` and clears its placement entry, under the unique lock.
+    /// Deletes `resource` and clears its placement entry, under the shared lock: the manager
+    /// locks its own caches (creation lock), and an exec on another FIFO channel that already
+    /// looked the resource up keeps it alive past the delete. The unique lock made every delete
+    /// wait for the other channels' execs of the task (measured ~150 us a delete, decstat1).
+    /// REIMS_VGPU_SHARED_DELETE=0 takes the unique lock as before.
     pub fn delete_resource(&self, hold: Hold<'_>, resource: u32) -> RaiseResult<()> {
-        let _lock = self.mutex.write();
+        let t0 = std::time::Instant::now();
+        let _lock = if shared_delete() {
+            TaskLock::Shared(self.mutex.read())
+        } else {
+            TaskLock::Unique(self.mutex.write())
+        };
+        let t_lock = t0.elapsed();
+        crate::perfstats::DELETE_LOCK.add(t_lock);
         self.live_manager()
             .delete_object::<Resources>(hold, resource, true);
+        crate::perfstats::DELETE_OBJECT.add(t0.elapsed() - t_lock);
         Ok(())
     }
 
@@ -666,6 +678,19 @@ impl<P: Platform> Drop for TaskCore<P> {
         drop(queue);
         drop(event);
     }
+}
+
+/// The task lock a command holds: shared or unique (`shared_delete`).
+pub(crate) enum TaskLock<'a> {
+    Shared(#[allow(dead_code)] ReadGuard<'a>),
+    Unique(#[allow(dead_code)] WriteGuard<'a>),
+}
+
+/// Whether deletes and unmaps outside the object list take the task's shared lock in place of
+/// the unique one (default); REIMS_VGPU_SHARED_DELETE=0 takes the unique lock as before.
+pub(crate) fn shared_delete() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_SHARED_DELETE").map_or(true, |v| v != "0"))
 }
 
 #[cfg(test)]

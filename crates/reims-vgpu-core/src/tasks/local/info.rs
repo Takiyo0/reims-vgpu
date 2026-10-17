@@ -40,6 +40,11 @@ fn store_compute_info_pair(entry: GuestPtr, key: u32, value: u32) {
     entry.write_u32_pair(0, key, value, DeathKind::NullReply);
 }
 
+
+/// The SIMD width a nil compute pipeline answers (`threadExecutionWidth`): this device's, never
+/// 0, which a guest divides by.
+const NIL_THREAD_EXECUTION_WIDTH: u64 = 32;
+
 impl<P: Platform> LocalTask<P> {
     /// The info command (opcode 69), with no task lock: waits up to 5 s for the previous exec's
     /// FIFO value (3 on a timeout), then with the object lists mapped (else 2) prepares, decodes
@@ -149,9 +154,22 @@ impl<P: Platform> LocalTask<P> {
             (4, |p| p.static_threadgroup_memory_length()),
         ];
         let mut index: u32 = 0;
+        if pipeline.is_none() {
+            log::warn!(
+                "compute pipeline info for nil pipeline {pipeline_reference}: threadExecutionWidth answered {NIL_THREAD_EXECUTION_WIDTH}, the rest 0"
+            );
+        }
         for (key, answer) in answers {
             if max_key > key && index < count {
-                let value = pipeline.as_ref().map_or(0, answer);
+                // A nil pipeline answers 0, as Metal's nil does, but for its SIMD width: guests
+                // divide by it unchecked (WindowServer's CA::OGL::MetalContext::
+                // calculate_average_luma died of SIGFPE on a 0), and no dispatch of a nil
+                // pipeline runs anyway.
+                let value = match &pipeline {
+                    Some(p) => answer(p),
+                    None if key == 3 => NIL_THREAD_EXECUTION_WIDTH,
+                    None => 0,
+                };
                 store_compute_info_pair(entry(index), key, value.low_u32());
                 index = index.wrapping_add(1);
             }

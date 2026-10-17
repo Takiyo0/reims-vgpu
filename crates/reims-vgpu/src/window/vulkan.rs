@@ -6,8 +6,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod swapchain;
 #[cfg(target_os = "windows")]
 mod windows;
-mod swapchain;
 
 pub(crate) use swapchain::sink;

@@ -338,7 +338,11 @@ mod tests {
         surface.request_draw();
         let work = surface.next(None).unwrap();
         let again = surface.next(Some(work)).unwrap();
-        assert_eq!(again.layout, a_layout(), "the draw with no image comes again");
+        assert_eq!(
+            again.layout,
+            a_layout(),
+            "the draw with no image comes again"
+        );
         surface.set_visible(false);
         surface.set_visible(true);
         assert!(surface.state.lock().take().is_some());

@@ -24,6 +24,20 @@ pub fn function_with_function_ref<P: Platform>(
     Ok(match manager.get_object::<Functions>(hold, reference)? {
         // Nil for reference 0, with no log
         Ok(function) => function,
+        // A function a dead process's leftover command names (its entry empty in the list of
+        // the new process now holding its task id, as in `exec_indirect`'s drop) is a failed
+        // lookup: given to Metal as nil, a render pipeline with no vertex function aborts the
+        // process. REIMS_VGPU_EMPTY_ENTRY_FAULTS=1 gives nil as before.
+        Err(error)
+            if error.contains("has an empty entry")
+                && !std::env::var("REIMS_VGPU_EMPTY_ENTRY_FAULTS").is_ok_and(|v| v == "1") =>
+        {
+            log::warn!("pipeline function {reference} not found, a failed lookup: {error}");
+            return Err(crate::raise::Raise::new(crate::resources::manager::RaiseKind::Lookup(
+                crate::resources::manager::ObjectKind::Function,
+            ))
+            .with_detail(crate::resources::manager::ObjectKind::Function.failure()));
+        }
         Err(error) => {
             log::warn!("pipeline function {reference} not found, given to Metal as nil: {error}");
             None

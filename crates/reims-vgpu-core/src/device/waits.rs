@@ -100,7 +100,20 @@ impl<P: Platform> DeviceCore<P> {
                     )
                 );
             }
-            if !self.wait_stamp(barrier, waiter, quiesced)? {
+            // DIAG(stamp-wait): a barrier that holds its FIFO 2 ms or more is written at debug.
+            let timed = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+            let passed = self.wait_stamp(barrier, waiter, quiesced)?;
+            if let Some(t) = timed {
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                if ms >= 2.0 {
+                    log::debug!(
+                        "stamp barrier: FIFO {waiter} waited {ms:.2} ms for stamp {} to reach {:#x}",
+                        barrier.index,
+                        barrier.value
+                    );
+                }
+            }
+            if !passed {
                 return Ok(false);
             }
         }
@@ -110,6 +123,12 @@ impl<P: Platform> DeviceCore<P> {
     /// Blocks until stamp slot `stamp.index` reaches `stamp.value` or the FIFO is quiesced;
     /// answers `false` when it ended quiesced. Each 2 s without a wake it logs, asks the
     /// reporting queue for a report, then waits untimed for the next wake.
+    /// DIAG(empty-entry): stamp slot `index`'s value now; `None` without stamp memory.
+    pub(crate) fn current_stamp(&self, index: u32) -> Option<u32> {
+        let stamp_memory: GuestPtr = (*self.stamp_memory.lock())?;
+        Some(stamp_memory.read_u32(u64::from(index).wrapping_mul(4), DeviceDeath::StampReadWithoutMemory))
+    }
+
     fn wait_stamp(
         &self,
         stamp: StampWait,

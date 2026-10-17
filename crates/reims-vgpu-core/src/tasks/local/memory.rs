@@ -67,6 +67,8 @@ fn check_mappable(offset: u64, length: u64, task_length: u64, has_root: bool) ->
     Ok(())
 }
 
+use crate::tasks::shared::TaskLock;
+
 impl<P: Platform> LocalTask<P> {
     /// The guest's map command. In the blocks setup it maps the range into the host's task
     /// under the task's shared lock, before the completion; in the map setup it only completes.
@@ -160,23 +162,48 @@ impl<P: Platform> LocalTask<P> {
         length: u64,
         done: Completion,
     ) -> RaiseResult<()> {
-        let _lock = self.base.mutex.write();
+        // An unmap over the object list takes the unique lock (the execs read the lists); any
+        // other takes the shared one, as the map does: the tracker and the host's task lock their
+        // own, and the unique lock made every unmap wait for the other FIFO channels' execs of
+        // the task (decstat1). REIMS_VGPU_SHARED_DELETE=0 takes the unique lock for all.
         check_task_range(offset, length, self.length)?;
         let end = offset.wrapping_add(length);
+        let overlaps_list = || {
+            let (list_offset, list_length) = *self.object_list_range.lock();
+            let list_end = list_offset.wrapping_add(u64::from(list_length));
+            offset < list_end && list_offset < end
+        };
+        let t0 = std::time::Instant::now();
+        let mut lock = if crate::tasks::shared::shared_delete() {
+            TaskLock::Shared(self.base.mutex.read())
+        } else {
+            TaskLock::Unique(self.base.mutex.write())
+        };
+        if matches!(lock, TaskLock::Shared(_)) && overlaps_list() {
+            drop(lock);
+            lock = TaskLock::Unique(self.base.mutex.write());
+        }
+        let _lock = lock;
+        crate::perfstats::UNMAP_LOCK.add(t0.elapsed());
+        let t = std::time::Instant::now();
         let (_, _, lists) = self.parts();
-        let (list_offset, list_length) = *self.object_list_range.lock();
-        let list_end = list_offset.wrapping_add(u64::from(list_length));
-        if offset < list_end && list_offset < end {
+        // Under the unique lock the range is stable; under the shared one it did not overlap.
+        if matches!(_lock, TaskLock::Unique(_)) && overlaps_list() {
             lists.unmap_object_list();
         }
+        crate::perfstats::UNMAP_LIST.add(t.elapsed());
         // The placement list of a local task is empty: `0..0` overlaps nothing
         if let Backend::Blocks { mapped } = &self.backend {
+            let t = std::time::Instant::now();
             mapped.remove_from_range(offset, length)?;
+            crate::perfstats::UNMAP_TRACKER.add(t.elapsed());
+            let t = std::time::Instant::now();
             // With the device gone the host refuses
             let unmapped = self
                 .device
                 .upgrade()
                 .is_some_and(|d| d.unmap_memory_in_task(self.task_info.task, offset, length));
+            crate::perfstats::UNMAP_HOST.add(t.elapsed());
             if !unmapped {
                 return raise_caught(
                     RaiseKind::HostUnmap,
@@ -200,6 +227,33 @@ impl<P: Platform> LocalTask<P> {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<Option<Arc<Mapping<P>>>> {
+        let (ranges, writable) = self.physical_ranges(hold, offset, length)?;
+        if need_writable && !writable {
+            return Ok(None);
+        }
+        Ok(self.mapping_over(&ranges, length, writable))
+    }
+
+    /// A mapping of `length` bytes over `ranges`, which a walk of the task's range found
+    /// ([`Self::physical_ranges`]).
+    fn mapping_over(
+        &self,
+        ranges: &[PhysRange],
+        length: u64,
+        writable: bool,
+    ) -> Option<Arc<Mapping<P>>> {
+        let memory_map = self.device.upgrade().and_then(|d| d.memory_map());
+        memory_map.and_then(|m| m.new_range_mapping(ranges, length, u32::from(!writable)))
+    }
+
+    /// The physical runs the task's page table names for `offset..offset + length`, and whether
+    /// every leaf is writable: a walk only, nothing mapped.
+    pub(super) fn physical_ranges(
+        &self,
+        hold: Hold<'_>,
+        offset: u64,
+        length: u64,
+    ) -> RaiseResult<(Vec<PhysRange>, bool)> {
         check_mappable(offset, length, self.length, !self.task_root.is_null())?;
         let mut ranges: Vec<PhysRange> = Vec::new();
         let mut writable = true;
@@ -236,11 +290,7 @@ impl<P: Platform> LocalTask<P> {
         if range.physical_length != 0 {
             ranges.push(range);
         }
-        if need_writable && !writable {
-            return Ok(None);
-        }
-        let memory_map = self.device.upgrade().and_then(|d| d.memory_map());
-        Ok(memory_map.and_then(|m| m.new_range_mapping(&ranges, length, u32::from(!writable))))
+        Ok((ranges, writable))
     }
 
     /// Resolves the host virtual address for each guest virtual page in `offset..offset + length`.
@@ -254,6 +304,25 @@ impl<P: Platform> LocalTask<P> {
         let Some(walker) = &self.walker else {
             return Ok(None);
         };
+        // DIAG(walker-root): the walker took the root and depth once, at the task's making; a
+        // root page that names another since is written (each time it differs).
+        if !self.task_root.is_null() {
+            let depth_now = self
+                .task_root
+                .read_u32(super::ROOT_PAGE_TABLE_DEPTH, crate::tasks::DeathKind::NullTaskRoot);
+            let root_now = u64::from(
+                self.task_root
+                    .read_u32(super::ROOT_PAGE_TABLE_ROOT, crate::tasks::DeathKind::NullTaskRoot),
+            )
+            .wrapping_shl(crate::guest::records::APV_PAGE_SHIFT);
+            let (root, depth) = walker.root_and_depth();
+            if root_now != root || depth_now != depth {
+                log::warn!(
+                    "task {}: page table moved: walker root {root:#x} depth {depth}, task root now names {root_now:#x} depth {depth_now}",
+                    self.task_id
+                );
+            }
+        }
         let Some(device) = self.device.upgrade() else {
             return Ok(None);
         };
@@ -372,6 +441,8 @@ impl<P: Platform> LocalTask<P> {
                 None => None,
             }
         } else {
+            // DIAG(bind-steps): see the log below.
+            let t0 = std::time::Instant::now();
             let Some(mapping) = self.virtual_mapping(hold, page_address(page), length, false)?
             else {
                 return raise_caught(
@@ -379,6 +450,7 @@ impl<P: Platform> LocalTask<P> {
                     format_args!("no host address for task page {page:#x}"),
                 );
             };
+            let t_map = t0.elapsed();
             let pointer = mapping.virtual_address();
             let owned = Arc::clone(&mapping);
             let deallocator = Box::new(move || drop(owned));
@@ -393,6 +465,16 @@ impl<P: Platform> LocalTask<P> {
                 }
                 None => Ok(None),
             };
+            crate::perfstats::BIND_MAP.add(t_map);
+            crate::perfstats::BIND_BUFFER.add(t0.elapsed() - t_map);
+            if length >= 1 << 20 && t0.elapsed().as_secs_f64() >= 0.0003 {
+                log::debug!(
+                    target: "reims_vgpu_core::tasks::local::exec",
+                    "bind steps: mapping={:.2} buffer={:.2} ms for {length:#x} bytes",
+                    t_map.as_secs_f64() * 1000.0,
+                    (t0.elapsed() - t_map).as_secs_f64() * 1000.0
+                );
+            }
             match buffer {
                 // The deallocator holds the mapping now
                 Ok(Some(buffer)) => {

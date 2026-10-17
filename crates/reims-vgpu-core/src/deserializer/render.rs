@@ -239,6 +239,7 @@ impl<P: Platform> RenderDecoder<P> {
         segment: &mut Cursor,
     ) -> RaiseResult<()> {
         if header.continues_previous == 0 {
+            let t_encoder = std::time::Instant::now();
             let descriptor = self.pass_prefix(hold, segment)?;
             let encoder = match &self.command_buffer {
                 Some(buffer) => buffer.render_encoder(OnFault::Return, &descriptor)?,
@@ -251,12 +252,16 @@ impl<P: Platform> RenderDecoder<P> {
                 keep_forever(open, Kept::MetalNumbering);
             }
             self.encoder = encoder;
+            crate::perfstats::DECODE_ENCODER.add(t_encoder.elapsed());
         }
         if self.encoder.is_none() {
             crate::raise!(RaiseKind::NoEncoder, "no render encoder");
         }
         while let Some((record_header, mut record)) = next_record(segment)? {
-            self.dispatch(hold, record_header.command_id, &mut record)?;
+            let t = std::time::Instant::now();
+            let dispatched = self.dispatch(hold, record_header.command_id, &mut record);
+            crate::perfstats::record(record_header.command_id, t.elapsed());
+            dispatched?;
         }
         if header.continued_by_next == 0 {
             self.send(RenderCmd::EndEncoding)?;

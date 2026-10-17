@@ -53,6 +53,13 @@ pub struct PageTableWalker {
     log: PageTableLog,
 }
 
+impl PageTableWalker {
+    /// DIAG(walker-root): the root table's guest physical address and the depth it walks.
+    pub fn root_and_depth(&self) -> (u64, u32) {
+        (self.root, self.depth)
+    }
+}
+
 impl std::fmt::Debug for PageTableWalker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PageTableWalker")

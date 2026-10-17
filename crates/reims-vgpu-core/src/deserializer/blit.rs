@@ -128,10 +128,12 @@ impl<P: Platform> BlitDecoder<P> {
         deserializer: Weak<Deserializer<P>>,
         command_buffer: Option<&P::CommandBuffer>,
     ) -> RaiseResult<Self> {
+        let t_encoder = std::time::Instant::now();
         let encoder = match command_buffer {
             Some(buffer) => buffer.blit_encoder(OnFault::Return)?,
             None => None,
         };
+        crate::perfstats::DECODE_ENCODER.add(t_encoder.elapsed());
         Ok(BlitDecoder {
             deserializer,
             encoder,
@@ -185,6 +187,7 @@ impl<P: Platform> BlitDecoder<P> {
             // Each command reads its record's whole size; a longer record is fine, a shorter one
             // fails to read.
             let c = &mut record;
+            let t_record = std::time::Instant::now();
             match record_header.command_id {
                 300 => self.decode_copy_from_buffer_to_texture(hold, c)?,
                 301 => self.decode_copy_from_buffer_to_buffer(hold, c)?,
@@ -215,6 +218,7 @@ impl<P: Platform> BlitDecoder<P> {
                     format_args!("unknown command {id}")
                 ),
             }
+            crate::perfstats::record(record_header.command_id, t_record.elapsed());
         }
         if header.continued_by_next == 0 {
             self.send(BlitCmd::EndEncoding)?;

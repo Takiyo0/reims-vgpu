@@ -461,9 +461,28 @@ pub struct Swapchain {
     held: Option<u32>,
     /// The surface is lost: no swapchain will be made of it.
     lost: bool,
-    /// The last making of the swapchain was refused, which was logged: the next refusal is not.
-    refusing: bool,
+    /// The making of the swapchain is being refused: since when, and the last reason logged. A
+    /// new reason is logged, and the same one again every [`REFUSAL_LOG_EVERY`].
+    refusing: Option<Refusing>,
 }
+
+/// A run of refusals to make the swapchain ([`Swapchain::acquire`]).
+#[derive(Debug)]
+struct Refusing {
+    /// The first refusal of the run.
+    since: std::time::Instant,
+    /// The reason last logged, and when.
+    logged: String,
+    logged_at: std::time::Instant,
+}
+
+/// How often a refusal that goes on is logged again.
+const REFUSAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the swapchain may be refused for a window that has pixels before the surface is
+/// given up and made again (an ended presenter): a surface the driver keeps answering with no
+/// pixels after a minimize, or a window still in use by a retired swapchain, recovers that way.
+const REFUSED_FOR_NEW_SURFACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl std::fmt::Debug for Swapchain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -647,7 +666,7 @@ impl Swapchain {
             pending: None,
             held: None,
             lost: false,
-            refusing: false,
+            refusing: None,
         })
     }
 
@@ -706,7 +725,15 @@ impl Swapchain {
         let current = self.chain.as_ref().map(|c| c.size);
         if self.stale || current != Some(size) {
             match self.remake(size) {
-                Ok(()) => self.refusing = false,
+                Ok(()) => {
+                    if let Some(r) = self.refusing.take() {
+                        log::warn!(
+                            target: "reims_vgpu_vulkan::swapchain",
+                            "swapchain made after {:.1} s of refusals",
+                            r.since.elapsed().as_secs_f64()
+                        );
+                    }
+                }
                 Err(e) if self.lost => {
                     log::warn!(
                         target: "reims_vgpu_vulkan::swapchain",
@@ -715,13 +742,32 @@ impl Swapchain {
                     return Acquired::Failed;
                 }
                 Err(e) => {
-                    if !self.refusing {
+                    let now = std::time::Instant::now();
+                    let reason = e.to_string();
+                    let refusing = self.refusing.get_or_insert_with(|| Refusing {
+                        since: now,
+                        logged: String::new(),
+                        logged_at: now,
+                    });
+                    if refusing.logged != reason
+                        || now.duration_since(refusing.logged_at) >= REFUSAL_LOG_EVERY
+                    {
                         log::warn!(
                             target: "reims_vgpu_vulkan::swapchain",
-                            "no swapchain yet ({e}): tried again at the next draw"
+                            "no swapchain yet for {size:?} ({reason}), refused for {:.1} s:                              tried again at the next draw",
+                            now.duration_since(refusing.since).as_secs_f64()
                         );
+                        refusing.logged = reason;
+                        refusing.logged_at = now;
                     }
-                    self.refusing = true;
+                    if now.duration_since(refusing.since) >= REFUSED_FOR_NEW_SURFACE {
+                        log::warn!(
+                            target: "reims_vgpu_vulkan::swapchain",
+                            "the swapchain was refused for {:.1} s: the surface is made again",
+                            now.duration_since(refusing.since).as_secs_f64()
+                        );
+                        return Acquired::Failed;
+                    }
                     return Acquired::Retry;
                 }
             }

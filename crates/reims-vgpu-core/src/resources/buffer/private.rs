@@ -151,6 +151,10 @@ impl<P: Platform> Drop for PrivateBufferResource<P> {
 }
 
 impl<P: Platform> ResourceClass<P> for PrivateBufferResource<P> {
+    fn devolatilize_now(&self, this: &Resource<P>) -> RaiseResult<()> {
+        PrivateBufferResource::devolatilize(self, this)
+    }
+
     fn initial_guest_valid(&self) -> bool {
         true
     }

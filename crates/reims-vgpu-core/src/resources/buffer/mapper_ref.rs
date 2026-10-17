@@ -287,7 +287,11 @@ mod tests {
             let m = env.p.call_log().mark();
             r.synchronize_with_cpu().unwrap();
             let calls = env.p.call_log().since(m);
-            assert!(calls.iter().all(|c| matches!(c.sel, "iosurface" | "CFRetain" | "CFRelease")));
+            assert!(
+                calls
+                    .iter()
+                    .all(|c| matches!(c.sel, "iosurface" | "CFRetain" | "CFRelease"))
+            );
         }
 
         #[test]

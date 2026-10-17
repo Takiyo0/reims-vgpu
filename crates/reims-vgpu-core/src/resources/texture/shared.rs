@@ -63,7 +63,11 @@ pub(crate) fn prepare_now<P: Platform>(
                 nil_send!(queue, command_buffer(OnFault::Return))?;
             let encoder: Option<P::BlitEncoder> =
                 nil_send!(command_buffer, blit_encoder(OnFault::Return))?;
-            prepare(hold, encoder.as_ref())?;
+            // Fills the prepare defers run here, before the commit whose copies read them.
+            let (prepared, fills) =
+                crate::memory::map::with_deferred_syncs(|| prepare(hold, encoder.as_ref()));
+            crate::memory::map::run_deferred_syncs(fills);
+            prepared?;
             nil_send!(encoder, encode(OnFault::Return, BlitCmd::EndEncoding))?;
             nil_send!(command_buffer, commit(OnFault::Return))?;
             nil_send!(command_buffer, wait_until_completed(OnFault::Return))?;
@@ -160,7 +164,8 @@ impl SharedSingle {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_with_blit(
+            encoder,
             state,
             || paged.ensure_physical(hold),
             || self.page(paged, encoder, false),
@@ -281,7 +286,8 @@ impl SharedDual {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_with_blit(
+            encoder,
             state,
             || paged.ensure_physical(hold),
             || self.page(paged, encoder, false),

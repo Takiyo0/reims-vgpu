@@ -171,43 +171,27 @@ impl WindowsSurface {
             }
             offset += now;
         }
+        data.gpu_written.store(false, Ordering::Release);
     }
 
-    /// Unconditionally synchronizes changes from `source_ranges` (guest memory) into `own`
-    /// memory, resetting the `gpu_written` latch.
+    /// Synchronizes guest changes into `own` unless the GPU owns newer contents. A writeback
+    /// makes both copies agree, after which subsequent guest writes may be refreshed.
     pub fn sync_from_guest(&self) {
-        let data = self.data();
-        let Some(own) = &data.own else { return };
-        if data.source_ranges.is_empty() {
-            return;
-        }
-        let _guard = data.sync_lock.lock();
-        let length = own.length();
-        let dst = own.first() as *mut u8;
-        let mut offset = 0usize;
-        for r in &data.source_ranges {
-            if offset as u64 >= length {
-                break;
-            }
-            let now = (r.physical_length.min(length.saturating_sub(offset as u64))) as usize;
-            let src = r.physical_address as *const u8;
-            // SAFETY: Under WHPX, physical_address is the direct host VA within QEMU's guest RAM allocation.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src, dst.add(offset), now);
-            }
-            offset += now;
-        }
-        data.gpu_written.store(false, Ordering::Release);
+        self.refresh();
     }
 
     /// Marks the surface as written by the GPU.
     pub fn mark_gpu_written(&self) {
-        self.data().gpu_written.store(true, Ordering::Release);
+        let data = self.data();
+        let _guard = data.sync_lock.lock();
+        data.gpu_written.store(true, Ordering::Release);
     }
 
     /// Clears the GPU-written flag, allowing subsequent `refresh()` calls to update from guest RAM.
     pub fn clear_gpu_written(&self) {
-        self.data().gpu_written.store(false, Ordering::Release);
+        let data = self.data();
+        let _guard = data.sync_lock.lock();
+        data.gpu_written.store(false, Ordering::Release);
     }
 
     /// Whether this surface was marked as written by the GPU.
@@ -551,7 +535,10 @@ impl IoSurfaces<VulkanPlatform> for WindowsSurfaces {
                                     if offset as u64 >= length {
                                         break;
                                     }
-                                    let now = (r.physical_length.min(length.saturating_sub(offset as u64))) as usize;
+                                    let now = (r
+                                        .physical_length
+                                        .min(length.saturating_sub(offset as u64)))
+                                        as usize;
                                     let src = r.physical_address as *const u8;
                                     // SAFETY: Under WHPX, physical_address is the direct host VA within QEMU's guest RAM allocation.
                                     unsafe {
@@ -659,10 +646,10 @@ impl IoSurfaces<VulkanPlatform> for WindowsSurfaces {
 mod tests {
     use reims_vgpu_core::platform::os::surface::BackingPlaneSpec;
 
+    use super::super::vm::Prot;
     use super::super::vm::allocate_aliasable;
     use super::super::vm::tests::mapped;
     use super::*;
-    use super::super::vm::Prot;
 
     const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
@@ -979,9 +966,9 @@ mod tests {
         free(at, 4 * page);
     }
 
-    /// A multi-range surface over pages with no section falls back to OwnMemory under WHPX,
-    /// and refresh() synchronizes updated guest pixel data into OwnMemory, while sync_to_guest()
-    /// synchronizes changes back.
+    /// A multi-range surface over pages with no section falls back to OwnMemory under WHPX;
+    /// guest changes refresh it, GPU-owned contents survive guest refreshes, and writeback
+    /// returns ownership to the guest.
     #[test]
     fn pages_without_a_section_fall_back_to_own_memory_and_refresh() {
         let vm = WindowsVm::new();
@@ -1006,7 +993,9 @@ mod tests {
             client_address_ranges: Some(ranges),
             ..host_only()
         };
-        let surface = WindowsSurfaces::new().create(&spec).expect("fallback to OwnMemory");
+        let surface = WindowsSurfaces::new()
+            .create(&spec)
+            .expect("fallback to OwnMemory");
         let base = surface.base_address().addr().to_u64();
         assert_ne!(base, 0);
         assert_ne!(base, at); // base is in OwnMemory, not pointing at `at`
@@ -1027,7 +1016,8 @@ mod tests {
         surface.refresh();
         assert_eq!(read(base), 0x42);
 
-        // Host writes to OwnMemory (0x77).
+        // A GPU write is newer than the guest's copy. Refresh must not replace it.
+        surface.mark_gpu_written();
         unsafe {
             std::ptr::write_bytes(
                 std::ptr::with_exposed_provenance_mut::<u8>(base.to_usize()),
@@ -1035,13 +1025,152 @@ mod tests {
                 (2 * page).to_usize(),
             );
         }
-        assert_eq!(read(at), 0x42);
+        unsafe {
+            std::ptr::write_bytes(
+                std::ptr::with_exposed_provenance_mut::<u8>(at.to_usize()),
+                0x55,
+                (2 * page).to_usize(),
+            );
+        }
+        surface.sync_from_guest();
+        assert_eq!(read(base), 0x77);
+        assert!(surface.is_gpu_written());
 
-        // After sync_to_guest, guest memory has 0x77.
+        assert_eq!(read(at), 0x55);
+
+        // After sync_to_guest, guest memory has 0x77 and both copies agree.
         surface.sync_to_guest();
         assert_eq!(read(at), 0x77);
+        assert!(!surface.is_gpu_written());
+
+        // A subsequent guest write can now refresh the host copy.
+        unsafe {
+            std::ptr::write_bytes(
+                std::ptr::with_exposed_provenance_mut::<u8>(at.to_usize()),
+                0x33,
+                (2 * page).to_usize(),
+            );
+        }
+        surface.sync_from_guest();
+        assert_eq!(read(base), 0x33);
 
         drop(surface);
+        free(at, 2 * page);
+    }
+
+    /// A compute input and a texture-copy source are reads even when their allocation also
+    /// permits GPU writes. Neither may freeze the surface's guest-memory staging.
+    #[test]
+    fn read_only_bindings_and_copy_sources_keep_guest_refresh_enabled() {
+        use reims_vgpu_core::platform::Platform;
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
+        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
+        use reims_vgpu_core::platform::device::GpuDevice;
+        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
+        use reims_vgpu_core::raise::OnFault;
+        let vm = WindowsVm::new();
+        let page = page_size();
+        let at = vm.allocate_anywhere(2 * page).unwrap().addr().to_u64();
+        let ranges = (0..2)
+            .map(|i| PhysicalMemoryRange {
+                physical_address: at + i * page,
+                physical_length: page,
+            })
+            .collect();
+        let surface = WindowsSurfaces::new()
+            .create(&SurfaceSpec {
+                alloc_size: 2 * page,
+                client_address_ranges: Some(ranges),
+                ..host_only()
+            })
+            .unwrap();
+        let p = crate::platform::tests::platform();
+        let d = crate::gpu::device::tests::dev();
+        let descriptor = p.texture_descriptor(&TextureDesc {
+            width: 16,
+            height: 16,
+            pixel_format: 80,
+            usage: 3,
+            ..TextureDesc::default()
+        });
+        let t = d
+            .new_texture_on_surface(&descriptor, Some(&surface), 0)
+            .unwrap()
+            .unwrap();
+        let queue = d.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        e.encode(
+            OnFault::Return,
+            ComputeCmd::SetTexture {
+                texture: Some(&t),
+                index: 0,
+            },
+        )
+        .unwrap();
+        assert!(!surface.is_gpu_written(), "binding an input is not a write");
+        let pass = p.render_pass_descriptor();
+        pass.set_color_attachment(
+            OnFault::Return,
+            0,
+            &ColorAttachmentSet {
+                texture: Some(Some(&t)),
+                load_action: Some(1),  // Load.
+                store_action: Some(1), // Store.
+                ..ColorAttachmentSet::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !surface.is_gpu_written(),
+            "assigning an attachment does not constitute a GPU write"
+        );
+        // SAFETY: allocated guest pages, no GPU work writes this source.
+        unsafe {
+            std::ptr::write_bytes(at.to_usize() as *mut u8, 0x42, (2 * page).to_usize());
+        }
+        t.copied("copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:");
+        assert!(
+            !surface.is_gpu_written(),
+            "a copy source is not a destination"
+        );
+        assert_eq!(read(surface.base_address().addr().to_u64()), 0x42);
+        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+        let load_encoder = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        assert!(
+            !surface.is_gpu_written(),
+            "opening a load/store pass without drawing is not a write"
+        );
+        load_encoder
+            .encode(OnFault::Return, RenderCmd::EndEncoding)
+            .unwrap();
+
+        let clear_pass = p.render_pass_descriptor();
+        clear_pass
+            .set_color_attachment(
+                OnFault::Return,
+                0,
+                &ColorAttachmentSet {
+                    texture: Some(Some(&t)),
+                    load_action: Some(2),  // Clear.
+                    store_action: Some(1), // Store.
+                    ..ColorAttachmentSet::default()
+                },
+            )
+            .unwrap();
+        let clear_encoder = cb
+            .render_encoder(OnFault::Return, &clear_pass)
+            .unwrap()
+            .unwrap();
+        assert!(surface.is_gpu_written(), "a clear owns the target surface");
+        clear_encoder
+            .encode(OnFault::Return, RenderCmd::EndEncoding)
+            .unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        drop((e, cb, queue, t, surface));
         free(at, 2 * page);
     }
 
@@ -1093,7 +1222,10 @@ mod tests {
             height: 16,
         };
         let s_bgra = surfaces.create_backing(&spec_bgra).unwrap();
-        assert_eq!((s_bgra.bytes_per_element(), s_bgra.bytes_per_row()), (4, 64));
+        assert_eq!(
+            (s_bgra.bytes_per_element(), s_bgra.bytes_per_row()),
+            (4, 64)
+        );
         let mut short = spec.clone();
         short.planes[0].bytes_per_row = 15;
         assert!(surfaces.create_backing(&short).is_none());

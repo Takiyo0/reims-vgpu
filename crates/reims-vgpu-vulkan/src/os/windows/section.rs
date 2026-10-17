@@ -59,7 +59,10 @@ impl Section {
     }
 
     /// The section's length in bytes.
-    #[allow(dead_code, reason = "symmetry with memfd's ftruncate length; read in tests")]
+    #[allow(
+        dead_code,
+        reason = "symmetry with memfd's ftruncate length; read in tests"
+    )]
     pub(crate) fn length(&self) -> u64 {
         self.length
     }

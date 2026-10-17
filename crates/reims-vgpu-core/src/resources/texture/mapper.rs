@@ -66,10 +66,8 @@ impl<P: Platform> MapperRefTextureResource<P> {
 
     /// Synchronizes guest memory into the host surface.
     fn sync_from_guest(&self) {
-        if let Some(surface) = self.texture.as_ref().and_then(Texture::iosurface) {
-            use crate::platform::os::surface::Surface as _;
-            surface.sync_from_guest();
-        }
+        // Refresh the guest-memory staging first. A WHPX surface can itself have a second
+        // staging allocation, so copying it before this step would import stale guest bytes.
         if let Some(t) = self.task.upgrade() {
             if let Some(map) = t.memory_map() {
                 if self.surface_base != 0 && self.surface_size != 0 {
@@ -79,6 +77,10 @@ impl<P: Platform> MapperRefTextureResource<P> {
                     map.sync_range_from_guest(ptr, self.surface_size);
                 }
             }
+        }
+        if let Some(surface) = self.texture.as_ref().and_then(Texture::iosurface) {
+            use crate::platform::os::surface::Surface as _;
+            surface.sync_from_guest();
         }
     }
 
@@ -315,7 +317,9 @@ mod tests {
             Arc::downgrade(&other)
         };
         let (t, sid) = surface_texture(&p);
-        let r = MapperRefTextureResource::new(gone, 9, t, 0, 0).unwrap().unwrap();
+        let r = MapperRefTextureResource::new(gone, 9, t, 0, 0)
+            .unwrap()
+            .unwrap();
         drop(r);
         assert_eq!(p.call_log().count("release_io_surface_with_mapping_id"), 0);
         // The texture is released; the surface lives on through the leaked retain.

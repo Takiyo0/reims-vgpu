@@ -56,15 +56,19 @@ impl ApiPlatform for VulkanPlatform {
             offset: 0,
         });
         #[cfg(not(windows))]
-        let files = map.ranges().iter().zip(map.files()).filter_map(|(range, file)| {
-            let file = file.as_ref()?;
-            Some(GuestRamFile {
-                host: range.host_address.addr().to_u64(),
-                length: range.physical_length,
-                fd: Some(Arc::clone(&file.fd)),
-                offset: file.offset,
-            })
-        });
+        let files = map
+            .ranges()
+            .iter()
+            .zip(map.files())
+            .filter_map(|(range, file)| {
+                let file = file.as_ref()?;
+                Some(GuestRamFile {
+                    host: range.host_address.addr().to_u64(),
+                    length: range.physical_length,
+                    fd: Some(Arc::clone(&file.fd)),
+                    offset: file.offset,
+                })
+            });
         Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
     }
 }

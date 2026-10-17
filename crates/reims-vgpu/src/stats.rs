@@ -374,8 +374,12 @@ fn report_forever(clock: &dyn TimerClock) -> ! {
             }
         }
         let live = registry().lock().live();
-        let lines = lines(&live);
+        let mut lines = lines(&live);
         drop(live);
+        // The FIFO thread's work this second (`reims_vgpu_core::perfstats`).
+        if let Some(work) = reims_vgpu_core::perfstats::take_line() {
+            lines.push_str(&work);
+        }
         if !lines.is_empty() {
             let _ = std::io::stderr().lock().write_all(lines.as_bytes());
         }

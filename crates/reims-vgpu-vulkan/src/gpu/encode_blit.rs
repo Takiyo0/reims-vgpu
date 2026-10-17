@@ -657,13 +657,122 @@ fn buffer_copy_shape(
     )
 }
 
+/// A no-copy buffer over the stretch `from..to` of a persistent host range (a WHPX guest's RAM,
+/// `metal2vulkan_runtime::persistent_stretch`) on `device`, made at its first use and kept for the
+/// process: it lies in the runtime's kept import of that stretch, so it costs no import of its
+/// own. `None` where the runtime makes no buffer there.
+fn stretch_buffer(device: &rt::Device, (from, to): (u64, u64)) -> Option<rt::Buffer> {
+    use std::collections::HashMap;
+    static KEPT: Mutex<Option<HashMap<(u64, u64, u64), rt::Buffer>>> = Mutex::new(None);
+    let key = (device.registry_id(), from, to);
+    let mut kept = KEPT.lock();
+    let map = kept.get_or_insert_with(HashMap::new);
+    if let Some(found) = map.get(&key) {
+        return Some(found.clone());
+    }
+    let bytes = std::ptr::NonNull::new(from as *mut u8)?;
+    let options = crate::gpu::resource_options("gatherHostRanges", 0);
+    // SAFETY: a persistent range stays mapped, readable and writable for the rest of the process
+    // (`register_persistent_host_range`'s contract), and the stretch lies in one.
+    let made = unsafe { device.new_buffer_with_bytes_no_copy(bytes, to - from, options, None) };
+    let buffer = made.ok()?;
+    map.insert(key, buffer.clone());
+    Some(buffer)
+}
+
 impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
+    /// Groups the ranges by the persistent stretch each lies in and copies each group with one
+    /// multi-region copy from that stretch's kept no-copy buffer ([`stretch_buffer`]); `false`,
+    /// encoding nothing, where a range lies in no persistent stretch or a stretch has no buffer.
+    fn gather_host_ranges(
+        &self,
+        destination: &crate::gpu::resource::VulkanBuffer,
+        ranges: &[(reims_vgpu_core::host::HostPtr, u64, u64)],
+    ) -> RaiseResult<bool> {
+        const SEL: &str = "gatherHostRanges";
+        // Opt-in: on an RTX 4060 the GPU took longer gathering a texture's pages, about 4100
+        // scattered 4 KiB regions read across PCIe, than the CPU's copy (the paging queue busy
+        // 417 ms a second against 103 ms, measured), so the CPU copies unless
+        // `REIMS_VGPU_GPU_GATHER` is set.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_GPU_GATHER").is_some()) {
+            return Ok(false);
+        }
+        let mut by_stretch: Vec<((u64, u64), Vec<(u64, u64, u64)>)> = Vec::new();
+        for &(at, offset, length) in ranges {
+            if length == 0 {
+                continue;
+            }
+            let first = at.addr() as u64;
+            let Some(stretch) = rt::persistent_stretch(first, length) else {
+                return Ok(false);
+            };
+            let region = (first - stretch.0, offset, length);
+            match by_stretch.iter_mut().find(|(s, _)| *s == stretch) {
+                Some((_, regions)) => regions.push(region),
+                None => by_stretch.push((stretch, vec![region])),
+            }
+        }
+        let device = destination.raw.device().clone();
+        let mut sources = Vec::with_capacity(by_stretch.len());
+        for (stretch, _) in &by_stretch {
+            let Some(source) = stretch_buffer(&device, *stretch) else {
+                return Ok(false);
+            };
+            sources.push(source);
+        }
+        destination.mark_gpu_written();
+        for ((_, regions), source) in by_stretch.iter().zip(&sources) {
+            send(SEL, Policy::Dies, || {
+                self.with(SEL, |e| {
+                    e.copy_from_buffer_to_buffer_regions(source, &destination.raw, regions)
+                })
+            })?;
+        }
+        Ok(true)
+    }
+
     /// Each command but `endEncoding` is a first use of Metal's device
     /// ([`FirstUse::BlitCommand`]: measured for fills and copies, taken alike for the rest), and
     /// a reset or copy of an indirect command buffer is work for Metal's tiler
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
+        // DIAG(boot-tile): the first 400 blits as sent, truncated.
+        {
+            use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Relaxed) < 400 {
+                use reims_vgpu_core::platform::resource::Texture as _;
+                let text = match &cmd {
+                    BlitCmd::CopyBufferToTextureOptions {
+                        source_offset, source_bytes_per_row, source_size, destination_texture,
+                        destination_origin, options, ..
+                    } => format!(
+                        "buffer->texture offset {source_offset:#x} bpr {source_bytes_per_row} size {}x{} -> origin ({},{}) of a {:?} texture, options {options:#x}",
+                        source_size.width, source_size.height, destination_origin.x, destination_origin.y,
+                        destination_texture.map(|t| (t.width(), t.height()))
+                    ),
+                    BlitCmd::CopyBufferToTexture {
+                        source_offset, source_bytes_per_row, source_size, destination_texture,
+                        destination_origin, ..
+                    } => format!(
+                        "buffer->texture offset {source_offset:#x} bpr {source_bytes_per_row} size {}x{} -> origin ({},{}) of a {}x{} texture",
+                        source_size.width, source_size.height, destination_origin.x, destination_origin.y,
+                        destination_texture.width(), destination_texture.height()
+                    ),
+                    BlitCmd::CopyBufferToBuffer { source_buffer, source_offset, destination_buffer, destination_offset, size } => {
+                        use reims_vgpu_core::platform::resource::Buffer as _;
+                        format!(
+                            "buffer->buffer {size:#x} bytes from offset {source_offset:#x} of a {:?}-byte buffer to offset {destination_offset:#x} of a {:?}-byte buffer",
+                            source_buffer.map(|b| b.length()), destination_buffer.map(|b| b.length())
+                        )
+                    }
+                    _ => String::new(),
+                };
+                log::debug!(target: "reims_vgpu_core::boot_tile", "blit {sel}: {text}");
+            }
+        }
         match &cmd {
             BlitCmd::CopyBufferToTexture {
                 destination_texture,
@@ -692,20 +801,17 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 }
             }
             BlitCmd::CopyBufferToBuffer {
-                destination_buffer,
-                ..
+                destination_buffer, ..
             }
             | BlitCmd::CopyTextureToBufferOptions {
-                destination_buffer,
-                ..
+                destination_buffer, ..
             } => {
                 if let Some(b) = destination_buffer {
                     b.mark_gpu_written();
                 }
             }
             BlitCmd::CopyTextureToBuffer {
-                destination_buffer,
-                ..
+                destination_buffer, ..
             } => {
                 destination_buffer.mark_gpu_written();
             }

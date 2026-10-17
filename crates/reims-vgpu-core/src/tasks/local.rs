@@ -532,6 +532,11 @@ impl<P: Platform> LocalTask<P> {
                 placement_list_length,
                 self.task_root,
             );
+            // DIAG(empty-entry): rare (a list per task, grown now and then).
+            log::debug!(
+                "task {}: SetObjectList offset {object_list_offset:#x} length {object_list_length:#x} stored {stored}",
+                self.task_id
+            );
             *self.object_list_range.lock() = if stored {
                 (object_list_offset, object_list_length)
             } else {

@@ -124,6 +124,10 @@ pub type TaskRef<P> = Weak<dyn ResourceHost<P>>;
 /// own; each kind overrides exactly what it answers. `this` is the resource the method runs on:
 /// its flags, and the receiver when a default asks the resource.
 pub trait ResourceClass<P: Platform>: Send + Sync {
+    /// DIAG: the class's type name, for timing lines.
+    fn diag_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
     /// The guest-valid flag a new resource of this kind starts with (host-valid and volatile
     /// always start false).
     fn initial_guest_valid(&self) -> bool {
@@ -162,6 +166,12 @@ pub trait ResourceClass<P: Platform>: Send + Sync {
         !this.is_guest_valid() && this.is_host_valid()
     }
     /// Whether the host's copy needs making or refreshing.
+    /// Makes a volatile resource non-volatile on the CPU, as its prepare does first, with no
+    /// encoder ([`Resource::devolatilize_now`]). Nothing for a kind that is never volatile.
+    fn devolatilize_now(&self, this: &Resource<P>) -> RaiseResult<()> {
+        let _ = this;
+        Ok(())
+    }
     fn needs_prepare(&self, this: &Resource<P>) -> bool {
         // A question to the resource, then the raw volatile flag.
         !this.is_host_valid() || this.state.is_volatile()
@@ -327,6 +337,26 @@ impl<P: Platform> Resource<P> {
         class_of(&self.kind)
     }
 
+    /// DIAG(paging-class): the kind's slot in [`crate::perfstats::PAGING_KINDS`].
+    pub fn kind_slot(&self) -> usize {
+        match &self.kind {
+            ResourceKind::SharedBuffer(_) => 0,
+            ResourceKind::PrivateBuffer(_) => 1,
+            ResourceKind::DetachBuffer(_) => 2,
+            ResourceKind::HeapBuffer(_) => 3,
+            ResourceKind::MapperRefBuffer(_) => 4,
+            ResourceKind::LegacyHeap(_) => 5,
+            ResourceKind::DetachHeap(_) => 6,
+            ResourceKind::Icb(_) => 7,
+            ResourceKind::Texture(_) => 8,
+            ResourceKind::SerializerTexture(_) => 9,
+            ResourceKind::RefTexture(_) => 10,
+            ResourceKind::MapperRefTexture(_) => 11,
+            ResourceKind::SharedTexture(_) => 12,
+            ResourceKind::Backing(_) => 13,
+        }
+    }
+
     /// Whether the guest's copy is current (the kind's answer).
     pub fn is_guest_valid(&self) -> bool {
         self.class().is_guest_valid(self)
@@ -355,6 +385,13 @@ impl<P: Platform> Resource<P> {
     pub fn needs_sync(&self) -> bool {
         self.class().needs_sync(self)
     }
+    /// Makes it non-volatile now, on the CPU: the first step of its prepare, needing no encoder.
+    /// An exec's prepare does it for a resource whose host copy is valid, so that one needs no
+    /// paging buffer ([`crate::tasks`]'s `prepare_resources`). A purged resource comes out
+    /// host-invalid, and is paged as before.
+    pub fn devolatilize_now(&self) -> RaiseResult<()> {
+        self.class().devolatilize_now(self)
+    }
     /// Whether the host's copy needs making or refreshing.
     pub fn needs_prepare(&self) -> bool {
         self.class().needs_prepare(self)
@@ -371,7 +408,21 @@ impl<P: Platform> Resource<P> {
         hold: Hold<'_>,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        self.class().prepare_in_encoder(hold, self, encoder)
+        // DIAG(prepare-each): a prepare of 2 ms or more is written at debug with its class.
+        let timed = log::log_enabled!(target: "reims_vgpu_core::tasks::local::exec", log::Level::Debug)
+            .then(std::time::Instant::now);
+        let done = self.class().prepare_in_encoder(hold, self, encoder);
+        if let Some(t) = timed {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if ms >= 2.0 {
+                log::debug!(
+                    target: "reims_vgpu_core::tasks::local::exec",
+                    "prepare_in_encoder {}: {ms:.2} ms",
+                    self.class().diag_name()
+                );
+            }
+        }
+        done
     }
     /// Host to guest through a blit encoder (`None` as for a prepare).
     pub fn synchronize_in_encoder(
@@ -998,6 +1049,37 @@ mod tests {
             r.state.set_is_volatile(v);
             assert_eq!(r.needs_prepare(), want, "h={h} v={v}");
         }
+    }
+
+    /// Made non-volatile now, a valid resource whose contents were kept needs no prepare: the
+    /// exec's prepare drops it and builds no paging buffer for it
+    #[test]
+    fn devolatilize_now_of_kept_contents_needs_no_prepare() {
+        let env = Env::new();
+        let r = private_buffer(&env);
+        r.set_is_host_valid(true);
+        r.state.set_is_volatile(true);
+        assert!(r.needs_prepare());
+        env.p.script().push("setPurgeableState:", Step::value(3u64));
+        r.devolatilize_now().unwrap();
+        assert!(!r.state.is_volatile());
+        assert!(r.is_host_valid());
+        assert!(!r.needs_prepare());
+    }
+
+    /// Made non-volatile now, a resource whose contents were purged is host-invalid and still
+    /// needs its prepare: it is paged as before
+    #[test]
+    fn devolatilize_now_of_purged_contents_still_needs_a_prepare() {
+        let env = Env::new();
+        let r = private_buffer(&env);
+        r.set_is_host_valid(true);
+        r.state.set_is_volatile(true);
+        env.p.script().push("setPurgeableState:", Step::value(4u64));
+        r.devolatilize_now().unwrap();
+        assert!(!r.state.is_volatile());
+        assert!(!r.is_host_valid());
+        assert!(r.needs_prepare());
     }
 
     /// An eviction writes back only when the raw flags say guest-invalid and host-valid

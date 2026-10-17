@@ -51,16 +51,18 @@ fn stage1_window_surface_and_present_queue() {
     let window = Window::new(WindowConfig::default(), 0, crate::handle::title(0));
     // Force the UI thread up first and prove it runs by listing screens.
     let screens = crate::screens::host_screens();
-    println!("stage1: UI thread up; {} host screen(s): {screens:?}", screens.len());
+    println!(
+        "stage1: UI thread up; {} host screen(s): {screens:?}",
+        screens.len()
+    );
     window.attach(Arc::new(NoPresenter));
     let id = window.id();
     let hwnd = wait_for(|| ui::test_hwnd(id), Duration::from_secs(10))
         .expect("the window did not open within 10s (CreateWindowExW failed or UI thread stalled)");
     assert!(!hwnd.is_null(), "a null HWND");
     // SAFETY: the process module handle.
-    let hinstance = unsafe {
-        windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
-    };
+    let hinstance =
+        unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) };
     let target = Target { hwnd, hinstance };
 
     // 2. A Vulkan instance with the window-surface extensions.
@@ -105,10 +107,9 @@ fn stage1_window_surface_and_present_queue() {
         let fams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
         for qi in 0..fams.len() as u32 {
             // SAFETY: `pd`, `qi` and `surface` are all live and from this instance.
-            let supports = unsafe {
-                surface_fn.get_physical_device_surface_support(pd, qi, surface)
-            }
-            .unwrap_or(false);
+            let supports =
+                unsafe { surface_fn.get_physical_device_surface_support(pd, qi, surface) }
+                    .unwrap_or(false);
             // SAFETY: `pd` and `qi` are live; the Win32 query takes no surface.
             let win32_supports =
                 unsafe { win32_fn.get_physical_device_win32_presentation_support(pd, qi) };

@@ -138,6 +138,8 @@ impl VulkanPlatform {
     /// pool core's pools push, as `MetalPlatform::new` does, as IOSurface and Foundation still
     /// autorelease into it.
     pub fn new(launcher: Box<dyn TaskLauncher<VulkanPlatform>>) -> VulkanPlatform {
+        // metal2vulkan's own work counters join the work line.
+        let _ = reims_vgpu_core::perfstats::EXTRA.set(metal2vulkan_runtime::perfcount::take_line);
         crate::os::install_process_services();
         VulkanPlatform {
             surfaces: OsSurfaces::new(),
@@ -312,9 +314,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             .chain(crate::answer::HEARD)
             .collect();
         if let Some(cache_dir) = std::env::var_os("REIMS_VGPU_CACHE_DIR") {
-            options.shader_cache =
-                rt::ShaderCacheOptions::in_directory(PathBuf::from(cache_dir));
-        } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            options.shader_cache = rt::ShaderCacheOptions::in_directory(PathBuf::from(cache_dir));
+        } else if let Some(home) =
+            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        {
             options.shader_cache =
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
         }

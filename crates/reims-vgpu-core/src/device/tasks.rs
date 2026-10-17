@@ -81,6 +81,8 @@ impl<P: Platform> DeviceCore<P> {
         length: u64,
         restoring: bool,
     ) -> RaiseResult<()> {
+        // DIAG(empty-entry): rare; a task id defined again would show here twice.
+        log::debug!("DefineTask: id {task_id} root page {task_root:#x} length {length:#x} restoring {restoring}");
         if task_id >= MAX_TASKS {
             crate::raise!(
                 DeviceRaise::InvalidTaskId,

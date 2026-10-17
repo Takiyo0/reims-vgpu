@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use reims_vgpu::{
     AddTraceRange, CreateTask, DestroyTask, Device, DeviceConfig, Error, HostCallbacks, HostPtr,
-    HostTask, HostTraceRange, MapMemory, MemoryMap, PhysicalMemoryRange,
-    RaiseInterrupt, ReadMemory, RemoveTraceRange, UnmapMemory,
+    HostTask, HostTraceRange, MapMemory, MemoryMap, PhysicalMemoryRange, RaiseInterrupt,
+    ReadMemory, RemoveTraceRange, UnmapMemory,
 };
 
 use crate::ffi;
@@ -452,26 +452,26 @@ fn file_refusal(r: &RvgMemoryRange, f: &RvgMemoryRangeFile, page: NonZeroU64) ->
     }
     #[cfg(unix)]
     {
-    let size = match file_size(f.fd) {
-        Ok(size) => size,
-        Err(e) => return Some(format!("has fd {}, which fstat cannot read: {e}", f.fd)),
-    };
-    if f.offset
-        .checked_add(r.physical_length)
-        .is_none_or(|end| size < end)
-    {
-        return Some(format!(
-            "holds {size:#x} bytes, fewer than its offset {:#x} and the range's {:#x}",
-            f.offset, r.physical_length
-        ));
-    }
-    if f.offset % page != 0 {
-        return Some(format!(
-            "has offset {:#x}, not a multiple of the page size {page:#x}",
-            f.offset
-        ));
-    }
-    None
+        let size = match file_size(f.fd) {
+            Ok(size) => size,
+            Err(e) => return Some(format!("has fd {}, which fstat cannot read: {e}", f.fd)),
+        };
+        if f.offset
+            .checked_add(r.physical_length)
+            .is_none_or(|end| size < end)
+        {
+            return Some(format!(
+                "holds {size:#x} bytes, fewer than its offset {:#x} and the range's {:#x}",
+                f.offset, r.physical_length
+            ));
+        }
+        if f.offset % page != 0 {
+            return Some(format!(
+                "has offset {:#x}, not a multiple of the page size {page:#x}",
+                f.offset
+            ));
+        }
+        None
     }
 }
 

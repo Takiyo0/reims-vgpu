@@ -54,8 +54,7 @@ fn frame_queue(device: &Device<VulkanPlatform>) -> Queue {
 /// A Vulkan device on a platform of its own, and a presenting display on its port 0.
 fn presenting_display(serial: u32) -> (Device<VulkanPlatform>, Display<VulkanPlatform>) {
     let platform = Arc::new(VulkanPlatform::new(Box::new(TaskThreads::new())));
-    let device =
-        Device::with_platform(platform, DeviceConfig::default()).expect("a Vulkan device");
+    let device = Device::with_platform(platform, DeviceConfig::default()).expect("a Vulkan device");
     let mut c = DisplayConfig::new(0, serial);
     c.callbacks.new_frame = Some(Arc::new(|| {}));
     let display = device.new_display(c).unwrap();
@@ -91,7 +90,13 @@ fn present_a_fixed_frame(
         ));
         td.set_usage(objc2_metal_shader_read());
         td.set_resource_options(SHARED);
-        let frame = no_catch(device.core().mtl_device_ref().new_texture(OnFault::Die, &td)).unwrap();
+        let frame = no_catch(
+            device
+                .core()
+                .mtl_device_ref()
+                .new_texture(OnFault::Die, &td),
+        )
+        .unwrap();
         no_catch(frame.replace_region(
             MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(width, height, 1)),
             0,
@@ -147,7 +152,11 @@ fn stage2_frames_render_into_the_window() {
     .expect("a Vulkan window sink");
 
     // A real Win32 window; attaching the sink opens it and starts the render thread.
-    let window = Window::new(WindowConfig::default(), 0, reims_vgpu_window::handle::title(0));
+    let window = Window::new(
+        WindowConfig::default(),
+        0,
+        reims_vgpu_window::handle::title(0),
+    );
     window.attach(sink);
 
     let size = (640, 400);

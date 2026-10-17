@@ -145,11 +145,18 @@ impl<P: Platform> DeviceCore<P> {
                 // Its result is ignored.
                 if let Some(child) = d.child_slot(fifo_id) {
                     let started = child.start(&d.platform);
-                    log::info!("FIFO create_fifo: child slot {} start result={}", fifo_id, started);
+                    log::info!(
+                        "FIFO create_fifo: child slot {} start result={}",
+                        fifo_id,
+                        started
+                    );
                 }
                 return true;
             } else {
-                log::warn!("FIFO create_fifo: create_fifo_internal returned false for slot {}", fifo_id);
+                log::warn!(
+                    "FIFO create_fifo: create_fifo_internal returned false for slot {}",
+                    fifo_id
+                );
             }
             false
         });
@@ -357,7 +364,11 @@ impl<P: Platform> DeviceCore<P> {
             if let Some(child) = d.child_slot(fifo) {
                 if !child.is_running() {
                     let started = child.start(&d.platform);
-                    log::info!("FIFO wake_fifo: child slot {} was not running, start result={}", fifo, started);
+                    log::info!(
+                        "FIFO wake_fifo: child slot {} was not running, start result={}",
+                        fifo,
+                        started
+                    );
                 }
                 child.poke();
             } else {

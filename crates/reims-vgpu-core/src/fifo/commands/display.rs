@@ -99,7 +99,11 @@ pub(super) fn transaction2<P: Platform>(c: &mut Command<'_, P>) {
     c.f_class(|c, _| {
         c.check_size(TRANSACTION2)?;
         let p = c.payload;
-        log::info!("FIFO CmdDisplayTransaction2: port={}, surface={}", p.u32(0), p.u32(4));
+        log::info!(
+            "FIFO CmdDisplayTransaction2: port={}, surface={}",
+            p.u32(0),
+            p.u32(4)
+        );
         let guest_display = c.guest_display(p.u32(0))?;
         if p.u32(8) != 0 {
             raise!(RaiseKind::KernelOnly, KERNEL_ONLY);
@@ -148,7 +152,11 @@ pub(super) fn swap_mapping<P: Platform>(c: &mut Command<'_, P>) {
         }
         c.check_size(SWAP_MAPPING)?;
         let p = c.payload;
-        log::info!("FIFO CmdDisplaySwapMapping: port={}, mapping_id={:#x}", p.u32(0), p.u64(8));
+        log::info!(
+            "FIFO CmdDisplaySwapMapping: port={}, mapping_id={:#x}",
+            p.u32(0),
+            p.u64(8)
+        );
         if p.u32(4) != 0 {
             raise!(RaiseKind::KernelOnly, KERNEL_ONLY);
         }

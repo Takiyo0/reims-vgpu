@@ -197,7 +197,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
@@ -208,6 +208,7 @@ use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::blit::ResourceRef;
 use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
+use reims_vgpu_core::platform::os::surface::Surface as _;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
@@ -401,11 +402,16 @@ pub struct RenderEncoderObject {
     pub encoder: EncoderObject<rt::RenderCommandEncoder>,
     /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
     nil_pipeline: Mutex<bool>,
+    /// The guest function names for the current pipeline, retained only for the opt-in display
+    /// probe because numeric pipeline identifiers change between boots.
+    capture_stages: Mutex<Option<String>>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
     /// map [`open`] took, without the colour resolves [`untouched_resolves`] dropped and the
     /// unused depth and stencil resolve textures [`without_unused_resolves`] removes. Its
     /// attachments' store actions and resolve textures decide what a late setter does.
     pass: rt::RenderPassDescriptor,
+    /// The Metal texture objects behind the pass, for ownership tracking at actual writes.
+    sources: Sources,
     /// The colour attachments whose resolves [`untouched_resolves`] dropped: a late resolve
     /// setter of one dies, and a late store action is compared with the descriptor's own; where
     /// there is one, a late depth or stencil resolve texture that may resolve dies
@@ -1308,7 +1314,7 @@ pub(crate) fn open(
     let made = match map {
         None => {
             let (d, dropped) = settled(d, PassMap::Unmapped);
-            make(command_buffer, d, dropped, true, false)
+            make(command_buffer, d, dropped, sources.clone(), true, false)
         }
         Some(map) => map.for_pass(command_buffer, |taken| {
             let rasterizes = taken.is_some();
@@ -1323,6 +1329,7 @@ pub(crate) fn open(
                 command_buffer,
                 d,
                 dropped,
+                sources.clone(),
                 rasterizes,
                 mapped == PassMap::Varying,
             )
@@ -1919,6 +1926,7 @@ fn make(
     command_buffer: &VulkanCommandBuffer,
     d: rt::RenderPassDescriptor,
     dropped: Vec<Dropped>,
+    sources: Sources,
     rasterizes: bool,
     varying_rates: bool,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
@@ -1931,6 +1939,7 @@ fn make(
                 command_buffer,
                 raw,
                 (&d, made, dropped),
+                sources,
                 rasterizes,
                 varying_rates,
             )
@@ -1994,6 +2003,44 @@ fn make(
     }
 }
 
+/// Clear load actions and resolves write attachments even without a draw.
+fn mark_cleared_and_resolved_attachments(d: &rt::RenderPassDescriptor, sources: &Sources) {
+    for (attachment, source) in d.color_attachments.iter().zip(&sources.color) {
+        if attachment.load_action == rt::LoadAction::Clear
+            && let Some(texture) = source[0].texture()
+        {
+            texture.mark_gpu_written();
+        }
+        if attachment.store_action.resolves()
+            && let Some(texture) = source[1].texture()
+        {
+            texture.mark_gpu_written();
+        }
+    }
+    let depth = &d.depth_attachment;
+    if depth.load_action == rt::LoadAction::Clear
+        && let Some(texture) = sources.depth[0].texture()
+    {
+        texture.mark_gpu_written();
+    }
+    if depth.store_action.resolves()
+        && let Some(texture) = sources.depth[1].texture()
+    {
+        texture.mark_gpu_written();
+    }
+    let stencil = &d.stencil_attachment;
+    if stencil.load_action == rt::LoadAction::Clear
+        && let Some(texture) = sources.stencil[0].texture()
+    {
+        texture.mark_gpu_written();
+    }
+    if stencil.store_action.resolves()
+        && let Some(texture) = sources.stencil[1].texture()
+    {
+        texture.mark_gpu_written();
+    }
+}
+
 /// The encoder of the runtime's `raw`, just made on `command_buffer` of `made`: the pass `d`
 /// without its unused resolves ([`without_unused_resolves`]), `d` itself made without the colour
 /// resolves `dropped` lists ([`untouched_resolves`]). It is in its handle before anything can
@@ -2009,17 +2056,37 @@ fn opened(
         rt::RenderPassDescriptor,
         Vec<Dropped>,
     ),
+    sources: Sources,
     rasterizes: bool,
     varying_rates: bool,
 ) -> RaiseResult<VulkanRenderEncoder> {
     let sel = "renderCommandEncoderWithDescriptor:";
+    if wallpaper_sized_pass(d) {
+        let targets: Vec<_> = plain(|| {
+            d.color_attachments
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| {
+                    a.texture
+                        .as_ref()
+                        .map(|t| (i, t.width(), t.height(), t.pixel_format(), t.sample_count()))
+                })
+                .collect()
+        });
+        log::warn!(
+            "wallpaper pass open targets={targets:?} rasterizes={rasterizes} rate_map={} varying_rates={varying_rates}",
+            d.rasterization_rate_map.is_some()
+        );
+    }
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
         nil_pipeline: Mutex::new(false),
+        capture_stages: Mutex::new(None),
         device: command_buffer.device.raw.clone(),
         undecided: Mutex::new(undecided(d)),
         late_stores: Mutex::new(Vec::new()),
         marks: Mutex::new(Marks::default()),
+        sources,
         no_layers: (d.rasterization_rate_map.as_ref()).is_some_and(|m| m.layer_count() == 0),
         pass: made,
         dropped,
@@ -2039,6 +2106,7 @@ fn opened(
     if !rasterizes {
         e.run(sel, &mut |r| r.set_scissor_rect(EMPTY))?;
     }
+    mark_cleared_and_resolved_attachments(d, &e.sources);
     Ok(e)
 }
 
@@ -2134,6 +2202,30 @@ fn viewport(v: MtlViewport) -> rt::Viewport {
 /// Core's `MTLScissorRect`.
 fn scissor(r: MtlScissorRect) -> rt::ScissorRect {
     rt::ScissorRect::new(r.x, r.y, r.width, r.height)
+}
+
+/// Whether this pass writes to the wallpaper-sized IOSurface candidate seen in Windows boots.
+fn wallpaper_sized_pass(pass: &rt::RenderPassDescriptor) -> bool {
+    plain(|| {
+        pass.color_attachments
+            .iter()
+            .filter_map(|a| a.texture.as_ref())
+            .any(|t| t.width() >= 3840 && t.height() >= 2160)
+    })
+}
+
+fn render_targets(pass: &rt::RenderPassDescriptor) -> Vec<(usize, u64, u64, PixelFormat)> {
+    plain(|| {
+        pass.color_attachments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                a.texture
+                    .as_ref()
+                    .map(|t| (i, t.width(), t.height(), t.pixel_format()))
+            })
+            .collect()
+    })
 }
 
 /// The scissor rectangle of a pass that rasterizes nothing.
@@ -2396,6 +2488,103 @@ fn range_of(sel: &'static str, r: NsRange) -> Range<u64> {
 type Call<'c> = &'c mut dyn FnMut(&mut rt::RenderCommandEncoder) -> Result<(), rt::Error>;
 
 impl VulkanRenderEncoder {
+    /// Mark only attachments that an encoded render operation can actually write.
+    fn mark_render_targets_written(&self, sel: &'static str) {
+        for (index, source) in self
+            .sources
+            .color
+            .iter()
+            .enumerate()
+            .map(|(i, pair)| (i, &pair[0]))
+        {
+            if let Some(texture) = source.texture() {
+                self.trace_large_render_target_write(sel, &format!("color[{index}]"), texture);
+                texture.mark_gpu_written();
+            }
+        }
+        for (name, source) in [
+            ("depth", &self.sources.depth[0]),
+            ("stencil", &self.sources.stencil[0]),
+        ] {
+            if let Some(texture) = source.texture() {
+                self.trace_large_render_target_write(sel, name, texture);
+                texture.mark_gpu_written();
+            }
+        }
+    }
+
+    /// A bounded, opt-in record of actual 4K render-target writes, keyed by the live texture
+    /// object's address as well as the runtime resource ID that may later be reused.
+    fn trace_large_render_target_write(
+        &self,
+        sel: &'static str,
+        attachment: &str,
+        texture: &VulkanTexture,
+    ) {
+        if std::env::var_os("REIMS_VGPU_CAPTURE_DIR").is_none()
+            || texture.raw.width() < 3840
+            || texture.raw.height() < 2160
+        {
+            return;
+        }
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, Ordering::Relaxed);
+        if n < 64 {
+            log::warn!(
+                "wallpaper render-target write #{n} selector={sel} pipeline={} attachment={attachment} {}",
+                self.encoder.pipeline.load(Ordering::Relaxed),
+                crate::gpu::resource::wallpaper_texture_lineage(texture),
+            );
+        }
+    }
+
+    /// Read back the actual background input and pass target from the command buffer that draws
+    /// them, rather than racing the queue with an immediate CPU read.
+    fn capture_background_binding(&self, textures: &[Option<&VulkanTexture>]) {
+        let pipeline_id = self.encoder.pipeline.load(Ordering::Relaxed);
+        if !self.is_background_pipeline() {
+            return;
+        }
+        let source = textures
+            .iter()
+            .flatten()
+            .find(|texture| texture.raw.width() >= 3840 && texture.raw.height() >= 2160);
+        let target = self.sources.color.iter().find_map(|pair| pair[0].texture());
+        let command_buffer = self.encoder.command_buffer();
+        if let (Some(source), Some(target), Some(command_buffer)) =
+            (source.copied(), target, command_buffer)
+        {
+            crate::gpu::resource::capture_background_after_completion(
+                &command_buffer,
+                source,
+                target,
+                pipeline_id,
+            );
+        }
+    }
+
+    /// Diagnostic selection uses the guest function identity, never its reusable numeric ID.
+    fn is_background_pipeline(&self) -> bool {
+        plain(|| self.capture_stages.lock().as_deref().is_some_and(
+            |stages| stages.contains("fragment \"backgroundFragment\""),
+        ))
+    }
+
+    /// Mark an enabled resolve target immediately before its resolve is encoded.
+    fn mark_resolve_target_written(&self, attachment: Attachment) {
+        let source = match attachment {
+            Attachment::Color(index) => usize::try_from(index)
+                .ok()
+                .and_then(|index| self.sources.color.get(index))
+                .map(|pair| &pair[1]),
+            Attachment::Depth => Some(&self.sources.depth[1]),
+            Attachment::Stencil => Some(&self.sources.stencil[1]),
+        };
+        if let Some(texture) = source.and_then(Source::texture) {
+            texture.mark_gpu_written();
+        }
+    }
+
     /// `bind`, of a command: what a draw may write through what it binds or makes resident is
     /// read at the draw ([`Reach`]).
     fn bound(&self, bind: Bind) {
@@ -2506,6 +2695,16 @@ impl VulkanRenderEncoder {
         (drawn, empty): (Option<(Shape, K)>, bool),
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
+        if self.is_background_pipeline()
+            || wallpaper_sized_pass(&self.pass)
+        {
+            log::warn!(
+                "background draw selector={sel} pipeline={} rasterizes={} empty={empty} targets={:?}",
+                self.encoder.pipeline.load(Ordering::Relaxed),
+                self.rasterizes,
+                render_targets(&self.pass)
+            );
+        }
         self.pipelined(sel);
         match drawn {
             Some((shape, k)) => {
@@ -2524,7 +2723,13 @@ impl VulkanRenderEncoder {
                         "a draw the provoking vertex rotates, as it stands",
                     );
                 }
-                self.binds(sel, &mut |e| call(e, k))
+                self.binds(sel, &mut |e| {
+                    call(e, k)?;
+                    if !empty {
+                        self.mark_render_targets_written(sel);
+                    }
+                    Ok(())
+                })
             }
             None => self.encoder.nothing(sel),
         }
@@ -2905,7 +3110,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
         match cmd {
             RenderCmd::DispatchThreadsPerTile { threads_per_tile } => {
                 self.tiled(sel);
-                encoded(&mut |e| e.dispatch_threads_per_tile(size(threads_per_tile)))
+                encoded(&mut |e| e.dispatch_threads_per_tile(size(threads_per_tile)))?;
+                self.mark_render_targets_written(sel);
+                Ok(())
             }
             RenderCmd::DispatchThreadsPerTileInRegion {
                 threads_per_tile,
@@ -2914,7 +3121,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 self.tiled(sel);
                 encoded(&mut |e| {
                     e.dispatch_threads_per_tile_in_region(size(threads_per_tile), region(r), None)
-                })
+                })?;
+                self.mark_render_targets_written(sel);
+                Ok(())
             }
             RenderCmd::DispatchThreadsPerTileInRegionIndex {
                 threads_per_tile,
@@ -2928,7 +3137,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         region(r),
                         Some(render_target_array_index),
                     )
-                })
+                })?;
+                self.mark_render_targets_written(sel);
+                Ok(())
             }
             RenderCmd::DrawIndexedPatchesIndirect {
                 number_of_patch_control_points,
@@ -3158,6 +3369,24 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     device_rounded(sel, &self.pass);
                 }
                 if ended.is_ok()
+                    && std::env::var_os("REIMS_VGPU_CAPTURE_PIPELINES").is_some()
+                    && let Some(stages) = plain(|| self.capture_stages.lock().clone())
+                    && let Some(command_buffer) = self.encoder.command_buffer()
+                {
+                    let pipeline_id = self.encoder.pipeline.load(Ordering::Relaxed);
+                    for (attachment, source) in self.sources.color.iter().enumerate() {
+                        if let Some(target) = source[0].texture() {
+                            crate::gpu::resource::capture_pipeline_target_after_completion(
+                                &command_buffer,
+                                target,
+                                pipeline_id,
+                                &stages,
+                                attachment,
+                            );
+                        }
+                    }
+                }
+                if ended.is_ok()
                     && self.hung.load(Ordering::SeqCst)
                     && let Some(cb) = self.encoder.command_buffer()
                 {
@@ -3180,6 +3409,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         indirect_buffer_offset,
                     )
                 })?;
+                self.mark_render_targets_written(sel);
                 self.checked_at_commit(checked);
                 if let Some(progress) = progress {
                     progress.executes(sel, indirect_commandbuffer.clone_ref());
@@ -3207,6 +3437,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     encoded(&mut |e| {
                         e.execute_commands_in_buffer(&indirect_command_buffer.raw, range.clone())
                     })?;
+                    self.mark_render_targets_written(sel);
                     self.checked_at_commit(checked);
                 }
                 if let Some(progress) = progress {
@@ -3393,6 +3624,23 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.set_fragment_sampler_states(&list, None, at))
             }
             RenderCmd::SetFragmentTexture { texture, index } => {
+                self.capture_background_binding(&[texture]);
+                if let Some(t) = texture {
+                    if t.raw.width() >= 3840 && t.raw.height() >= 2160 {
+                        crate::gpu::resource::capture_sampled_wallpaper_texture(t);
+                    }
+                    if t.raw.width() >= 3840 && t.raw.height() >= 2160
+                        || self.is_background_pipeline()
+                    {
+                        log::warn!(
+                            "background texture slot={index} pipeline={} {} surface={:?} targets={:?}",
+                            self.encoder.pipeline.load(Ordering::Relaxed),
+                            crate::gpu::resource::wallpaper_texture_lineage(t),
+                            t.surface.as_ref().map(|s| s.pixel_format()),
+                            render_targets(&self.pass)
+                        );
+                    }
+                }
                 plain(|| self.rounded.lock().bind(index, &[texture]));
                 let index = small(sel, index);
                 let texture = texture.map(|t| t.texels(sel));
@@ -3403,6 +3651,43 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 range,
             } => {
                 let (at, list) = ranged(sel, range, list);
+                self.capture_background_binding(list);
+                for texture in list.iter().flatten() {
+                    if texture.raw.width() >= 3840 && texture.raw.height() >= 2160 {
+                        crate::gpu::resource::capture_sampled_wallpaper_texture(texture);
+                    }
+                }
+                // A wallpaper diagnostic: debug, and not even built below it (it fired about
+                // 150 times a second in normal runs, on the FIFO thread).
+                if log::log_enabled!(log::Level::Debug)
+                    && (list
+                        .iter()
+                        .flatten()
+                        .any(|t| t.raw.width() >= 3840 && t.raw.height() >= 2160)
+                        || self.is_background_pipeline())
+                {
+                    let bindings: Vec<_> = list
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, t)| {
+                            t.as_ref().map(|t| {
+                                (
+                                    i + usize::try_from(at).unwrap_or(0),
+                                    t.raw.width(),
+                                    t.raw.height(),
+                                    t.raw.pixel_format(),
+                                    t.surface.as_ref().map(|s| s.pixel_format()),
+                                    crate::gpu::resource::wallpaper_texture_lineage(t),
+                                )
+                            })
+                        })
+                        .collect();
+                    log::debug!(
+                        "background textures pipeline={} bindings=(slot,width,height,format,surface,lineage){bindings:?} targets={:?}",
+                        self.encoder.pipeline.load(Ordering::Relaxed),
+                        render_targets(&self.pass)
+                    );
+                }
                 plain(|| self.rounded.lock().bind(u64::from(at), list));
                 let list = textures(sel, list);
                 encoded(&mut |e| e.set_fragment_textures(&list, at))
@@ -3449,13 +3734,42 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 None => {
                     self.encoder.nothing(sel)?;
                     plain(|| *self.nil_pipeline.lock() = true);
+                    plain(|| *self.capture_stages.lock() = None);
                     self.encoder.pipeline.store(0, Ordering::Relaxed);
                     self.encodes_icbs.store(false, Ordering::SeqCst);
                     Ok(())
                 }
                 Some(state) => {
+                    let capture_stages = if std::env::var_os("REIMS_VGPU_CAPTURE_PIPELINES")
+                        .is_some()
+                    {
+                        match state.reflection.descriptor() {
+                            Some(Reflected::Render(RenderDescriptor::Render(descriptor))) => {
+                                Some(format!("{}; {}",
+                                    crate::gpu::timing::render_stages(descriptor),
+                                    crate::gpu::states::formats(&RenderDescriptor::Render(descriptor.clone()))))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if capture_stages.as_deref().is_some_and(
+                        |stages| stages.contains("fragment \"backgroundFragment\""),
+                    )
+                        || wallpaper_sized_pass(&self.pass)
+                    {
+                        log::warn!(
+                            "background pipeline id={} rasterizes={} rate_map={} targets={:?}",
+                            state.unique_identifier(),
+                            self.rasterizes,
+                            self.pass.rasterization_rate_map.is_some(),
+                            render_targets(&self.pass)
+                        );
+                    }
                     self.run(sel, &mut |e| e.set_render_pipeline_state(&state.raw))?;
                     plain(|| *self.nil_pipeline.lock() = false);
+                    plain(|| *self.capture_stages.lock() = capture_stages);
                     plain(|| self.reach.lock().set(state));
                     plain(|| self.rounded.lock().set(state));
                     self.encoder
@@ -3490,11 +3804,17 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 }
             },
             RenderCmd::SetScissorRect { rect } => {
+                if wallpaper_sized_pass(&self.pass) {
+                    log::info!("wallpaper pass scissor {rect:?}");
+                }
                 let rect = scissor(rect);
                 encoded(&mut |e| e.set_scissor_rect(rect))?;
                 self.unrasterized(sel, 1)
             }
             RenderCmd::SetScissorRects { scissor_rects } => {
+                if wallpaper_sized_pass(&self.pass) {
+                    log::info!("wallpaper pass scissors {scissor_rects:?}");
+                }
                 let rects: Vec<_> = scissor_rects.iter().copied().map(scissor).collect();
                 encoded(&mut |e| e.set_scissor_rects(&rects))?;
                 self.unrasterized(sel, rects.len())
@@ -3709,6 +4029,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.set_vertex_textures(&list, at))
             }
             RenderCmd::SetViewport { viewport: v } => {
+                if wallpaper_sized_pass(&self.pass) {
+                    log::info!("wallpaper pass viewport {v:?}");
+                }
                 let v = viewport(v);
                 self.run(sel, &mut |e| e.set_viewport(v))
             }
@@ -3716,6 +4039,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.set_viewport_transform_enabled(enabled))
             }
             RenderCmd::SetViewports { viewports } => {
+                if wallpaper_sized_pass(&self.pass) {
+                    log::info!("wallpaper pass viewports {viewports:?}");
+                }
                 let list: Vec<_> = viewports.iter().copied().map(viewport).collect();
                 encoded(&mut |e| e.set_viewports(&list))
             }
@@ -3974,6 +4300,9 @@ impl VulkanRenderEncoder {
                 {
                     unsent.dies(sel, "a store action that resolves into a texture");
                 }
+                if action.resolves() {
+                    self.mark_resolve_target_written(attachment);
+                }
                 self.run(sel, call)?;
                 plain(|| {
                     self.undecided.lock().retain(|&(a, _)| a != attachment);
@@ -4003,7 +4332,11 @@ impl VulkanRenderEncoder {
         texture: Option<&VulkanTexture>,
         at: (u64, u64, u64),
     ) -> Option<rt::ResolveTarget> {
-        if let Some(t) = texture {
+        if self
+            .stored(attachment)
+            .is_some_and(|(action, _)| action.resolves())
+            && let Some(t) = texture
+        {
             t.mark_gpu_written();
         }
         let unsent = texture.and_then(Unsent::of);
@@ -7123,7 +7456,14 @@ pub(crate) mod tests {
         let life = TaskLife::new();
         let stopped = life.run(|| {
             life.exit();
-            opened(&cb, raw, (&desc, made, Vec::new()), false, false)
+            opened(
+                &cb,
+                raw,
+                (&desc, made, Vec::new()),
+                crate::gpu::desc::Sources::default(),
+                false,
+                false,
+            )
         });
         assert!(stopped.is_none());
         let refused = cb.raw.blit_command_encoder().unwrap_err();

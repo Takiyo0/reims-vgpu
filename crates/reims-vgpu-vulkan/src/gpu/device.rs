@@ -601,7 +601,9 @@ impl VulkanDevice {
             let mut fresh = false;
             let made = || {
                 fresh = true;
-                backing::gather(sel, &allocation, length.saturating_add(offset), read_only)
+                crate::gpu::timing::host_bytes("backing::gather (surface)", length, || {
+                    backing::gather(sel, &allocation, length.saturating_add(offset), read_only)
+                })
             };
             let alias = crate::os::surface_alias(surface, made);
             log::debug!(
@@ -776,12 +778,17 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let start = pointer(sel, bytes.ptr());
         let offset = u64::try_from(start.as_ptr().addr()).unwrap_or(0);
         let (placement, mut placing) =
-            metal_space::placing(bytes.len(), metal_space::Bytes::NoCopy(offset), None);
+            crate::gpu::timing::host_bytes("metal_space::placing of a no-copy buffer", bytes.len(), || {
+                metal_space::placing(bytes.len(), metal_space::Bytes::NoCopy(offset), None)
+            });
         let token = placing.token();
         // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
         // and what keeps them mapped until the runtime freed its import.
-        let (imported, run, keep, kept) = no_copy_release(start, bytes.len(), run);
-        let made = create(
+        let (imported, run, keep, kept) =
+            crate::gpu::timing::host_bytes("import_view of a no-copy buffer", bytes.len(), || {
+                no_copy_release(start, bytes.len(), run)
+            });
+        let made = crate::gpu::timing::host_bytes(sel, bytes.len(), || create(
             sel,
             Policy::Dies,
             placed_nil(&placing, Nil::BufferLength),
@@ -807,15 +814,21 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     Err(e) => Err(e),
                 }
             },
-        )
+        ))
         .map(Option::flatten);
         keep_unrun(&made, slot);
         // Core makes a task's no-copy buffers over its own mappings of the guest's pages.
-        let over_guest_pages = crate::remap::shows_guest_pages(bytes.ptr(), bytes.len());
+        let over_guest_pages = crate::gpu::timing::host_bytes("shows_guest_pages of a no-copy buffer", bytes.len(), || {
+            crate::remap::shows_guest_pages(bytes.ptr(), bytes.len())
+        });
         made.map(|b| {
             b.map(|raw| {
-                let buffer = self.buffer(raw, None, over_guest_pages);
-                buffer.backing.imported(kept);
+                let buffer = crate::gpu::timing::host_bytes("wrap (self.buffer) of a no-copy buffer", bytes.len(), || {
+                    self.buffer(raw, None, over_guest_pages)
+                });
+                crate::gpu::timing::host_bytes("backing.imported of a no-copy buffer", bytes.len(), || {
+                    buffer.backing.imported(kept)
+                });
                 buffer
             })
         })
@@ -1251,6 +1264,16 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let sel = "newTextureWithDescriptor:";
         let fields = descriptor.fields();
         let desc = fields.descriptor(sel, Maker::Other);
+        // DIAG(boot-tile): the first 600 textures made, any kind.
+        {
+            use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Relaxed) < 600 {
+                let text = format!("{desc:?}");
+                let cut: String = text.chars().take(400).collect();
+                log::debug!(target: "reims_vgpu_core::boot_tile", "newTexture: {cut}");
+            }
+        }
         if crate::gpu::desc::metal_makes_none(&desc) {
             return Ok(None);
         }
@@ -1530,7 +1553,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     })
                 });
                 own = Some(backing::Own::new(start, held));
-                let (imported, run, keep, twinned) = no_copy_release(start, bytes.len(), run);
+                let (imported, run, keep, twinned) = crate::gpu::timing::host_bytes(
+                    "import_view of a no-copy buffer (descriptor)",
+                    bytes.len(),
+                    || no_copy_release(start, bytes.len(), run),
+                );
                 kept = twinned;
                 rt::BufferContents::NoCopy {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
@@ -1548,12 +1575,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let descriptor =
             rt::BufferDescriptor::new(desc.length, options, contents).with_placement(placement);
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create(
-            sel,
-            Policy::Dies,
-            placed_nil(&placing, Nil::BufferLength),
-            || self.raw.new_buffer_with_descriptor(descriptor),
-        );
+        let made = crate::gpu::timing::host_bytes(sel, desc.length, || {
+            create(
+                sel,
+                Policy::Dies,
+                placed_nil(&placing, Nil::BufferLength),
+                || self.raw.new_buffer_with_descriptor(descriptor),
+            )
+        });
         metal_space::let_go(pool);
         keep_unrun(&made, slot);
         made.map(|b| {
@@ -1663,7 +1692,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 made_over = desc
                     .size
                     .checked_next_multiple_of(HEAP_GRANULE)
-                    .and_then(|size| backing::gather(sel, &ranges.ranges, size, read_only))
+                    .and_then(|size| {
+                        crate::gpu::timing::host_bytes("backing::gather (heap)", size, || {
+                            backing::gather(sel, &ranges.ranges, size, read_only)
+                        })
+                    })
                     .map(Arc::new);
                 match made_over
                     .as_ref()

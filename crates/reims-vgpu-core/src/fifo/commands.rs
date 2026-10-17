@@ -267,6 +267,11 @@ impl<P: Platform> Fifo<P> {
             // One pool and one holder per command: the holder releases what it holds, then the
             // pool pops.
             Some(h) => {
+                // DIAG(cmd-time): a command whose handler and releases take 2 ms or more is
+                // written at debug, with its name: where the FIFO thread's time goes.
+                let timed = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+                let started = std::time::Instant::now();
+                let command_id = header.command_id;
                 let pool = Pool::push(self.platform());
                 let held = Held::new();
                 h(&mut Command {
@@ -276,8 +281,22 @@ impl<P: Platform> Fifo<P> {
                     header,
                     payload,
                 });
+                let ran = timed.map(|t| t.elapsed());
                 drop(held);
                 drop(pool);
+                crate::perfstats::command(command_id, started.elapsed());
+                crate::perfstats::channel(self.stamp_index() as usize, started.elapsed());
+                if let (Some(t), Some(ran)) = (timed, ran) {
+                    let all = t.elapsed();
+                    if all.as_secs_f64() >= 0.002 {
+                        log::debug!(
+                            "FIFO channel {}: command {op:?} took {:.2} ms ({:.2} ms in its handler, the rest in its releases)",
+                            self.stamp_index(),
+                            all.as_secs_f64() * 1000.0,
+                            ran.as_secs_f64() * 1000.0
+                        );
+                    }
+                }
             }
             None => misc::deprecated(self, header, payload),
         }

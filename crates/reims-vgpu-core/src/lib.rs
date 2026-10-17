@@ -44,6 +44,7 @@ pub mod iosurface;
 pub mod logging;
 pub mod memory;
 pub mod num;
+pub mod perfstats;
 pub mod platform;
 pub mod process;
 pub mod raise;

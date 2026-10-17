@@ -1,4 +1,4 @@
-﻿//! [`SwapchainSink`]: what draws a window display's frames on the Vulkan platform, on either OS,
+//! [`SwapchainSink`]: what draws a window display's frames on the Vulkan platform, on either OS,
 //! into the window's swapchain on the runtime's own device, with no copy.
 //!
 //! The window's render thread asks the sink for a presenter at its first draw: the sink makes the
@@ -40,7 +40,6 @@ use reims_vgpu_window::{Drawn, FrameSink, PixelRect, Presenter, VulkanTarget};
 use crate::entry;
 use crate::stats::DisplayStats;
 use crate::window::{SinkDisplay, WindowFrame};
-
 
 /// DIAG(clear-test): whether `REIMS_VGPU_CLEAR_TEST=1` is set — bypass the display encode and
 /// clear each acquired image to a cycling colour, to tell a present/compositing fault from a

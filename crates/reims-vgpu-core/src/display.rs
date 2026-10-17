@@ -43,6 +43,7 @@ pub mod host_calls;
 pub mod mode;
 pub mod page;
 pub mod pipeline;
+mod probe;
 mod render;
 #[cfg(test)]
 mod tests;
@@ -61,11 +62,11 @@ pub use render::{
     POS_DATA, TEX_DATA,
 };
 pub use wallpaper::{
-    generate_recovery_wallpaper_bgra, generate_recovery_wallpaper_rgb,
-    generate_recovery_wallpaper_rgba, recovery_wallpaper_intensity,
-    recovery_wallpaper_pixel_bgra, recovery_wallpaper_pixel_rgb, recovery_wallpaper_pixel_rgba,
     RECOVERY_CENTER_BGRA, RECOVERY_CENTER_RGB, RECOVERY_CENTER_RGBA, RECOVERY_CORNER_BGRA,
-    RECOVERY_CORNER_RGB, RECOVERY_CORNER_RGBA,
+    RECOVERY_CORNER_RGB, RECOVERY_CORNER_RGBA, generate_recovery_wallpaper_bgra,
+    generate_recovery_wallpaper_rgb, generate_recovery_wallpaper_rgba,
+    recovery_wallpaper_intensity, recovery_wallpaper_pixel_bgra, recovery_wallpaper_pixel_rgb,
+    recovery_wallpaper_pixel_rgba,
 };
 
 use crate::device::{Device, DeviceCore};
