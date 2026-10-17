@@ -29,6 +29,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use reims_vgpu_core::display::Display as CoreDisplay;
 use reims_vgpu_core::platform::types::ClearColor;
@@ -38,7 +39,7 @@ use reims_vgpu_vulkan::swapchain::{self, Acquired, Frame, Swapchain};
 use reims_vgpu_window::{Drawn, FrameSink, PixelRect, Presenter, VulkanTarget};
 
 use crate::entry;
-use crate::stats::DisplayStats;
+use crate::stats::{DisplayStats, WindowOutcome, WindowStage};
 use crate::window::{SinkDisplay, WindowFrame};
 
 /// DIAG(clear-test): whether `REIMS_VGPU_CLEAR_TEST=1` is set — bypass the display encode and
@@ -143,10 +144,26 @@ impl Presenter for SwapchainPresenter {
     /// The next image, the display's frame encoded into it, and its present (module doc).
     fn draw(&mut self, drawable: (u64, u64), region: PixelRect) -> Drawn {
         entry::run(|_| {
-            let frame = match self.swapchain.acquire(drawable) {
+            let stats = self.display.stats();
+            let acquire_started = stats.map(|_| Instant::now());
+            let acquired = self.swapchain.acquire(drawable);
+            if let (Some(stats), Some(started)) = (stats, acquire_started) {
+                stats.window_stage_time(WindowStage::Acquire, started.elapsed());
+            }
+            let frame = match acquired {
                 Acquired::Image(frame) => frame,
-                Acquired::Retry => return Drawn::Retry,
-                Acquired::Failed => return Drawn::Ended,
+                Acquired::Retry => {
+                    if let Some(stats) = stats {
+                        stats.window_outcome(WindowOutcome::Retry);
+                    }
+                    return Drawn::Retry;
+                }
+                Acquired::Failed => {
+                    if let Some(stats) = stats {
+                        stats.window_outcome(WindowOutcome::Ended);
+                    }
+                    return Drawn::Ended;
+                }
             };
             let region = self
                 .swapchain
@@ -176,22 +193,54 @@ impl Presenter for SwapchainPresenter {
                         color.red, color.green, color.blue
                     );
                 }
-                if !self.display.clear_test(color, &mut image) {
+                let encode_started = stats.map(|_| Instant::now());
+                let encoded = self.display.clear_test(color, &mut image);
+                if let (Some(stats), Some(started)) = (stats, encode_started) {
+                    stats.window_stage_time(WindowStage::Encode, started.elapsed());
+                }
+                if !encoded {
+                    if let Some(stats) = stats {
+                        stats.window_outcome(WindowOutcome::Nothing);
+                    }
                     return Drawn::Nothing;
                 }
                 let Some(command_buffer) = image.ready else {
+                    if let Some(stats) = stats {
+                        stats.window_outcome(WindowOutcome::Nothing);
+                    }
                     return Drawn::Nothing;
                 };
+                let present_started = stats.map(|_| Instant::now());
                 self.swapchain.present(frame, command_buffer);
+                if let (Some(stats), Some(started)) = (stats, present_started) {
+                    stats.window_stage_time(WindowStage::PresentCall, started.elapsed());
+                    stats.window_outcome(WindowOutcome::Presented);
+                }
                 return Drawn::Presented;
             }
-            if !self.display.encode(region, &mut image) {
+            let encode_started = stats.map(|_| Instant::now());
+            let encoded = self.display.encode(region, &mut image);
+            if let (Some(stats), Some(started)) = (stats, encode_started) {
+                stats.window_stage_time(WindowStage::Encode, started.elapsed());
+            }
+            if !encoded {
+                if let Some(stats) = stats {
+                    stats.window_outcome(WindowOutcome::Nothing);
+                }
                 return Drawn::Nothing;
             }
             let Some(command_buffer) = image.ready else {
+                if let Some(stats) = stats {
+                    stats.window_outcome(WindowOutcome::Nothing);
+                }
                 return Drawn::Nothing;
             };
+            let present_started = stats.map(|_| Instant::now());
             self.swapchain.present(frame, command_buffer);
+            if let (Some(stats), Some(started)) = (stats, present_started) {
+                stats.window_stage_time(WindowStage::PresentCall, started.elapsed());
+                stats.window_outcome(WindowOutcome::Presented);
+            }
             Drawn::Presented
         })
     }
