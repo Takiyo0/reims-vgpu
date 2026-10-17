@@ -1571,7 +1571,10 @@ enum Bind {
 /// point index buffer, of the indices of an indirect indexed draw, whose count the GPU reads, and
 /// of a buffer made resident. Each is a use of those bytes
 /// ([`crate::gpu::resource::BufferObject::used`]).
-fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
+fn for_each_named_buffer<'a>(
+    cmd: &RenderCmd<'a, VulkanPlatform>,
+    mut visit: impl FnMut(Named<'a>),
+) {
     match *cmd {
         RenderCmd::DrawIndexedPatchesIndirect {
             patch_index_buffer,
@@ -1579,19 +1582,19 @@ fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![
-            (patch_index_buffer, None),
-            (Some(control_point_index_buffer), None),
-            (Some(indirect_buffer), reach(indirect_buffer_offset, 16)),
-        ],
+        } => {
+            visit((patch_index_buffer, None));
+            visit((Some(control_point_index_buffer), None));
+            visit((Some(indirect_buffer), reach(indirect_buffer_offset, 16)));
+        }
         RenderCmd::DrawIndexedPatches {
             patch_index_buffer,
             control_point_index_buffer,
             ..
-        } => vec![
-            (patch_index_buffer, None),
-            (Some(control_point_index_buffer), None),
-        ],
+        } => {
+            visit((patch_index_buffer, None));
+            visit((Some(control_point_index_buffer), None));
+        }
         RenderCmd::DrawIndexedPrimitives {
             index_count,
             index_type,
@@ -1612,58 +1615,64 @@ fn named_buffers<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
             index_buffer,
             index_buffer_offset,
             ..
-        } => vec![(
+        } => visit((
             Some(index_buffer),
             indices(index_type, index_buffer_offset, index_count),
-        )],
+        )),
         RenderCmd::DrawIndexedPrimitivesIndirect {
             index_buffer,
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![
-            (Some(index_buffer), None),
-            (Some(indirect_buffer), reach(indirect_buffer_offset, 20)),
-        ],
+        } => {
+            visit((Some(index_buffer), None));
+            visit((Some(indirect_buffer), reach(indirect_buffer_offset, 20)));
+        }
         RenderCmd::DrawPatchesIndirect {
             patch_index_buffer,
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![
-            (patch_index_buffer, None),
-            (Some(indirect_buffer), reach(indirect_buffer_offset, 16)),
-        ],
+        } => {
+            visit((patch_index_buffer, None));
+            visit((Some(indirect_buffer), reach(indirect_buffer_offset, 16)));
+        }
         RenderCmd::DrawPatches {
             patch_index_buffer, ..
-        } => vec![(patch_index_buffer, None)],
+        } => visit((patch_index_buffer, None)),
         RenderCmd::DrawPrimitivesIndirect {
             indirect_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![(Some(indirect_buffer), reach(indirect_buffer_offset, 16))],
+        } => visit((Some(indirect_buffer), reach(indirect_buffer_offset, 16))),
         RenderCmd::ExecuteCommandsIndirect {
             indirect_range_buffer,
             indirect_buffer_offset,
             ..
-        } => vec![(
+        } => visit((
             Some(indirect_range_buffer),
             reach(indirect_buffer_offset, 8),
-        )],
+        )),
         RenderCmd::SetFragmentBuffer { buffer, .. }
         | RenderCmd::SetTessellationFactorBuffer { buffer, .. }
-        | RenderCmd::SetVertexBuffer { buffer, .. } => vec![(buffer, None)],
+        | RenderCmd::SetVertexBuffer { buffer, .. } => visit((buffer, None)),
         RenderCmd::SetFragmentBuffers { buffers, .. }
         | RenderCmd::SetTileBuffers { buffers, .. }
         | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
         | RenderCmd::SetVertexBuffers { buffers, .. } => {
-            buffers.iter().map(|&b| (b, None)).collect()
+            for &buffer in buffers {
+                visit((buffer, None));
+            }
         }
         RenderCmd::UseResources { resources, .. }
         | RenderCmd::UseResourcesStages { resources, .. } => {
-            crate::gpu::encode_compute::resident_buffers(resources)
+            for resource in resources.iter().flatten() {
+                if let ResourceRef::Buffer(buffer) = *resource {
+                    visit((Some(buffer), None));
+                }
+            }
         }
-        _ => Vec::new(),
+        _ => {}
     }
 }
 
@@ -3096,11 +3105,11 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
     #[expect(clippy::too_many_lines, reason = "one arm per command")]
     fn encode(&self, _on: OnFault, cmd: RenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        for (buffer, bytes) in named_buffers(&cmd) {
+        for_each_named_buffer(&cmd, |(buffer, bytes)| {
             if let Some(buffer) = buffer {
                 buffer.used(sel, bytes);
             }
-        }
+        });
         let encoded = |call: Call<'_>| self.run(sel, call);
         if let Some(bind) = binds(&cmd)
             && self.encoder.command_buffer().is_some()
