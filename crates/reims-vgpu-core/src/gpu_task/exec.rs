@@ -486,11 +486,19 @@ impl<P: Platform> GpuTask<P> {
                     *index = index.wrapping_add(1);
                 };
                 if INFO_KEY_MAX_TOTAL_THREADS < max_key && index < count {
-                    let v = pipeline.max_total_threads_per_threadgroup().low_u32();
+                    let mut v = pipeline.max_total_threads_per_threadgroup().low_u32();
+                    if v == 0 && pipeline_width_clamp() {
+                        log::warn!("compute pipeline answered maxTotalThreadsPerThreadgroup 0: 1024 given");
+                        v = 1024;
+                    }
                     put(&mut index, INFO_KEY_MAX_TOTAL_THREADS, v);
                 }
                 if INFO_KEY_THREAD_EXECUTION_WIDTH < max_key && index < count {
-                    let v = pipeline.thread_execution_width().low_u32();
+                    let mut v = pipeline.thread_execution_width().low_u32();
+                    if v == 0 && pipeline_width_clamp() {
+                        log::warn!("compute pipeline answered threadExecutionWidth 0: 32 given");
+                        v = 32;
+                    }
                     put(&mut index, INFO_KEY_THREAD_EXECUTION_WIDTH, v);
                 }
                 if INFO_KEY_STATIC_THREADGROUP_MEMORY < max_key && index < count {
@@ -1188,4 +1196,12 @@ mod tests {
         tx.send(ToService::ResetRasterizationRateMap { map: 5, reply });
         assert_eq!(*got.lock(), vec![1]);
     }
+}
+
+/// `REIMS_VGPU_PIPELINE_WIDTH_CLAMP=0` disables the 0 -> 1024/32 pipeline info clamp (read once).
+fn pipeline_width_clamp() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("REIMS_VGPU_PIPELINE_WIDTH_CLAMP").map_or(true, |v| v.trim() != "0")
+    })
 }
