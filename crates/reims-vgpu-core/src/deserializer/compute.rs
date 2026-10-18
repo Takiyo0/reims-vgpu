@@ -287,6 +287,7 @@ impl<P: Platform> ComputeDecoder<P> {
         }
         while let Some((record_header, mut record)) = next_record(segment)? {
             let c = &mut record;
+            #[cfg(feature = "record-timing")]
             let t_record = std::time::Instant::now();
             match record_header.command_id {
                 0xc8 => self.decode_dispatch_threadgroups(c)?,
@@ -327,6 +328,7 @@ impl<P: Platform> ComputeDecoder<P> {
                     format_args!("unknown command {id}")
                 ),
             }
+            #[cfg(feature = "record-timing")]
             crate::perfstats::record(record_header.command_id, t_record.elapsed());
         }
         if header.continued_by_next == 0 {

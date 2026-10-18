@@ -22,6 +22,9 @@ macos-sdl = ["reims-vgpu/macos-sdl"]
 # `VulkanPlatform` in place of `MetalPlatform`. Off by default: the Metal platform is the product.
 # `cargo xtask dist --platform vulkan` builds the dist tree with it.
 vulkan = ["reims-vgpu/vulkan"]
+# Per-record decoder timings (`reims-vgpu-core`); off in normal release builds to avoid timing
+# every guest render command on the FIFO thread.
+record-timing = ["reims-vgpu-core/record-timing"]
 
 [dependencies]
 reims-vgpu.workspace = true

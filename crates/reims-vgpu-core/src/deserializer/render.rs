@@ -258,8 +258,10 @@ impl<P: Platform> RenderDecoder<P> {
             crate::raise!(RaiseKind::NoEncoder, "no render encoder");
         }
         while let Some((record_header, mut record)) = next_record(segment)? {
+            #[cfg(feature = "record-timing")]
             let t = std::time::Instant::now();
             let dispatched = self.dispatch(hold, record_header.command_id, &mut record);
+            #[cfg(feature = "record-timing")]
             crate::perfstats::record(record_header.command_id, t.elapsed());
             dispatched?;
         }

@@ -10,6 +10,9 @@ license.workspace = true
 [features]
 # core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
 testkit = []
+# Per-record decoder timings for the one-second performance report. Kept opt-in because render
+# workloads can dispatch tens of thousands of records per second.
+record-timing = []
 
 # Architecture 2.2: no objc2, block2, dispatch2, mach2 or libc here.
 [dependencies]

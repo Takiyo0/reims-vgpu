@@ -187,6 +187,7 @@ impl<P: Platform> BlitDecoder<P> {
             // Each command reads its record's whole size; a longer record is fine, a shorter one
             // fails to read.
             let c = &mut record;
+            #[cfg(feature = "record-timing")]
             let t_record = std::time::Instant::now();
             match record_header.command_id {
                 300 => self.decode_copy_from_buffer_to_texture(hold, c)?,
@@ -218,6 +219,7 @@ impl<P: Platform> BlitDecoder<P> {
                     format_args!("unknown command {id}")
                 ),
             }
+            #[cfg(feature = "record-timing")]
             crate::perfstats::record(record_header.command_id, t_record.elapsed());
         }
         if header.continued_by_next == 0 {
