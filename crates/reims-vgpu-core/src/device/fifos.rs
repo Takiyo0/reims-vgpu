@@ -42,8 +42,16 @@ use crate::num::{ToUsize, Truncate};
 use crate::platform::Platform;
 use crate::platform::os::Clock;
 use crate::raise::RaiseResult;
+
 use crate::seams::links::FifoDeviceLink;
 use crate::tasks::{Completion, Task};
+
+/// `REIMS_VGPU_EVENT_FIX`, read once: unless `0`, a stamp signal that finds stamp interrupt bits
+/// already pending raises no further interrupt.
+fn event_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_EVENT_FIX").map_or(true, |v| v.trim() != "0"))
+}
 
 /// A waiter's next index when it waits on nothing.
 const NOT_WAITING: u32 = u32::MAX;
@@ -397,9 +405,18 @@ impl<P: Platform> DeviceCore<P> {
             stamp_value,
             DeviceDeath::StampWriteWithoutMemory,
         );
-        self.interrupt_stamp
+        let prior = self
+            .interrupt_stamp
             .fetch_or(crate::num::bit32(stamp), Ordering::SeqCst);
         self.signal_cond.notify_all();
+        // Coalescing: when stamp bits are already pending (an interrupt was raised for them and
+        // the guest's handler has not yet read 0x1018, which clears them), the handler's read
+        // will also return this bit, so a second interrupt would only make the guest's
+        // AppleParavirtEventMachine run its three register reads (3 VM exits) for nothing.
+        // `REIMS_VGPU_EVENT_FIX=0` raises one interrupt per signal as before.
+        if prior != 0 && event_fix_enabled() {
+            return;
+        }
         self.interrupt();
     }
 
