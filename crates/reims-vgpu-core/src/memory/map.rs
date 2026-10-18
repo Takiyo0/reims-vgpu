@@ -56,6 +56,9 @@ thread_local! {
     /// Whether a copy fallback made on this thread leaves its buffer unfilled
     /// ([`with_lazy_fallback`]).
     static LAZY_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether `new_range_mapping` on this thread skips the remap and the borrow and takes the
+    /// copy fallback ([`MemoryMap::new_range_mapping_copy`]).
+    static FORCE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `f` with the copy fallback leaving the buffers it makes unfilled: their chunks are
@@ -71,13 +74,23 @@ pub fn with_lazy_fallback<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// Whether the GPU gather of scattered guest pages is on (`REIMS_VGPU_GPU_GATHER`, on unless
+/// `0`): a private buffer's transfer buffer is then made unfilled and gathered or filled at its
+/// prepare.
+pub fn gpu_gather_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_GPU_GATHER").map_or(true, |v| v != "0"))
+}
+
 /// A deferred fill of a transfer buffer: the copy of its guest pages ([`defer_sync`]).
 pub type DeferredSync = Box<dyn FnOnce() + Send>;
 
 thread_local! {
-    /// The fills deferred on this thread, where [`with_deferred_syncs`] collects them.
-    static DEFERRED_SYNCS: std::cell::RefCell<Option<Vec<DeferredSync>>> =
-        const { std::cell::RefCell::new(None) };
+    /// The list of the enclosing [`with_deferred_syncs`] on this thread, borrowed for its scope:
+    /// a raw pointer (no destructor, so no destructor registration at each access on the Windows
+    /// GNU target), null outside one.
+    static DEFERRED_SYNCS: std::cell::Cell<*mut Vec<DeferredSync>> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
 /// Runs `f`, collecting the transfer-buffer fills its prepares defer ([`defer_sync`]) instead of
@@ -91,21 +104,35 @@ pub fn with_deferred_syncs<T>(f: impl FnOnce() -> T) -> (T, Vec<DeferredSync>) {
     if !*ENABLED.get_or_init(|| std::env::var("REIMS_VGPU_PARALLEL_FILLS").is_ok_and(|v| v == "1")) {
         return (f(), Vec::new());
     }
-    let before = DEFERRED_SYNCS.with(|d| d.replace(Some(Vec::new())));
-    let made = f();
-    let jobs = DEFERRED_SYNCS.with(|d| d.replace(before)).unwrap_or_default();
+    let mut jobs: Vec<DeferredSync> = Vec::new();
+    let before = DEFERRED_SYNCS.with(|d| d.replace(&raw mut jobs));
+    struct Restore(*mut Vec<DeferredSync>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEFERRED_SYNCS.with(|d| d.set(self.0));
+        }
+    }
+    let made = {
+        let _restore = Restore(before);
+        f()
+    };
     (made, jobs)
 }
 
 /// Defers `job` to the enclosing [`with_deferred_syncs`]; runs it now where there is none.
 pub fn defer_sync(job: DeferredSync) {
-    let job = DEFERRED_SYNCS.with(|d| match d.borrow_mut().as_mut() {
-        Some(list) => {
-            list.push(job);
-            None
+    let list = DEFERRED_SYNCS.with(std::cell::Cell::get);
+    let job = if list.is_null() {
+        Some(job)
+    } else {
+        // SAFETY: the pointer is the enclosing `with_deferred_syncs`' local list, alive and not
+        // otherwise borrowed while its `f` runs on this thread.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).push(job);
         }
-        None => Some(job),
-    });
+        None
+    };
     if let Some(job) = job {
         job();
     }
@@ -117,19 +144,98 @@ pub fn run_deferred_syncs(jobs: Vec<DeferredSync>) {
     match jobs.len() {
         0 => {}
         1 => jobs.into_iter().for_each(|job| job()),
-        n => {
-            let threads = n.min(8);
-            let queue = crate::sync::Mutex::new(jobs);
-            std::thread::scope(|scope| {
-                for _ in 1..threads {
-                    scope.spawn(|| while let Some(job) = queue.lock().pop() {
-                        job();
-                    });
+        _ => fill_pool().run(jobs),
+    }
+}
+
+/// The fills' threads: started once and kept, where a scope of fresh threads per paging round
+/// cost each round up to 7 thread creations and joins (and their thread-local setup), measured
+/// hot in a profile of the FIFO thread.
+struct FillPool {
+    queue: crate::sync::Mutex<std::collections::VecDeque<(DeferredSync, std::sync::Arc<Batch>)>>,
+    work: std::sync::Condvar,
+    guard: std::sync::Mutex<()>,
+}
+
+/// One round's fills: how many are left, and the wake of its waiter.
+struct Batch {
+    left: std::sync::Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+impl Batch {
+    fn finish(&self) {
+        let mut left = self.left.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *left -= 1;
+        if *left == 0 {
+            self.done.notify_all();
+        }
+    }
+}
+
+fn fill_pool() -> &'static FillPool {
+    static POOL: std::sync::OnceLock<&'static FillPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let pool: &'static FillPool = Box::leak(Box::new(FillPool {
+            queue: crate::sync::Mutex::new(std::collections::VecDeque::new()),
+            work: std::sync::Condvar::new(),
+            guard: std::sync::Mutex::new(()),
+        }));
+        for _ in 0..7 {
+            let _ = std::thread::Builder::new()
+                .name("reims-vgpu.fill".into())
+                .spawn(move || pool.worker());
+        }
+        pool
+    })
+}
+
+impl FillPool {
+    fn worker(&self) {
+        loop {
+            let next = {
+                let mut g = self.guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    if let Some(next) = self.queue.lock().pop_front() {
+                        break next;
+                    }
+                    g = self.work.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                while let Some(job) = queue.lock().pop() {
+            };
+            let (job, batch) = next;
+            job();
+            batch.finish();
+        }
+    }
+
+    /// Runs `jobs` on the pool and the calling thread, returning once all have run.
+    fn run(&self, jobs: Vec<DeferredSync>) {
+        let batch = std::sync::Arc::new(Batch {
+            left: std::sync::Mutex::new(jobs.len()),
+            done: std::sync::Condvar::new(),
+        });
+        {
+            let _g = self.guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut queue = self.queue.lock();
+            for job in jobs {
+                queue.push_back((job, std::sync::Arc::clone(&batch)));
+            }
+        }
+        self.work.notify_all();
+        // The caller helps until the queue is empty, then waits for the rest
+        loop {
+            let next = self.queue.lock().pop_front();
+            match next {
+                Some((job, b)) => {
                     job();
+                    b.finish();
                 }
-            });
+                None => break,
+            }
+        }
+        let mut left = batch.left.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *left != 0 {
+            left = batch.done.wait(left).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 }
@@ -436,6 +542,21 @@ impl<P: Platform> MemoryMap<P> {
         self.new_range_mapping(&[range], length, read_only)
     }
 
+    /// [`Self::new_range_mapping`] taking only the copy fallback (a private contiguous host
+    /// copy of the guest's pages), for a retry after Metal refused a buffer over the mapping the
+    /// other paths made.
+    pub fn new_range_mapping_copy(
+        &self,
+        ranges: &[PhysRange],
+        total_length: u64,
+        read_only: u32,
+    ) -> Option<Arc<Mapping<P>>> {
+        FORCE_COPY.with(|f| f.set(true));
+        let m = self.new_range_mapping(ranges, total_length, read_only);
+        FORCE_COPY.with(|f| f.set(false));
+        m
+    }
+
     /// A fresh VM allocation with each request range remapped into it, in request order; every
     /// refusal after the allocation deallocates it, except a failed protect. A length that is not
     /// whole pages dies.
@@ -454,11 +575,17 @@ impl<P: Platform> MemoryMap<P> {
         total_length: u64,
         read_only: u32,
     ) -> Option<Arc<Mapping<P>>> {
-        if let Some(m) = self.remap_range_mapping(ranges, total_length, read_only) {
-            return Some(m);
+        let force_copy = FORCE_COPY.with(std::cell::Cell::get);
+        if !force_copy {
+            if let Some(m) = self.remap_range_mapping(ranges, total_length, read_only) {
+                return Some(m);
+            }
         }
         // Fallback 1: a single contiguous span within one stored range -> borrow its host address.
-        if let Some(host_va) = self.contiguous_host_address(ranges, total_length) {
+        if let Some(host_va) = self
+            .contiguous_host_address(ranges, total_length)
+            .filter(|_| !force_copy)
+        {
             log::debug!(
                 "range mapping: no section to remap; borrowing guest host address {:#x} for \
                  {total_length:#x} bytes (WHPX direct host-VA)",

@@ -23,6 +23,11 @@
 
 // cbindgen writes the header's functions in the order it parses them: these modules' order,
 // each in a group of its own so that rustfmt keeps it.
+/// The library's allocator on Windows (Cargo.toml says why). Opt out at build time only.
+#[cfg(windows)]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod status;
 
 pub mod log;

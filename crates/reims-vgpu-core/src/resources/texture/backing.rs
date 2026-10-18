@@ -280,7 +280,7 @@ impl<P: Platform> BackingResource<P> {
             return Ok(b.clone_ref());
         }
         let made = match self.task.upgrade() {
-            Some(t) => Some(t.new_buffer_for_virtual_page(hold, self.page, self.length)?),
+            Some(t) => Some(t.new_transfer_buffer_for_virtual_page(hold, self.page, self.length)?),
             None => None,
         };
         let Some(made) = made else {

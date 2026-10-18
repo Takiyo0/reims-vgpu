@@ -343,6 +343,8 @@ pub struct DisplayLocked<P: Platform> {
     pub guest_color_space: Option<Arc<[u8]>>,
     /// The persistent wallpaper backdrop texture retained from early boot or generated procedurally.
     pub wallpaper_backdrop: Option<P::Texture>,
+    /// The host's copies of guest frames (`render::FrameCopy`).
+    pub(crate) frame_copy: Option<render::FrameCopy<P>>,
 }
 
 impl<P: Platform> DisplayLocked<P> {
@@ -362,6 +364,7 @@ impl<P: Platform> DisplayLocked<P> {
             protection_requirements: 0,
             guest_color_space: None,
             wallpaper_backdrop: None,
+            frame_copy: None,
         }
     }
 }

@@ -76,10 +76,12 @@ impl<P: Platform> DisplayCore<P> {
         // DIAG(present-wait): the display lock and the in-flight wait, written at debug where they
         // take 1 ms or more.
         let timed = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+        let waited = std::time::Instant::now();
         let mut g = self.display_mutex.lock();
         let locked = timed.map(|t| t.elapsed());
         let in_flight = self.in_flight_frame_count.load(Ordering::SeqCst);
         self.wait_for_pending_frames(&mut g);
+        crate::perfstats::PRESENT_WAIT.add(waited.elapsed());
         if let (Some(t), Some(locked)) = (timed, locked) {
             let all = t.elapsed();
             if all.as_secs_f64() >= 0.001 {

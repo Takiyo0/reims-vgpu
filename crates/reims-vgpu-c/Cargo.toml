@@ -36,6 +36,11 @@ parking_lot.workspace = true
 # `fstat` and the host's page size, for the files behind a memory map's ranges.
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# The library's allocator on Windows: the process heap (ntdll) took about a fifth of the decode and
+# FIFO threads' busy time in a profile; mimalloc's thread-local free lists take none of its locks.
+mimalloc = { version = "0.1", default-features = false }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # `exception::catch` around every call of a host function (`ffi::host_call`, `ffi/catch/macos.rs`).
 objc2.workspace = true

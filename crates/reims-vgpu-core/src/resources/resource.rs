@@ -567,38 +567,66 @@ impl<P: Platform> Resource<P> {
 // ---------------------------------------------------------------------------------------------
 // Helpers the kinds share.
 
+/// The open [`with_platform`] scopes of a thread, innermost last: each platform's type and the
+/// pointer of its `Arc`, borrowed for the scope. A fixed table with no destructor: a thread-local
+/// with one runs a fence and atomics at each access on the Windows GNU target, and this one is
+/// reached at every task command (measured hot in a profile of the decode threads).
+struct Platforms {
+    slots: [(Option<std::any::TypeId>, *const ()); 8],
+    len: usize,
+}
+
 thread_local! {
-    /// The platforms of the open [`with_platform`] scopes on this thread, innermost last.
-    static PLATFORMS: RefCell<Vec<Arc<dyn Any + Send + Sync>>> = const { RefCell::new(Vec::new()) };
+    static PLATFORMS: RefCell<Platforms> =
+        const { RefCell::new(Platforms { slots: [(None, std::ptr::null()); 8], len: 0 }) };
 }
 
 /// Runs `f` with `platform` as the one the resources made or paged inside it reach for the VM
 /// and Metal's descriptor classes. The task's entry points and the manager open it; so do
 /// unit tests.
 pub fn with_platform<P: Platform, T>(platform: &Arc<P>, f: impl FnOnce() -> T) -> T {
-    struct Pop;
+    struct Pop(bool);
     impl Drop for Pop {
         fn drop(&mut self) {
-            PLATFORMS.with(|s| {
-                s.borrow_mut().pop();
-            });
+            if self.0 {
+                PLATFORMS.with(|s| s.borrow_mut().len -= 1);
+            }
         }
     }
-    PLATFORMS.with(|s| s.borrow_mut().push(platform.clone()));
-    let _pop = Pop;
+    let pushed = PLATFORMS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len == s.slots.len() {
+            return false;
+        }
+        let at = s.len;
+        s.slots[at] = (Some(std::any::TypeId::of::<P>()), Arc::as_ptr(platform).cast::<()>());
+        s.len += 1;
+        true
+    });
+    let _pop = Pop(pushed);
     f()
 }
 
 /// The platform a resource of `task` reaches, or `None` outside every [`with_platform`] scope:
 /// the kinds then refuse the creations that need a descriptor or a VM allocation.
+#[allow(unsafe_code)] // an `Arc` remade from the pointer its scope borrows
 pub(crate) fn platform_for<P: Platform>(task: &TaskRef<P>) -> Option<Arc<P>> {
     let _ = task;
-    PLATFORMS.with(|s| {
-        s.borrow()
+    let want = std::any::TypeId::of::<P>();
+    let ptr = PLATFORMS.with(|s| {
+        let s = s.borrow();
+        s.slots[..s.len]
             .iter()
             .rev()
-            .find_map(|p| p.clone().downcast::<P>().ok())
-    })
+            .find(|(id, _)| *id == Some(want))
+            .map(|&(_, p)| p.cast::<P>())
+    })?;
+    // SAFETY: the pointer is an `Arc<P>`'s (its type checked), alive while its scope is open,
+    // which it is while it is in the table; the count is raised for the new `Arc`.
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Some(Arc::from_raw(ptr))
+    }
 }
 
 /// A record's first `size_of::<T>()` bytes. The factories check only that the record is at

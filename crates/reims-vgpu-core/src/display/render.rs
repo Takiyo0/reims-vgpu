@@ -296,6 +296,8 @@ impl<P: Platform> DisplayCore<P> {
         command_buffer: &P::CommandBuffer,
         viewport: MtlViewport,
     ) -> RaiseResult<()> {
+        // Whether this pass counts as the frame in flight: not where it draws a copy.
+        let mut counted = true;
         // Still under the display mutex, in a pool (the pass descriptor and the encoder are
         // Metal's `+0`), which a raise leaves pushed.
         pool::around(&*self.platform, || {
@@ -346,10 +348,21 @@ impl<P: Platform> DisplayCore<P> {
                     );
                 }
             }
-            let frame = match frame {
-                Some(f) => Some(f),
-                None => g.current_frame.as_ref(),
+            let frame_owned = match frame {
+                Some(f) => Some(f.clone_ref()),
+                None => g.current_frame.as_ref().map(Handle::clone_ref),
             };
+            // A guest frame (an IOSurface's) is drawn from the host's copy of it where one can be
+            // made (`FrameCopy`): then only the copy counts in flight, not this pass.
+            let guest_frame = frame_owned.as_ref().is_some_and(|f| f.iosurface().is_some());
+            let copied = match &frame_owned {
+                Some(f) if guest_frame && frame_copy_enabled() => {
+                    self.copy_frame_locked(g, f, command_buffer)?
+                }
+                _ => None,
+            };
+            counted = copied.is_none();
+            let frame = copied.as_ref().or(frame_owned.as_ref());
             // DIAG(frame-trace): report the guest frame texture bound into the present pass, so
             // an empty/wrong source can be told from a draw that emits nothing. Throttled.
             {
@@ -469,7 +482,7 @@ impl<P: Platform> DisplayCore<P> {
                     // Its alpha is not a layer opacity and must not blend the screen over the
                     // host's generated recovery backdrop. The EFI framebuffer is the one path
                     // that may use that backdrop to fill its transparent pixels.
-                    g.pipeline.blend = has_backdrop && frame.iosurface().is_none();
+                    g.pipeline.blend = has_backdrop && !guest_frame;
                     let pipeline = match &self.render_pipeline_cache {
                         Some(cache) => cache.pipeline_for(g.pipeline),
                         None => None,
@@ -478,8 +491,8 @@ impl<P: Platform> DisplayCore<P> {
                     // image. Keep RGB untouched and force only the sampled alpha to one; guest
                     // shadows are already composited into the guest frame. EFI may retain alpha
                     // when a backdrop is present so its transparent pixels reveal that fallback.
-                    let opaque_view = if frame.iosurface().is_some()
-                        || (frame.iosurface().is_none() && !g.pipeline.gamma && !has_backdrop)
+                    let opaque_view = if guest_frame
+                        || (!guest_frame && !g.pipeline.gamma && !has_backdrop)
                     {
                         let swizzle = Swizzle {
                             red: 2,
@@ -599,6 +612,9 @@ impl<P: Platform> DisplayCore<P> {
             }
             Ok(())
         })?;
+        if !counted {
+            return Ok(());
+        }
         self.in_flight_frame_count.fetch_add(1, Ordering::SeqCst);
         // The block holds the display (a display whose last release has begun: its core), and the
         // command buffer lets it go when it has run.
@@ -711,5 +727,210 @@ impl<P: Platform> DisplayCore<P> {
                 NsRange::new(0, FRAG_SHADER_PROPERTIES_SIZE)
             )
         )?)
+    }
+}
+
+/// How many host copies of guest frames a display keeps (`FrameCopy`).
+const FRAME_COPY_SLOTS: usize = 3;
+
+/// Whether the host draws guest frames from copies of its own (`REIMS_VGPU_FRAME_COPY`, on
+/// unless `0`).
+fn frame_copy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_FRAME_COPY").map_or(true, |v| v != "0"))
+}
+
+/// One copy of a guest frame.
+pub(crate) struct FrameCopySlot<P: Platform> {
+    texture: P::Texture,
+    /// The window passes reading it that have not completed.
+    readers: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The guest frame and the guest present it copies.
+    source: (crate::platform::ObjId, u64),
+    /// The copy event's value its copy signals.
+    value: u64,
+}
+
+/// The host's copies of guest frames: a guest frame is copied once, on a queue of the display's
+/// own, and the window draws from the copy. Only the copy counts as a frame in flight, so a guest
+/// present waits for that blit (well under a millisecond) instead of the window's whole pass, and
+/// not at all while the window draws a frame it already copied. A slot is written again only once
+/// no window pass reads it.
+pub(crate) struct FrameCopy<P: Platform> {
+    queue: P::CommandQueue,
+    event: P::Event,
+    value: u64,
+    slots: Vec<FrameCopySlot<P>>,
+    /// The slot the last copy went to.
+    current: Option<usize>,
+}
+
+impl<P: Platform> DisplayCore<P> {
+    /// The copy of the guest frame `src` for a window pass in `composite` (made now, or the last
+    /// one when it copies the same frame and present), with the pass's wait for it encoded and
+    /// its slot's reader count raised until the pass completes; `None` where no copy can be made
+    /// (the caller draws `src` itself, counted in flight as before).
+    fn copy_frame_locked(
+        &self,
+        g: &mut DisplayLocked<P>,
+        src: &P::Texture,
+        composite: &P::CommandBuffer,
+    ) -> RaiseResult<Option<P::Texture>> {
+        use crate::platform::blit::{BlitCmd, BlitEncoder};
+        use crate::platform::command::CommandQueue;
+        use crate::platform::event::EventRef;
+        use crate::platform::types::{MtlOrigin, MtlSize};
+        let Some(device) = self.mtl_device() else {
+            return Ok(None);
+        };
+        if g.frame_copy.is_none() {
+            let (Some(queue), Some(event)) =
+                (device.new_command_queue(), device.new_event(OnFault::Return)?)
+            else {
+                return Ok(None);
+            };
+            g.frame_copy = Some(FrameCopy {
+                queue,
+                event,
+                value: 0,
+                slots: Vec::new(),
+                current: None,
+            });
+        }
+        let source = (src.id(), self.guest_present_count());
+        let Some(fc) = g.frame_copy.as_mut() else {
+            return Ok(None);
+        };
+        let reuse = fc
+            .current
+            .filter(|&i| fc.slots.get(i).is_some_and(|s| s.source == source));
+        let index = match reuse {
+            Some(i) => i,
+            None => {
+                // A slot no pass reads, of the frame's shape; else a new one; else none
+                let fits = |t: &P::Texture| {
+                    t.width() == src.width()
+                        && t.height() == src.height()
+                        && t.pixel_format() == src.pixel_format()
+                };
+                let free = (0..fc.slots.len()).find(|&i| {
+                    Some(i) != fc.current
+                        && fc.slots[i].readers.load(Ordering::SeqCst) == 0
+                        && fits(&fc.slots[i].texture)
+                });
+                let free = match free {
+                    Some(i) => Some(i),
+                    None => {
+                        // A slot of another shape no pass reads is replaced
+                        let stale = (0..fc.slots.len()).find(|&i| {
+                            Some(i) != fc.current
+                                && fc.slots[i].readers.load(Ordering::SeqCst) == 0
+                        });
+                        if stale.is_none() && fc.slots.len() >= FRAME_COPY_SLOTS {
+                            return Ok(None);
+                        }
+                        let desc = self.platform.texture_descriptor(&TextureDesc {
+                            texture_type: src.texture_type(),
+                            pixel_format: src.pixel_format(),
+                            width: src.width(),
+                            height: src.height(),
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            // Shader read, and pixel-format views (the pass's swizzled view)
+                            usage: 0x1 | 0x10,
+                            ..TextureDesc::default()
+                        });
+                        let Some(texture) = device.new_texture(OnFault::Return, &desc)? else {
+                            return Ok(None);
+                        };
+                        let slot = FrameCopySlot {
+                            texture,
+                            readers: std::sync::Arc::default(),
+                            source: (src.id(), u64::MAX),
+                            value: 0,
+                        };
+                        match stale {
+                            Some(i) => {
+                                fc.slots[i] = slot;
+                                Some(i)
+                            }
+                            None => {
+                                fc.slots.push(slot);
+                                Some(fc.slots.len() - 1)
+                            }
+                        }
+                    }
+                };
+                let Some(i) = free else {
+                    return Ok(None);
+                };
+                let Some(buffer) = fc.queue.command_buffer(OnFault::Return)? else {
+                    return Ok(None);
+                };
+                let Some(encoder) = buffer.blit_encoder(OnFault::Return)? else {
+                    return Ok(None);
+                };
+                let slot = &fc.slots[i];
+                encoder.encode(
+                    OnFault::Return,
+                    BlitCmd::CopyTextureRegion {
+                        source_texture: src,
+                        source_slice: 0,
+                        source_level: 0,
+                        source_origin: MtlOrigin::new(0, 0, 0),
+                        source_size: MtlSize::new(src.width(), src.height(), 1),
+                        destination_texture: &slot.texture,
+                        destination_slice: 0,
+                        destination_level: 0,
+                        destination_origin: MtlOrigin::new(0, 0, 0),
+                    },
+                )?;
+                encoder.encode(OnFault::Return, BlitCmd::EndEncoding)?;
+                drop(encoder);
+                fc.value = fc.value.wrapping_add(1);
+                let value = fc.value;
+                buffer.encode_signal(Some(EventRef::Event(&fc.event)), value)?;
+                // The copy is the frame in flight: the guest may reuse its surface once it ran
+                self.in_flight_frame_count.fetch_add(1, Ordering::SeqCst);
+                let this = self.block_self();
+                buffer.add_completed_handler(
+                    OnFault::Die,
+                    Box::new(move |info: CompletedInfo| {
+                        if info.status == CommandBufferStatus::ERROR {
+                            log::error!("a frame copy's command buffer failed");
+                        }
+                        if let Some(this) = this {
+                            let _g = this.display_mutex.lock();
+                            let left = this
+                                .in_flight_frame_count
+                                .fetch_sub(1, Ordering::SeqCst)
+                                .wrapping_sub(1);
+                            if left == 0 {
+                                this.in_flight_condition.notify_all();
+                            }
+                        }
+                    }),
+                )?;
+                buffer.commit(OnFault::Return)?;
+                let slot = &mut fc.slots[i];
+                slot.source = source;
+                slot.value = value;
+                fc.current = Some(i);
+                i
+            }
+        };
+        let slot = &fc.slots[index];
+        composite.encode_wait(Some(EventRef::Event(&fc.event)), slot.value)?;
+        slot.readers.fetch_add(1, Ordering::SeqCst);
+        let readers = std::sync::Arc::clone(&slot.readers);
+        composite.add_completed_handler(
+            OnFault::Die,
+            Box::new(move |_info: CompletedInfo| {
+                readers.fetch_sub(1, Ordering::SeqCst);
+            }),
+        )?;
+        Ok(Some(slot.texture.clone_ref()))
     }
 }

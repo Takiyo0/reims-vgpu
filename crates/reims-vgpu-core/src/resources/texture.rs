@@ -454,7 +454,7 @@ impl<P: Platform> PagedTexture<P> {
             crate::fatal!(DeathKind::GoneTaskPages)
         };
         // The task raises rather than answer nothing.
-        let buffer = task.new_buffer_for_virtual_page(hold, self.page, self.length)?;
+        let buffer = task.new_transfer_buffer_for_virtual_page(hold, self.page, self.length)?;
         *self.transfer_buffer.lock() = Some(buffer);
         Ok(())
     }

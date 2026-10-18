@@ -74,6 +74,18 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
         length: u64,
     ) -> RaiseResult<P::Buffer>;
 
+    /// [`new_buffer_for_virtual_page`](Self::new_buffer_for_virtual_page) for a transfer buffer
+    /// (a host-side staging buffer no guest value names), which a host may hand out again for the
+    /// same physical pages.
+    fn new_transfer_buffer_for_virtual_page(
+        &self,
+        hold: Hold<'_>,
+        page: u32,
+        length: u64,
+    ) -> RaiseResult<P::Buffer> {
+        self.new_buffer_for_virtual_page(hold, page, length)
+    }
+
     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
     /// nothing checks: the backing's validity writes still happen.
     fn prepare_backing(
