@@ -674,7 +674,7 @@ fn stretch_buffer(device: &rt::Device, (from, to): (u64, u64)) -> Option<rt::Buf
     let options = crate::gpu::resource_options("gatherHostRanges", 0);
     // SAFETY: a persistent range stays mapped, readable and writable for the rest of the process
     // (`register_persistent_host_range`'s contract), and the stretch lies in one.
-    let made = unsafe { device.new_buffer_with_bytes_no_copy(bytes, to - from, options, None) };
+    let made = unsafe { device.new_buffer_with_bytes_no_copy(rt::HostMemory::new(bytes), to - from, options, None) };
     let buffer = made.ok()?;
     map.insert(key, buffer.clone());
     Some(buffer)
@@ -690,34 +690,73 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         ranges: &[(reims_vgpu_core::host::HostPtr, u64, u64)],
     ) -> RaiseResult<bool> {
         const SEL: &str = "gatherHostRanges";
-        // Opt-in: on an RTX 4060 the GPU took longer gathering a texture's pages, about 4100
-        // scattered 4 KiB regions read across PCIe, than the CPU's copy (the paging queue busy
-        // 417 ms a second against 103 ms, measured), so the CPU copies unless
-        // `REIMS_VGPU_GPU_GATHER` is set.
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_GPU_GATHER").is_some()) {
-            return Ok(false);
+        use reims_vgpu_core::perfstats as stats;
+        use std::sync::atomic::Ordering::Relaxed;
+        // On unless `REIMS_VGPU_GPU_GATHER=0`; earlier builds gathered only when it was set at
+        // all, because 4100 scattered 4 KiB regions read across PCIe took the RTX 4060 longer
+        // than the CPU's copy (the paging queue busy 417 ms a second against 103 ms, measured).
+        // The merge of adjacent pages, the size floor and the run-length floor below are what
+        // make it worth trying again; `REIMS_VGPU_GPU_GATHER_MIN_KB` (default 1024) is the
+        // smallest gather, `REIMS_VGPU_GPU_GATHER_MIN_RUN_KB` (default 16) the smallest average
+        // run of merged pages. Anything refused is filled on the CPU, as before.
+        static ON: std::sync::OnceLock<(bool, u64, u64)> = std::sync::OnceLock::new();
+        let &(on, min_bytes, min_run) = ON.get_or_init(|| {
+            let kb = |name: &str, default: u64| {
+                std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+            };
+            (
+                std::env::var("REIMS_VGPU_GPU_GATHER").map_or(true, |v| v != "0"),
+                kb("REIMS_VGPU_GPU_GATHER_MIN_KB", 1024) << 10,
+                kb("REIMS_VGPU_GPU_GATHER_MIN_RUN_KB", 16) << 10,
+            )
+        });
+        let total: u64 = ranges.iter().map(|r| r.2).sum();
+        let cpu = |total: u64| {
+            stats::GATHER_CPU.add(std::time::Duration::ZERO);
+            stats::GATHER_CPU_KB.fetch_add(total >> 10, Relaxed);
+            Ok(false)
+        };
+        if !on || total < min_bytes {
+            return cpu(total);
         }
+        let started = std::time::Instant::now();
         let mut by_stretch: Vec<((u64, u64), Vec<(u64, u64, u64)>)> = Vec::new();
+        let mut runs = 0u64;
         for &(at, offset, length) in ranges {
             if length == 0 {
                 continue;
             }
             let first = at.addr() as u64;
             let Some(stretch) = rt::persistent_stretch(first, length) else {
-                return Ok(false);
+                return cpu(total);
             };
             let region = (first - stretch.0, offset, length);
-            match by_stretch.iter_mut().find(|(s, _)| *s == stretch) {
-                Some((_, regions)) => regions.push(region),
-                None => by_stretch.push((stretch, vec![region])),
+            let group = match by_stretch.iter().position(|(s, _)| *s == stretch) {
+                Some(i) => &mut by_stretch[i].1,
+                None => {
+                    by_stretch.push((stretch, Vec::new()));
+                    &mut by_stretch.last_mut().expect("just pushed").1
+                }
+            };
+            // Pages adjacent in both the source and the destination are one region
+            match group.last_mut() {
+                Some(last) if last.0 + last.2 == region.0 && last.1 + last.2 == region.1 => {
+                    last.2 += region.2;
+                }
+                _ => {
+                    group.push(region);
+                    runs += 1;
+                }
             }
+        }
+        if runs == 0 || total / runs < min_run {
+            return cpu(total);
         }
         let device = destination.raw.device().clone();
         let mut sources = Vec::with_capacity(by_stretch.len());
         for (stretch, _) in &by_stretch {
             let Some(source) = stretch_buffer(&device, *stretch) else {
-                return Ok(false);
+                return cpu(total);
             };
             sources.push(source);
         }
@@ -729,6 +768,8 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
                 })
             })?;
         }
+        stats::GATHER_GPU.add(started.elapsed());
+        stats::GATHER_GPU_KB.fetch_add(total >> 10, Relaxed);
         Ok(true)
     }
 
