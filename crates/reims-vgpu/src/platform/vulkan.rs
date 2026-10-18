@@ -71,4 +71,21 @@ impl ApiPlatform for VulkanPlatform {
             });
         Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
     }
+
+    /// On Windows (WHPX) the guest's RAM is `VirtualAlloc` memory the runtime imports through
+    /// `VK_EXT_external_memory_host`: import it once now, in large chunks, instead of a chunk at
+    /// the first buffer that needs it (a stall of tens of ms each, on the FIFO thread).
+    fn prewarm_guest_memory(&self, device: Option<&<Self as Platform>::Device>, map: Option<&MemoryMap>) {
+        #[cfg(windows)]
+        if let (Some(device), Some(map)) = (device, map) {
+            reims_vgpu_vulkan::api::prewarm_guest_ram(
+                device,
+                map.ranges()
+                    .iter()
+                    .map(|range| (range.host_address.addr().to_u64(), range.physical_length)),
+            );
+        }
+        #[cfg(not(windows))]
+        let _ = (device, map);
+    }
 }

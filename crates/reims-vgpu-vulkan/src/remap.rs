@@ -327,6 +327,21 @@ fn scratch_pool() -> bool {
     *ON.get_or_init(|| !std::env::var("REIMS_VGPU_SCRATCH_POOL").is_ok_and(|v| v == "0"))
 }
 
+/// The length a scratch range of `len` bytes is made with: rounded up to a size class (an eighth
+/// of the power of two at or above it, and whole 64 KiB granules), so ranges of nearby lengths
+/// share the pool's ranges and their kept imports, where an exact length missed whenever a size
+/// was new (a fresh range costs its section, zero fill and first-touch faults: 8.7 ms p50 for 8
+/// MB, measured). `REIMS_VGPU_SCRATCH_CLASSES=0` keeps exact lengths.
+fn scratch_class(len: u64) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| !std::env::var("REIMS_VGPU_SCRATCH_CLASSES").is_ok_and(|v| v == "0"));
+    if !on || len == 0 {
+        return len;
+    }
+    let step = (len.next_power_of_two() / 8).max(64 << 10);
+    len.div_ceil(step).saturating_mul(step)
+}
+
 /// The process's scratch ranges kept for reuse ([`Scratch`]).
 static SCRATCH: Mutex<Scratch> = Mutex::new(Scratch::new());
 
@@ -487,16 +502,20 @@ impl HostVm for VulkanVm {
             // As the committed copy fallback: a fresh range, unmapped at its free (holds wait).
             return self.allocate_anywhere(len);
         }
+        let len = scratch_class(len);
         let reused = SCRATCH.lock().take(len);
         match reused {
             Some(first) => {
+                reims_vgpu_core::perfstats::SCRATCH_REUSED.add(std::time::Duration::ZERO);
                 let at = HostPtr::from_addr(first.to_usize());
                 // New contents under the address, as a fresh range's are (module docs).
                 self.changed(at, len);
                 Ok(at)
             }
             None => {
+                let made = std::time::Instant::now();
                 let at = self.allocate_anywhere(len)?;
+                reims_vgpu_core::perfstats::SCRATCH_FRESH.add(made.elapsed());
                 // A scratch range is never unmapped (`free_scratch` keeps it), so the runtime may
                 // keep one import of it and bind each buffer over it there, instead of importing
                 // its pages anew at each reuse (1.4 ms p50 for 8 MB, measured).
@@ -512,6 +531,8 @@ impl HostVm for VulkanVm {
         if !scratch_pool() {
             return self.deallocate(addr, len);
         }
+        // The class the range was made with (`scratch_class`)
+        let len = scratch_class(len);
         // At the unmap, as `deallocate`'s (module docs).
         let pages = self.changed(addr, len);
         let whole = pages.start == addr.addr().to_u64() && pages.end - pages.start == len;

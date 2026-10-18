@@ -306,7 +306,7 @@ impl<P: ApiPlatform> Device<P> {
                 .memory_map
                 .as_ref()
                 .map(|map| Arc::from(platform.guest_memory(map)));
-            let core = config.into_core::<P>(metal);
+            let core = { platform.prewarm_guest_memory(metal.as_ref(), config.memory_map.as_ref()); config.into_core::<P>(metal) };
             match CoreDevice::new(platform.clone(), core) {
                 Ok(handle) => Ok(Device {
                     handle: Ours::new(handle),

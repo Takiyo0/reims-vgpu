@@ -21,6 +21,48 @@ pub fn read_pixels(texture: &VulkanTexture, dst: &mut [u8], bytes_per_row: usize
     });
 }
 
+/// Imports the guest's RAM into Vulkan once, at startup, before the guest runs (roadmap #2):
+/// each `(host address, length)` range in `ranges` is a persistent range
+/// ([`crate::os::lease_guest_memory`] registered it) and the runtime imports it in aligned chunks
+/// (`REIMS_VGPU_RAM_IMPORT_CHUNK_MB`, 256 MiB by default), so that no-copy buffers over it bind at an
+/// offset of a kept import instead of importing their pages. A chunk the driver refuses is left
+/// to the buffers' own imports. One warning line says what was done. `REIMS_VGPU_RAM_IMPORT=0`
+/// turns it off. Never fails.
+pub fn prewarm_guest_ram(
+    device: &crate::gpu::device::VulkanDevice,
+    ranges: impl IntoIterator<Item = (u64, u64)>,
+) {
+    let mut total = rt::PrewarmReport::default();
+    let mut count = 0u32;
+    for (host, length) in ranges {
+        let Some(start) = std::ptr::NonNull::new(host as *mut u8) else {
+            continue;
+        };
+        let report = device.raw.prewarm_persistent_host_range(start, length);
+        count += 1;
+        total.chunks += report.chunks;
+        total.failed += report.failed;
+        total.bytes += report.bytes;
+        total.elapsed += report.elapsed;
+    }
+    if total.chunks == 0 && total.failed == 0 {
+        return;
+    }
+    log::warn!(
+        "guest RAM import: {} chunks imported, {} refused, {} MiB over {count} ranges in {:.1} ms",
+        total.chunks,
+        total.failed,
+        total.bytes >> 20,
+        total.elapsed.as_secs_f64() * 1000.0
+    );
+    if total.failed != 0 {
+        log::warn!(
+            "guest RAM import: {} chunks were refused by the driver; buffers over them import their own pages",
+            total.failed
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use metal2vulkan::metal::PixelFormat;
