@@ -104,6 +104,7 @@ impl<P: Platform> Fifo<P> {
             self.quiesced.load(Ordering::SeqCst),
             DeathKind::DrainUnquiesced
         );
+        self.decode.drain();
         {
             let mut g = self.lock.lock();
             if self.running.load(Ordering::Relaxed) {
@@ -173,6 +174,7 @@ impl<P: Platform> Fifo<P> {
     /// The thread's body has no handler and no holder ([`Hold::NONE`]). The barrier wait has a
     /// handler of its own, and each command a holder of its own ([`Fifo::dispatch`]).
     fn run(self: &Arc<Self>) {
+        crate::fifo::decode_worker::raise_priority();
         let hold = Hold::NONE;
         // One read of the length serves the buffer and the bound (only a racing second thread
         // could make two reads differ). The buffer is zero-allocated, so the pages no command
@@ -278,6 +280,8 @@ impl<P: Platform> Fifo<P> {
             self.dispatch(&command, body);
         }
         drop(payload);
+        // Every exec handed on finishes before the thread's end
+        self.decode.drain();
         // Outside the lock
         self.rewind();
         let _g = self.lock.lock();

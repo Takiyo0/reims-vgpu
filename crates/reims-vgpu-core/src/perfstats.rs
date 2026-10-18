@@ -39,8 +39,30 @@ impl Counter {
 
 /// Execs (`ExecIndirect2`), whole.
 pub static EXEC: Counter = Counter::new();
+/// The decode worker's jobs (`fifo::decode_worker`): the second halves of the execs it ran.
+pub static DECODE_WORKER: Counter = Counter::new();
+/// A guest present's wait for the display lock and the frames in flight (`display::frame`).
+pub static PRESENT_WAIT: Counter = Counter::new();
+/// Transfer buffers handed out again by their physical pages (`TransferCache`).
+pub static TRANSFER_HIT: Counter = Counter::new();
+/// Copy-fallback scratch ranges made fresh (a pool miss), with their making's time.
+pub static SCRATCH_FRESH: Counter = Counter::new();
+/// Copy-fallback scratch ranges taken from the pool.
+pub static SCRATCH_REUSED: Counter = Counter::new();
 /// Their resource prepares.
 pub static PREPARE: Counter = Counter::new();
+/// Scattered guest ranges gathered on the GPU (`REIMS_VGPU_GPU_GATHER`): the encoding's time.
+pub static GATHER_GPU: Counter = Counter::new();
+/// The KiB they gathered.
+pub static GATHER_GPU_KB: AtomicU64 = AtomicU64::new(0);
+/// Scattered guest ranges a gather was asked for and left to the CPU copy (count, KiB).
+pub static GATHER_CPU: Counter = Counter::new();
+/// The KiB left to the CPU copy.
+pub static GATHER_CPU_KB: AtomicU64 = AtomicU64::new(0);
+/// Preparations run on the decode workers (`REIMS_VGPU_ASYNC_PREPARE`): the call's time.
+pub static PREP_ASYNC: Counter = Counter::new();
+/// A worker's wait for its preparation turn.
+pub static PREP_TURN: Counter = Counter::new();
 /// Resource prepares: the loop that looks up each resource the exec names.
 pub static PREPARE_LOOKUP: Counter = Counter::new();
 /// Resource prepares: GPU paging (the paging buffer, its texture and buffer prepares, commit).
@@ -61,6 +83,8 @@ pub const PAGING_KINDS: [&str; 14] = [
 ];
 /// GPU paging rounds: each blit prepare, by kind.
 pub static PAGING_BLIT: [Counter; 14] = [const { Counter::new() }; 14];
+/// Slow resource lookups (20 us or more: mostly a first use's creation), by resource kind.
+pub static LOOKUP_SLOW_KIND: [Counter; 14] = [const { Counter::new() }; 14];
 /// GPU paging rounds: each compute prepare, by kind.
 pub static PAGING_COMPUTE: [Counter; 14] = [const { Counter::new() }; 14];
 /// GPU paging round steps, in order.
@@ -82,7 +106,7 @@ pub static COPY_FALLBACK: Counter = Counter::new();
 pub static COPY_FALLBACK_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// The exec steps counted ([`exec_step`]), in order.
-const EXEC_STEPS: [&str; 7] = [
+const EXEC_STEPS: [&str; 9] = [
     "lock",
     "ensure_mapped",
     "prepare_resources",
@@ -90,8 +114,10 @@ const EXEC_STEPS: [&str; 7] = [
     "decode",
     "commit",
     "complete_resources",
+    "turn",
+    "handoff",
 ];
-static EXEC_STEP: [Counter; 7] = [const { Counter::new() }; 7];
+static EXEC_STEP: [Counter; 9] = [const { Counter::new() }; 9];
 
 /// One exec step of `took`, named as `exec_indirect` marks it; an unknown name is not counted.
 pub fn exec_step(label: &str, took: Duration) {
@@ -184,7 +210,16 @@ fn top(line: &mut String, prefix: &str, table: &[Counter], n: usize) {
 pub fn take_line() -> Option<String> {
     let parts = [
         ("exec", EXEC.take()),
+        ("decode-worker", DECODE_WORKER.take()),
+        ("present-wait", PRESENT_WAIT.take()),
+        ("transfer-hit", TRANSFER_HIT.take()),
+        ("scratch-fresh", SCRATCH_FRESH.take()),
+        ("scratch-reused", SCRATCH_REUSED.take()),
         ("prepare", PREPARE.take()),
+        ("gather-gpu", GATHER_GPU.take()),
+        ("gather-cpu", GATHER_CPU.take()),
+        ("prep-async", PREP_ASYNC.take()),
+        ("prep-turn", PREP_TURN.take()),
         ("prep-lookup", PREPARE_LOOKUP.take()),
         ("prep-paging", PREPARE_PAGING.take()),
         ("prep-tail", PREPARE_TAIL.take()),
@@ -196,6 +231,7 @@ pub fn take_line() -> Option<String> {
         ("copy", COPY_FALLBACK.take()),
     ];
     let bytes = COPY_FALLBACK_BYTES.swap(0, Relaxed);
+    let gather_kb = (GATHER_GPU_KB.swap(0, Relaxed), GATHER_CPU_KB.swap(0, Relaxed));
     let resources = PREPARE_RESOURCES.swap(0, Relaxed);
     let paged = PAGING_PREPARES.swap(0, Relaxed);
     if parts.iter().all(|(_, (n, _))| *n == 0)
@@ -219,7 +255,7 @@ pub fn take_line() -> Option<String> {
             line.push_str(&format!(" pg-{name} {n}/{ms:.1}ms"));
         }
     }
-    for (prefix, table) in [("pb", &PAGING_BLIT), ("pc", &PAGING_COMPUTE)] {
+    for (prefix, table) in [("pb", &PAGING_BLIT), ("pc", &PAGING_COMPUTE), ("ls", &LOOKUP_SLOW_KIND)] {
         for (name, counter) in PAGING_KINDS.iter().zip(table.iter()) {
             let (n, ms) = counter.take();
             if n != 0 {
@@ -281,8 +317,10 @@ pub fn take_line() -> Option<String> {
     }
     #[allow(clippy::cast_precision_loss)]
     line.push_str(&format!(
-        " copy-mb {:.1} resources {resources} paged {paged}\n",
-        bytes as f64 / f64::from(1u32 << 20)
+        " copy-mb {:.1} gather-gpu-kb {} gather-cpu-kb {} resources {resources} paged {paged}\n",
+        bytes as f64 / f64::from(1u32 << 20),
+        gather_kb.0,
+        gather_kb.1
     ));
     Some(line)
 }

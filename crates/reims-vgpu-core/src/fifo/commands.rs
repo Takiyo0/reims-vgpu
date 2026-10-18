@@ -272,15 +272,26 @@ impl<P: Platform> Fifo<P> {
                 let timed = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
                 let started = std::time::Instant::now();
                 let command_id = header.command_id;
+                // An exec hands its decode to the FIFO's worker; any other command waits for the
+                // worker first, so it never overtakes an exec before it (`decode_worker`).
+                let exec = matches!(op, Opcode::ExecIndirect2 | Opcode::ExecIndirect3);
+                if !exec {
+                    self.decode.drain();
+                }
                 let pool = Pool::push(self.platform());
                 let held = Held::new();
-                h(&mut Command {
+                let mut command = Command {
                     fifo: self,
                     held: &held,
                     hold: Hold::of(&held),
                     header,
                     payload,
-                });
+                };
+                if exec {
+                    crate::fifo::decode_worker::with_current(&self.decode, || h(&mut command));
+                } else {
+                    h(&mut command);
+                }
                 let ran = timed.map(|t| t.elapsed());
                 drop(held);
                 drop(pool);

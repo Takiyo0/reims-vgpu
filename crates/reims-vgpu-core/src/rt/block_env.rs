@@ -14,6 +14,7 @@
 //! Dropping the environment restores the caller's chain and mark.
 
 use std::cell::Cell;
+use std::mem::ManuallyDrop;
 
 use crate::rt::thread::{OursGuard, enter_ours};
 
@@ -23,31 +24,42 @@ pub(crate) type Owned = (u64, &'static str);
 thread_local! {
     /// The queues this thread is running a block of (its ownership chain), outermost first.
     static OWNED: Cell<Vec<Owned>> = const { Cell::new(Vec::new()) };
+    // Each installed chain is removed by BlockEnv's drop, including during unwind. Keeping
+    // ownership manually avoids the Windows GNU destructor guard on each TLS access.
+    static SCOPED_OWNED: Cell<ManuallyDrop<Vec<Owned>>> =
+        const { Cell::new(ManuallyDrop::new(Vec::new())) };
+}
+
+fn scoped_owned_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_BLOCK_ENV_TLS").map_or(true, |value| value != "0")
+    })
 }
 
 /// This thread's ownership chain.
 pub(crate) fn owned_chain() -> Vec<Owned> {
-    OWNED.with(|o| {
-        let v = o.take();
-        o.set(v.clone());
-        v
-    })
+    let v = swap_owned(Vec::new());
+    swap_owned(v.clone());
+    v
 }
 
 fn swap_owned(v: Vec<Owned>) -> Vec<Owned> {
-    OWNED.with(|o| o.replace(v))
+    if scoped_owned_enabled() {
+        SCOPED_OWNED.with(|o| ManuallyDrop::into_inner(o.replace(ManuallyDrop::new(v))))
+    } else {
+        OWNED.with(|o| o.replace(v))
+    }
 }
 
 /// The innermost queue this thread runs a block of (tests): what
 /// `dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL)` reads there.
 #[cfg(test)]
 pub(crate) fn current_label() -> Option<&'static str> {
-    OWNED.with(|o| {
-        let v = o.take();
-        let label = v.last().map(|&(_, l)| l);
-        o.set(v);
-        label
-    })
+    let v = swap_owned(Vec::new());
+    let label = v.last().map(|&(_, l)| l);
+    swap_owned(v);
+    label
 }
 
 /// The environment of one callout, entered when it starts and restored when it ends, on a
@@ -128,6 +140,24 @@ impl Submitted {
 mod tests {
     use super::*;
     use crate::rt::thread::is_our_thread;
+
+    #[test]
+    fn nested_chain_restores_after_panic() {
+        let outer = vec![(1, "outer")];
+        {
+            let _outer = BlockEnv::block(outer.clone(), false);
+            let result = std::panic::catch_unwind(|| {
+                let _inner = BlockEnv::block(vec![(1, "outer"), (2, "inner")], false);
+                assert_eq!(current_label(), Some("inner"));
+                assert_eq!(owned_chain(), vec![(1, "outer"), (2, "inner")]);
+                panic!("restore the enclosing ownership chain");
+            });
+            assert!(result.is_err());
+            assert_eq!(owned_chain(), outer);
+            assert_eq!(current_label(), Some("outer"));
+        }
+        assert!(owned_chain().is_empty());
+    }
 
     /// A block owns its chain, marked ours; the caller's come back after
     #[test]

@@ -145,6 +145,7 @@ impl<P: Platform> LocalTask<P> {
             io_surface_buffers_allowed: false,
             prepare_mutex: Mutex::new(()),
             object_list_range: Mutex::new((0, 0)),
+            transfer_cache: Mutex::new(super::memory::TransferCache::default()),
         };
         if length == 0 {
             log::warn!("task {task_id} refused: its length is 0");
