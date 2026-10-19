@@ -809,8 +809,13 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     .new_buffer_with_descriptor(with_token(descriptor, token))
                 {
                     Ok(raw) => Ok(Some(raw)),
-                    // Pages Metal makes no buffer over: nil.
-                    Err(_) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => Ok(None),
+                    // Pages Metal makes no buffer over: nil. The runtime's error is logged
+                    // (first 20, then a count a second): it was swallowed, and a nil here makes
+                    // the exec fault.
+                    Err(e) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => {
+                        log_swallowed_no_copy_error(&e, bytes.len(), false);
+                        Ok(None)
+                    }
                     Err(e) => Err(e),
                 }
             },
@@ -1712,7 +1717,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                             match token {
                                 Some(token) => {
                                     self.raw.new_heap_with_bytes_no_copy_and_range_token(
-                                        first,
+                                        rt::HostMemory::new(first),
                                         &descriptor,
                                         None,
                                         Some(keep),
@@ -1720,7 +1725,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                                     )
                                 }
                                 None => self.raw.new_heap_with_bytes_no_copy(
-                                    first,
+                                    rt::HostMemory::new(first),
                                     &descriptor,
                                     None,
                                     Some(keep),
@@ -2476,4 +2481,30 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "macos")]
     pub(crate) mod metal_tests;
+}
+
+/// Logs an error of a no-copy buffer that is turned into nil: the first 20 in full, then one
+/// summary line a second with the count since the last.
+fn log_swallowed_no_copy_error(e: &dyn std::fmt::Debug, size: u64, readable: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static LAST: StdMutex<Option<(std::time::Instant, u64)>> = StdMutex::new(None);
+    let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 20 {
+        log::warn!("no-copy buffer swallowed as nil (#{n}): error {e:?}, size {size:#x}, range readable {readable}");
+        return;
+    }
+    if let Ok(mut last) = LAST.lock() {
+        let now = std::time::Instant::now();
+        let (at, seen) = last.get_or_insert((now, 20));
+        if now.duration_since(*at).as_secs_f64() >= 1.0 {
+            log::warn!(
+                "no-copy buffer swallowed as nil: {} more since the last report ({n} total); last error {e:?}, size {size:#x}, range readable {readable}",
+                n - *seen
+            );
+            *at = now;
+            *seen = n;
+        }
+    }
 }
