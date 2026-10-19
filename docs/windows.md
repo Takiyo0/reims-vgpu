@@ -270,6 +270,9 @@ fresh QEMU-native install is `macos-shaderpass-20261015.qcow2` over `macos-overl
 The guest drivers were written against Apple's framework, so nothing is installed for the GPU.
 What the guest needs beyond that:
 
+How the guest disk, the OpenCore image, the firmware files, the SSH key and the guest agent were made, and how to
+make them again: [guest-setup.md](guest-setup.md).
+
 - **`FORCE_SOFTWARE_RENDERER=1`, for blank icons.** `iconservicesagent`, Spotlight and
   `com.apple.dock.extra` crash in IconRendering: it hands RenderBox its `binary.metallib` archive,
   and Metal asserts on the x86 paravirtual device (`+[MTLLoader sliceIDForDevice:]`, "Target
