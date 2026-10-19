@@ -180,6 +180,15 @@ tree can run on it beside the Metal one.
   `Cargo.toml` names. On macOS it runs on MoltenVK.
 - VMs: `reims-ctl` (`crates/reims-ctl`) creates, boots and manages them.
 
+## Windows host
+
+An x86-64 macOS guest also runs on Windows 11: QEMU on WHPX, the Vulkan platform on the host GPU
+(an NVIDIA GPU is the one measured), and each display in a Win32 window of its own. The library is
+built for `x86_64-pc-windows-gnu` and linked into QEMU under MSYS2; the launcher is a PowerShell
+script outside this repository. [docs/windows.md](docs/windows.md) covers building, running, the
+guest's setup, every environment variable, the performance work, and the known limits.
+[docs/merge-notes.md](docs/merge-notes.md) says how this branch relates to `master`.
+
 ## Developing
 
 macOS already includes a paravirtual GPU driver named `AppleParavirtGPU.kext`, written against the
