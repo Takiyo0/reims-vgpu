@@ -74,7 +74,7 @@ coverage:
 	$(PGTEST) cov -k "$(TEST)" $(ARGS)
 
 vendor/qemu/configure:
-	@echo "vendor/qemu is empty: git submodule update --init vendor/qemu" >&2
+	@echo "vendor/qemu is empty: git submodule update --init --remote vendor/qemu" >&2
 	@exit 1
 
 # QEMU finds reims-vgpu.pc in the dist tree and links libreims_vgpu.a, so the

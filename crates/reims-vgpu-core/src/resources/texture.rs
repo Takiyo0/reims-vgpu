@@ -201,6 +201,60 @@ pub(crate) fn raise<T>(kind: RaiseKind) -> RaiseResult<T> {
     crate::resources::raise(kind.into())
 }
 
+/// DIAG(texture-fingerprint): whether a texture's guest pages changed since its last prepare,
+/// from 64 bytes of each 4 KiB page (a sample: a change elsewhere in a page goes unseen). Counts
+/// are written every 500 prepares at debug.
+#[allow(unsafe_code)]
+fn fingerprint_diag(texture: usize, ranges: &[(crate::host::HostPtr, u64, u64)]) {
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: StdMutex<Option<HashMap<usize, (u64, u64)>>> = StdMutex::new(None);
+    static SAME: AtomicU64 = AtomicU64::new(0);
+    static CHANGED: AtomicU64 = AtomicU64::new(0);
+    static FIRST: AtomicU64 = AtomicU64::new(0);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut bytes = 0u64;
+    for &(host, _, size) in ranges {
+        let mut at = 0u64;
+        while at < size {
+            let n = 64.min(size - at) as usize;
+            // SAFETY: `host` maps `size` bytes of guest RAM (discontiguous_ranges); a read only.
+            let sample =
+                unsafe { std::slice::from_raw_parts((host.addr() + at as usize) as *const u8, n) };
+            for chunk in sample.chunks(8) {
+                let mut w = [0u8; 8];
+                w[..chunk.len()].copy_from_slice(chunk);
+                hash = (hash ^ u64::from_le_bytes(w)).wrapping_mul(0x100_0000_01b3);
+            }
+            at += 4096;
+        }
+        bytes += size;
+    }
+    let previous = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        last.get_or_insert_with(HashMap::new)
+            .insert(texture, (hash, bytes))
+    };
+    match previous {
+        Some((h, b)) if h == hash && b == bytes => SAME.fetch_add(1, Relaxed),
+        Some(_) => CHANGED.fetch_add(1, Relaxed),
+        None => FIRST.fetch_add(1, Relaxed),
+    };
+    let (same, changed, first) = (
+        SAME.load(Relaxed),
+        CHANGED.load(Relaxed),
+        FIRST.load(Relaxed),
+    );
+    if (same + changed + first) % 500 == 0 {
+        log::debug!(
+            target: "reims_vgpu_core::tasks::local::exec",
+            "texture fingerprint: {same} unchanged, {changed} changed, {first} first of {} prepares",
+            same + changed + first
+        );
+    }
+}
+
 /// A paged texture's Metal texture and the guest pages it is paged from, with the process it
 /// makes descriptors in.
 pub struct PagedTexture<P: Platform> {
@@ -355,6 +409,21 @@ pub fn create_shared_texture_resource<P: Platform>(
 impl<P: Platform> PagedTexture<P> {
     /// A paged texture over `texture` (retained), with no guest pages yet.
     pub(crate) fn new(platform: &Arc<P>, task: TaskRef<P>, texture: &P::Texture) -> Self {
+        // DIAG(boot-tile): the first 400 paged textures' sizes, for the grey boot frame whose
+        // tile x>=1024, y>=1024 never lands.
+        {
+            use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Relaxed) < 400 {
+                log::debug!(
+                    target: "reims_vgpu_core::boot_tile",
+                    "paged texture {}x{} format {}",
+                    texture.width(),
+                    texture.height(),
+                    texture.pixel_format()
+                );
+            }
+        }
         PagedTexture {
             platform: Arc::clone(platform),
             task,
@@ -394,7 +463,7 @@ impl<P: Platform> PagedTexture<P> {
         // page and its length.
         crate::trace::event("tobj", &[4, u64::from(self.page), self.length]);
         // The task raises rather than answer nothing.
-        let buffer = task.new_buffer_for_virtual_page(hold, self.page, self.length)?;
+        let buffer = task.new_transfer_buffer_for_virtual_page(hold, self.page, self.length)?;
         *self.transfer_buffer.lock() = Some(buffer);
         Ok(())
     }
@@ -408,33 +477,109 @@ impl<P: Platform> PagedTexture<P> {
     }
 
     /// Guest to host: devolatilize, then page up unless host-valid. A protected texture is never
-    /// paged, yet marked host-valid. `ensure` binds the pages, `page` pages them.
+    /// paged, yet marked host-valid. `ensure` binds the pages, `page` pages them. The transfer
+    /// buffer is brought up to date from the guest on the CPU first.
     pub(crate) fn prepare(
         &self,
         state: &ResourceState,
         ensure: impl FnOnce() -> RaiseResult<()>,
         page: impl FnOnce() -> RaiseResult<()>,
     ) -> RaiseResult<()> {
+        self.prepare_filled(None, state, ensure, page)
+    }
+
+    /// [`Self::prepare`] for a prepare through the blit `encoder`: a transfer buffer the WHPX copy
+    /// fallback made, whose guest pages are scattered in host memory, is filled by the GPU, its
+    /// pages gathered into it in `encoder` before `page`'s copies ([`BlitEncoder::gather_host_ranges`]),
+    /// in place of a copy on the CPU; one the platform cannot gather into is filled on the CPU.
+    pub(crate) fn prepare_with_blit(
+        &self,
+        encoder: Option<&P::BlitEncoder>,
+        state: &ResourceState,
+        ensure: impl FnOnce() -> RaiseResult<()>,
+        page: impl FnOnce() -> RaiseResult<()>,
+    ) -> RaiseResult<()> {
+        self.prepare_filled(encoder, state, ensure, page)
+    }
+
+    fn prepare_filled(
+        &self,
+        encoder: Option<&P::BlitEncoder>,
+        state: &ResourceState,
+        ensure: impl FnOnce() -> RaiseResult<()>,
+        page: impl FnOnce() -> RaiseResult<()>,
+    ) -> RaiseResult<()> {
+        use crate::platform::blit::BlitEncoder as _;
+        // DIAG(texture-prepare): each step's time, written where the prepare takes 2 ms or more.
+        let diag =
+            log::log_enabled!(target: "reims_vgpu_core::tasks::local::exec", log::Level::Debug);
+        let t0 = std::time::Instant::now();
+        let was_volatile = state.is_volatile();
         self.devolatilize(state)?;
+        let t_devol = t0.elapsed();
         if state.host_valid() {
             return Ok(());
         }
         if !state.guest_valid() {
             log::warn!("preparing a texture whose guest copy is not valid");
         }
+        let (mut t_ensure, mut t_sync) = (t_devol, t_devol);
+        let mut gathered = false;
         if self.texture.protection_options() == 0 {
-            ensure()?;
-            if let Some(tb) = self.transfer_buffer.lock().as_ref() {
-                if let Some(t) = self.task.upgrade() {
-                    if let Some(map) = t.memory_map() {
-                        use crate::platform::resource::Buffer as _;
-                        map.sync_range_from_guest(tb.contents(), tb.length());
-                    }
+            // A transfer buffer bound here is filled below, every byte, so its copy fallback
+            // leaves it unfilled (`with_lazy_fallback`).
+            crate::memory::map::with_lazy_fallback(ensure)?;
+            t_ensure = t0.elapsed();
+            let tb = self.transfer_buffer.lock().as_ref().map(Handle::clone_ref);
+            if let Some(tb) = tb
+                && let Some(t) = self.task.upgrade()
+                && let Some(map) = t.memory_map()
+            {
+                use crate::platform::resource::Buffer as _;
+                if diag && let Some(ranges) = map.discontiguous_ranges(tb.contents(), tb.length()) {
+                    fingerprint_diag(self as *const Self as usize, &ranges);
+                }
+                if let (Some(e), Some(ranges)) = (
+                    encoder,
+                    map.discontiguous_ranges(tb.contents(), tb.length()),
+                ) {
+                    gathered = e.gather_host_ranges(&tb, &ranges)?;
+                }
+                // EXPERIMENT(skip-fill): REIMS_VGPU_DIAG_SKIP_FILL=1 leaves transfer buffers of
+                // 1 MiB or more unfilled (wrong pixels), to measure what the copy costs a frame.
+                static SKIP_FILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let skip = *SKIP_FILL.get_or_init(|| {
+                    std::env::var("REIMS_VGPU_DIAG_SKIP_FILL").is_ok_and(|v| v == "1")
+                }) && tb.length() >= 1 << 20;
+                if !gathered && !skip {
+                    // Filled before the paging buffer commits, on a worker beside the other
+                    // textures' fills where the exec collects them.
+                    let (at, length) = (tb.contents().addr(), tb.length());
+                    crate::memory::map::defer_sync(Box::new(move || {
+                        map.sync_range_from_guest(crate::host::HostPtr::from_addr(at), length);
+                    }));
                 }
             }
+            t_sync = t0.elapsed();
+            crate::perfstats::TEXTURE_ENSURE.add(t_ensure - t_devol);
+            crate::perfstats::TEXTURE_SYNC.add(t_sync - t_ensure);
             page()?;
         }
         state.set_host_valid(true);
+        if diag && t0.elapsed().as_secs_f64() >= 0.002 {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            log::debug!(
+                target: "reims_vgpu_core::tasks::local::exec",
+                "texture prepare: devolatilize={:.2} (was volatile {was_volatile}) ensure={:.2} sync={:.2} page={:.2} ms; gathered {gathered}; {}x{} length {:#x}",
+                ms(t_devol),
+                ms(t_ensure - t_devol),
+                ms(t_sync - t_ensure),
+                ms(t0.elapsed() - t_sync),
+                self.texture.width(),
+                self.texture.height(),
+                self.length
+            );
+        }
         Ok(())
     }
 
@@ -480,6 +625,10 @@ impl<P: Platform> PagedTexture<P> {
 impl<P: Platform> ResourceClass<P> for TextureResource<P> {
     fn initial_guest_valid(&self) -> bool {
         true
+    }
+
+    fn devolatilize_now(&self, this: &Resource<P>) -> RaiseResult<()> {
+        self.paged.devolatilize(&this.state)
     }
 
     fn needs_compute_paging(&self, this: &Resource<P>) -> bool {

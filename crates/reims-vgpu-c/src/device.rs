@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use reims_vgpu::{
     AddTraceRange, CreateTask, DestroyTask, Device, DeviceConfig, Error, HostCallbacks, HostPtr,
-    HostTask, HostTraceRange, MapMemory, MemoryMap, PhysicalMemoryRange,
-    RaiseInterrupt, ReadMemory, RemoveTraceRange, UnmapMemory,
+    HostTask, HostTraceRange, MapMemory, MemoryMap, PhysicalMemoryRange, RaiseInterrupt,
+    ReadMemory, RemoveTraceRange, UnmapMemory,
 };
 
 use crate::ffi;
@@ -306,17 +306,24 @@ pub struct RvgDeviceConfig {
     /// not a multiple of the host's page size: RVG_ERR_INVALID_ARGUMENT, in that order, before
     /// any file is duplicated.
     pub memory_files: *const RvgMemoryRangeFile,
+    /// Isolate nonzero tasks only while the IOSurface device has a mapped descriptor table;
+    /// argument buffers follow the same condition.
+    pub process_isolation_follows_guest: bool,
 }
 
 // SAFETY: repr(C), a u32 first; integers, bools and pointers.
 unsafe impl HostStruct for RvgDeviceConfig {
     /// The first version ends at `callbacks`: a host built against it passes 48, and has no
-    /// `memory_files`.
+    /// `memory_files` or `process_isolation_follows_guest`.
     const V1_SIZE: usize = 48;
 }
 
 const _: () =
     assert!(std::mem::offset_of!(RvgDeviceConfig, memory_files) == RvgDeviceConfig::V1_SIZE);
+const _: () = assert!(
+    std::mem::offset_of!(RvgDeviceConfig, process_isolation_follows_guest)
+        == std::mem::offset_of!(RvgDeviceConfig, memory_files) + std::mem::size_of::<*const ()>()
+);
 
 /// The device: one paravirtualized GPU and its display ports.
 pub struct RvgDevice {
@@ -452,26 +459,26 @@ fn file_refusal(r: &RvgMemoryRange, f: &RvgMemoryRangeFile, page: NonZeroU64) ->
     }
     #[cfg(unix)]
     {
-    let size = match file_size(f.fd) {
-        Ok(size) => size,
-        Err(e) => return Some(format!("has fd {}, which fstat cannot read: {e}", f.fd)),
-    };
-    if f.offset
-        .checked_add(r.physical_length)
-        .is_none_or(|end| size < end)
-    {
-        return Some(format!(
-            "holds {size:#x} bytes, fewer than its offset {:#x} and the range's {:#x}",
-            f.offset, r.physical_length
-        ));
-    }
-    if f.offset % page != 0 {
-        return Some(format!(
-            "has offset {:#x}, not a multiple of the page size {page:#x}",
-            f.offset
-        ));
-    }
-    None
+        let size = match file_size(f.fd) {
+            Ok(size) => size,
+            Err(e) => return Some(format!("has fd {}, which fstat cannot read: {e}", f.fd)),
+        };
+        if f.offset
+            .checked_add(r.physical_length)
+            .is_none_or(|end| size < end)
+        {
+            return Some(format!(
+                "holds {size:#x} bytes, fewer than its offset {:#x} and the range's {:#x}",
+                f.offset, r.physical_length
+            ));
+        }
+        if f.offset % page != 0 {
+            return Some(format!(
+                "has offset {:#x}, not a multiple of the page size {page:#x}",
+                f.offset
+            ));
+        }
+        None
     }
 }
 
@@ -683,6 +690,7 @@ pub unsafe extern "C" fn rvg_device_create(
             memory_map,
             use_iosurface_mapper: c.use_iosurface_mapper,
             process_isolation: c.process_isolation,
+            process_isolation_follows_guest: c.process_isolation_follows_guest,
             argument_buffers: !c.disable_argument_buffers,
             callbacks: host_callbacks(&table, &callbacks),
         };

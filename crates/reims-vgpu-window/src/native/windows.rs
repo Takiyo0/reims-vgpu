@@ -23,6 +23,19 @@ mod keymap;
 mod render;
 mod ui;
 
+// Policy-only preparation; no production input path is wired yet.
+#[cfg(test)]
+mod focus;
+
+#[cfg(test)]
+mod focus_geometry;
+
+#[cfg(test)]
+mod keyboard_hook;
+
+#[cfg(test)]
+mod touchpad;
+
 #[cfg(test)]
 mod stage1_test;
 

@@ -292,7 +292,9 @@ fn file_name(p: &Path) -> String {
 /// Copies `src` to `dst`: a clone on APFS, a reflink where Linux's file system can, else a
 /// sparse copy.
 pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    let ok = if cfg!(target_os = "macos") {
+    let ok = if cfg!(windows) {
+        std::fs::copy(src, dst).is_ok()
+    } else if cfg!(target_os = "macos") {
         Command::new("cp")
             .arg("-c")
             .arg(src)
@@ -423,10 +425,19 @@ fn make_q35(
 }
 
 fn make_writable(p: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perm = std::fs::metadata(p)?.permissions();
-    perm.set_mode(perm.mode() | 0o600);
-    std::fs::set_permissions(p, perm)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(p)?.permissions();
+        perm.set_mode(perm.mode() | 0o600);
+        std::fs::set_permissions(p, perm)
+    }
+    #[cfg(windows)]
+    {
+        let mut perm = std::fs::metadata(p)?.permissions();
+        perm.set_readonly(false);
+        std::fs::set_permissions(p, perm)
+    }
 }
 
 fn import_disk(

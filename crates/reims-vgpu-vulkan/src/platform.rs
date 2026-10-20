@@ -138,6 +138,8 @@ impl VulkanPlatform {
     /// pool core's pools push, as `MetalPlatform::new` does, as IOSurface and Foundation still
     /// autorelease into it.
     pub fn new(launcher: Box<dyn TaskLauncher<VulkanPlatform>>) -> VulkanPlatform {
+        // metal2vulkan's own work counters join the work line.
+        let _ = reims_vgpu_core::perfstats::EXTRA.set(metal2vulkan_runtime::perfcount::take_line);
         crate::os::install_process_services();
         VulkanPlatform {
             surfaces: OsSurfaces::new(),
@@ -311,19 +313,11 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             .into_iter()
             .chain(crate::answer::HEARD)
             .collect();
-        if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
-            reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
-            if crate::answer::trace_degradations() && reims_vgpu_core::trace::on() {
-                // Every occurrence reaches the sink, which writes each to the trace and relays
-                // a kind the runtime announces once only the first time: only where the trace's
-                // file opened, the sink's own condition, so a refused file changes nothing.
-                options.announce_each = rt::Degradation::ALL.iter().copied().collect();
-            }
-        }
         if let Some(cache_dir) = std::env::var_os("REIMS_VGPU_CACHE_DIR") {
-            options.shader_cache =
-                rt::ShaderCacheOptions::in_directory(PathBuf::from(cache_dir));
-        } else if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            options.shader_cache = rt::ShaderCacheOptions::in_directory(PathBuf::from(cache_dir));
+        } else if let Some(home) =
+            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        {
             options.shader_cache =
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
         }

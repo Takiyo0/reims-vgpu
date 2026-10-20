@@ -9,7 +9,7 @@ license.workspace = true
 
 [dependencies]
 reims-vgpu-core.workspace = true
-metal2vulkan-runtime.workspace = true
+metal2vulkan-runtime = { workspace = true, features = ["performance-counters"] }
 metal2vulkan.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
 log.workspace = true

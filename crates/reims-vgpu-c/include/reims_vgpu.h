@@ -437,6 +437,10 @@ typedef struct {
   // not a multiple of the host's page size: RVG_ERR_INVALID_ARGUMENT, in that order, before
   // any file is duplicated.
   const RvgMemoryRangeFile *memory_files;
+  // With process isolation enabled, isolate nonzero tasks only while the IOSurface device has a
+  // mapped descriptor table; argument buffers follow the same condition. Zero keeps legacy
+  // behavior.
+  bool process_isolation_follows_guest;
 } RvgDeviceConfig;
 
 // Bytes the library allocated; free them with rvg_bytes_free.

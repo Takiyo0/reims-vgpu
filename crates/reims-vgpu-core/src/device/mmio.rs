@@ -27,6 +27,24 @@ use crate::platform::Platform;
 use crate::raise::{RaiseResult, death::DeathKind};
 use crate::rt::Hold;
 
+/// `REIMS_VGPU_GUEST_DISPLAY_PORTS`, read once: a port count from 1 the guest reads at 0x122c
+/// whatever its binary version. Unset (or not such a number), the guest reads Apple's answer: 1
+/// below version 245.
+///
+/// x86-64 macOS's `AppleParavirtGPU` asks for binary version 6, the highest it knows (measured:
+/// 0x1034 reads 6 on macOS 26.7, kext 15.0.0), and so reads one port; yet its control object
+/// reads 0x122c as it starts and takes up to 8 ports (read from its code; docs/qemu.md, "Two
+/// displays on x86-64"). Opt-in, so a guest's view of a device stays Apple's unless the host asks.
+fn guest_display_ports_override() -> Option<u32> {
+    static PORTS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *PORTS.get_or_init(|| {
+        std::env::var("REIMS_VGPU_GUEST_DISPLAY_PORTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&ports| ports >= 1)
+    })
+}
+
 /// Where the register window starts.
 pub const MMIO_BASE: u64 = 0x1000;
 
@@ -251,10 +269,15 @@ impl<P: Platform> DeviceCore<P> {
 
     /// The display port count the guest reads.
     ///
-    /// Below version 245 every read answers `count != 0`.
+    /// Below version 245 every read answers `count != 0`, unless `REIMS_VGPU_GUEST_DISPLAY_PORTS`
+    /// ([`guest_display_ports_override`]) is set: then every read answers that many, at most the
+    /// device's count, whatever the version.
     pub fn guest_display_port_count(&self) -> u32 {
         let mut count = self.display_port_count.load(Ordering::Relaxed);
-        if !self.features.load().supports_multiple_displays {
+        if let Some(ports) = guest_display_ports_override() {
+            count = count.min(ports);
+            log::debug!("display port count reads {count}: REIMS_VGPU_GUEST_DISPLAY_PORTS");
+        } else if !self.features.load().supports_multiple_displays {
             count = u32::from(count != 0);
             log::debug!("display port count reads {count}: the guest's version has one display");
         }

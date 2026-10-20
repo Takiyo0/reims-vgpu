@@ -3,7 +3,7 @@
 use crate::create::{self, DiskSource, ImportMode, Spec};
 use crate::host::{Host, Profile};
 use crate::vm::{self, Registry, Vm, format_mib, parse_size_mib};
-use crate::{gpu, install, logs, opencore, paths, qemu, reims_util, runtime, update, view};
+use crate::{gpu, install, logs, opencore, paths, qemu, qmp, reims_util, runtime, update, view};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
@@ -49,6 +49,13 @@ pub enum Cmd {
     },
     /// Start a VM: a window opens for each of its displays
     Start { name: String },
+    /// Query or change the connected displays of a running x86-64 Reims VM
+    Displays {
+        name: String,
+        /// Set the connected display count (1 to 8); requires --hotplug-displays at boot
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=8))]
+        count: Option<u32>,
+    },
     /// Shut a VM down; if the guest has not shut down when the timeout ends, power it off
     Stop {
         name: String,
@@ -267,6 +274,12 @@ pub struct CreateArgs {
     /// Displays, 1 to 8, each in a window of its own
     #[arg(long)]
     pub displays: Option<u32>,
+    /// Reserve all eight display ports for runtime hotplug (x86-64 Reims VMs)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub hotplug_displays: Option<bool>,
+    /// Host TCP port for the optional per-window pointer agent; 0 disables it
+    #[arg(long)]
+    pub pointer_agent_port: Option<u16>,
     /// The guest's first mode: WIDTHxHEIGHT, or host for the host screen's modes
     #[arg(long)]
     pub resolution: Option<String>,
@@ -311,6 +324,12 @@ pub struct SetArgs {
     pub graphics: Option<String>,
     #[arg(long)]
     pub displays: Option<u32>,
+    /// Reserve all eight display ports for runtime hotplug (x86-64 Reims VMs)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub hotplug_displays: Option<bool>,
+    /// Host TCP port for the optional per-window pointer agent; 0 disables it
+    #[arg(long)]
+    pub pointer_agent_port: Option<u16>,
     /// WIDTHxHEIGHT, or host
     #[arg(long)]
     pub resolution: Option<String>,
@@ -374,6 +393,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             let pid = runtime::start(&vm, host)?;
             println!("{name}: running, pid {pid}");
         }
+        Cmd::Displays { name, count } => displays(&name, count)?,
         Cmd::Stop {
             name,
             force,
@@ -404,12 +424,15 @@ pub fn main(cli: Cli) -> Result<i32> {
         Cmd::Command { name, output } => {
             let vm = Registry::load()?.open(&name)?;
             let script =
-                runtime::invocation_for_print(&vm, host)?.shell_script(&script_comment(&vm));
+                runtime::invocation_for_print(&vm, host)?.platform_script(&script_comment(&vm));
             match output {
                 Some(p) => {
                     std::fs::write(&p, script)?;
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
+                    }
                     println!("wrote {}", p.display());
                 }
                 None => print!("{script}"),
@@ -653,6 +676,8 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     if let Some(n) = a.displays {
         s.display.count = n;
     }
+    s.display.hotplug_displays = a.hotplug_displays.unwrap_or(false);
+    s.display.pointer_agent_port = a.pointer_agent_port.filter(|p| *p != 0);
     if let Some(r) = &a.resolution {
         s.display.resolution = r.clone();
     }
@@ -777,6 +802,12 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     }
     if c.display.borderless {
         disp.push_str(", borderless");
+    }
+    if c.display.hotplug_displays {
+        disp.push_str(", hotplug up to 8");
+    }
+    if let Some(port) = c.display.pointer_agent_port {
+        disp.push_str(&format!(", pointer agent on 127.0.0.1:{port}"));
     }
     if let Some(r) = c.display.refresh {
         disp.push_str(&format!(", {r} Hz"));
@@ -939,6 +970,15 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     if let Some(n) = a.displays {
         c.display.count = n;
     }
+    if let Some(b) = a.hotplug_displays {
+        c.display.hotplug_displays = b;
+    } else if c.graphics != vm::Graphics::ReimsVgpu {
+        c.display.hotplug_displays = false;
+        c.display.pointer_agent_port = None;
+    }
+    if let Some(p) = a.pointer_agent_port {
+        c.display.pointer_agent_port = (p != 0).then_some(p);
+    }
     if let Some(r) = &a.resolution {
         c.display.resolution = r.clone();
     }
@@ -999,6 +1039,52 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     };
     println!("{}: saved{note}", vm.name());
     show(&vm, host);
+    Ok(())
+}
+
+fn displays(name: &str, count: Option<u32>) -> Result<()> {
+    let mut vm = Registry::load()?.open(name)?;
+    if vm.config.profile != crate::host::Profile::Q35X86_64
+        || vm.config.graphics != vm::Graphics::ReimsVgpu
+    {
+        bail!("runtime display hotplug is supported for x86-64 Reims VMs");
+    }
+    if !runtime::running(&vm) {
+        bail!("{name} is not running");
+    }
+    if count.is_some() && !vm.config.display.hotplug_displays {
+        bail!(
+            "enable --hotplug-displays and restart {name} before changing its live display count"
+        );
+    }
+    let result = if let Some(count) = count {
+        qmp::run(
+            &vm.qmp_socket(),
+            "reims-set-display-count",
+            Some(serde_json::json!({ "device": "gfx", "count": count })),
+        )?
+    } else {
+        qmp::run(
+            &vm.qmp_socket(),
+            "query-reims-displays",
+            Some(serde_json::json!({ "device": "gfx" })),
+        )?
+    };
+    let actual = result
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .context("QMP response has no display count")? as u32;
+    let ports = result
+        .get("ports")
+        .and_then(serde_json::Value::as_u64)
+        .context("QMP response has no reserved display-port count")? as u32;
+    if count.is_some() {
+        vm.config.display.count = actual;
+        vm.save().context(format!(
+            "QEMU changed the live display count to {actual}, but saving it failed; the next start may use the previous count"
+        ))?;
+    }
+    println!("{name}: {actual} connected display(s), {ports} port(s) reserved");
     Ok(())
 }
 
@@ -1081,6 +1167,44 @@ fn doctor(host: Host) -> Result<i32> {
                     install::default_audio_backend(&b)
                 ),
             );
+            if host.os == crate::host::Os::Windows {
+                let whpx = install::has_whpx(&q);
+                line(
+                    whpx,
+                    "WHPX",
+                    if whpx {
+                        "listed by this QEMU build".into()
+                    } else {
+                        format!(
+                            "{} does not list WHPX; use a QEMU build compiled with --enable-whpx",
+                            q.display()
+                        )
+                    },
+                );
+                let device = install::has_device(&q, "apple-gfx-pci");
+                line(
+                    device,
+                    "apple-gfx-pci",
+                    if device {
+                        "listed by this QEMU build".into()
+                    } else {
+                        "not listed by this QEMU build; use the reims-vgpu QEMU build".into()
+                    },
+                );
+                match install::qemu_img(profile) {
+                    Ok(img) => line(true, "qemu-img", img.display().to_string()),
+                    Err(e) => line(false, "qemu-img", format!("{e:#}")),
+                }
+                match install::qemu_rom(&q) {
+                    Some(rom) => line(true, "Reims ROM", rom.display().to_string()),
+                    None => line(
+                        false,
+                        "Reims ROM",
+                        "set REIMS_CTL_QEMU_ROM or place ReimsVgpu.rom in the QEMU data directory"
+                            .into(),
+                    ),
+                }
+            }
         }
         Err(e) => line(false, "qemu", format!("{e:#}")),
     }
@@ -1096,9 +1220,14 @@ fn doctor(host: Host) -> Result<i32> {
             ),
         ),
         None => line(
-            false,
+            host.os == crate::host::Os::Windows,
             "checkout",
-            "no install record: reims-ctl update needs scripts/install-ctl.sh to have run".into(),
+            if host.os == crate::host::Os::Windows {
+                "no install record: source builds can manage VMs; self-update is unavailable on Windows yet".into()
+            } else {
+                "no install record: reims-ctl update needs scripts/install-ctl.sh to have run"
+                    .into()
+            },
         ),
     }
     match host.os {
@@ -1186,6 +1315,7 @@ fn doctor(host: Host) -> Result<i32> {
                 },
             );
         }
+        crate::host::Os::Windows => {}
         crate::host::Os::Other => {}
     }
     if profile == Profile::Q35X86_64 {
@@ -1205,7 +1335,15 @@ fn doctor(host: Host) -> Result<i32> {
                     },
                 );
             }
-            Err(e) => line(false, "reims-util", format!("{e:#}")),
+            Err(e) => line(
+                host.os == crate::host::Os::Windows,
+                "reims-util",
+                if host.os == crate::host::Os::Windows {
+                    "not installed: managing supplied VM images works; automatic OpenCore creation and installer downloads need reims-util".into()
+                } else {
+                    format!("{e:#}")
+                },
+            ),
         }
     }
     Ok(if bad == 0 { 0 } else { 1 })

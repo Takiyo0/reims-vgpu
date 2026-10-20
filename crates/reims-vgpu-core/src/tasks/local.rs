@@ -339,6 +339,8 @@ pub struct LocalTask<P: Platform> {
     /// refusal), under the task's lock: what an unmap tests its range against. The placement
     /// list of a local task is always empty.
     object_list_range: Mutex<(u64, u32)>,
+    /// Transfer buffers kept by the physical pages they lie over (`memory::TransferCache`).
+    transfer_cache: Mutex<memory::TransferCache<P>>,
 }
 
 impl<P: Platform> LocalTask<P> {
@@ -532,6 +534,11 @@ impl<P: Platform> LocalTask<P> {
                 placement_list_length,
                 self.task_root,
             );
+            // DIAG(empty-entry): rare (a list per task, grown now and then).
+            log::debug!(
+                "task {}: SetObjectList offset {object_list_offset:#x} length {object_list_length:#x} stored {stored}",
+                self.task_id
+            );
             *self.object_list_range.lock() = if stored {
                 (object_list_offset, object_list_length)
             } else {
@@ -573,7 +580,7 @@ impl<P: Platform> LocalTask<P> {
 
     /// Executes command buffers with 24-byte resource records.
     pub fn exec_indirect2(
-        &self,
+        self: &Arc<Self>,
         hold: Hold<'_>,
         args: ExecArgs<'_, P, CmdExecIndirectResource>,
         done: Completion,
@@ -592,7 +599,7 @@ impl<P: Platform> LocalTask<P> {
 
     /// Executes command buffers with 8-byte resource records.
     pub fn exec_indirect3(
-        &self,
+        self: &Arc<Self>,
         hold: Hold<'_>,
         args: ExecArgs<'_, P, CmdExecIndirectResource3>,
         done: Completion,
@@ -735,6 +742,15 @@ impl<P: Platform> ResourceHost<P> for LocalTask<P> {
         length: u64,
     ) -> RaiseResult<P::Buffer> {
         self.on_platform(|| self.buffer_for_page(hold, page, length))
+    }
+
+    fn new_transfer_buffer_for_virtual_page(
+        &self,
+        hold: Hold<'_>,
+        page: u32,
+        length: u64,
+    ) -> RaiseResult<P::Buffer> {
+        self.on_platform(|| self.transfer_buffer_for_page(hold, page, length))
     }
 
     fn prepare_backing(

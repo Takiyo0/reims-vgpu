@@ -35,7 +35,7 @@
 //! unwinds to the task's trap (`tasks::isolation::life`).
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -76,7 +76,52 @@ fn insert(values: &mut Vec<Value>, v: Value) {
 
 thread_local! {
     /// A core thread's last-resort holder ([`release_last_resort`]).
-    static LAST_RESORT: RefCell<Option<Held>> = const { RefCell::new(None) };
+    static LAST_RESORT: LastResort = const {
+        LastResort { held: RefCell::new(None) }
+    };
+    /// Hot access avoids the destructor-registration guard; ownership remains in LAST_RESORT.
+    static LAST_RESORT_PTR: Cell<*const RefCell<Option<Held>>> = const {
+        Cell::new(std::ptr::null())
+    };
+}
+
+struct LastResort {
+    held: RefCell<Option<Held>>,
+}
+
+impl Drop for LastResort {
+    fn drop(&mut self) {
+        // Clear before the held values drop: a reentrant hold must use try_with, which refuses
+        // access while this TLS destructor runs, and consequently release immediately.
+        let _ = LAST_RESORT_PTR.try_with(|slot| slot.set(std::ptr::null()));
+    }
+}
+
+/// Access the same destructor-owned holder through a thread-local, non-owning fast pointer.
+#[allow(unsafe_code)] // the pointer names stable TLS storage, cleared before its destructor
+fn with_last_resort<R>(
+    f: impl FnOnce(&RefCell<Option<Held>>) -> R,
+) -> Result<R, std::thread::AccessError> {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| {
+        std::env::var("REIMS_VGPU_LAST_RESORT_TLS").map_or(true, |value| value != "0")
+    });
+    if fast {
+        let pointer = LAST_RESORT_PTR.with(Cell::get);
+        if !pointer.is_null() {
+            // SAFETY: only this thread publishes or reads this pointer. LAST_RESORT's address
+            // is stable after initialization, and its destructor clears the pointer before
+            // dropping held values or ending the owner's lifetime. RefCell retains all borrow
+            // checks, including for reentrant calls. The reference never escapes this callback.
+            return Ok(f(unsafe { &*pointer }));
+        }
+    }
+    LAST_RESORT.try_with(|owner| {
+        if fast {
+            LAST_RESORT_PTR.with(|slot| slot.set(std::ptr::from_ref(&owner.held)));
+        }
+        f(&owner.held)
+    })
 }
 
 /// The values held to one point: released, most recent first, when it drops. Thread-bound
@@ -227,7 +272,7 @@ pub(crate) fn keep_last_resort<T: Any + Send>(v: T) {
 /// [`keep_last_resort`] for a value already held elsewhere, placed where it was first held.
 fn to_last_resort(v: Value) {
     // During the thread's exit the holder is gone: the closure, and `v` with it, goes at once.
-    let unheld = LAST_RESORT.try_with(move |l| match &*l.borrow() {
+    let unheld = with_last_resort(move |l| match &*l.borrow() {
         Some(held) => {
             held.take(v);
             None
@@ -242,10 +287,10 @@ fn to_last_resort(v: Value) {
 /// Releases the thread's last-resort holder, most recent first, and, when `again`, makes the
 /// next one (the thread goes on idle; at its end, none).
 pub(in crate::rt) fn release_last_resort(again: bool) {
-    let last = LAST_RESORT.try_with(RefCell::take).ok().flatten();
+    let last = with_last_resort(RefCell::take).ok().flatten();
     drop(last);
     if again {
-        let _ = LAST_RESORT.try_with(|l| *l.borrow_mut() = Some(Held::new()));
+        let _ = with_last_resort(|l| *l.borrow_mut() = Some(Held::new()));
     }
 }
 
@@ -642,6 +687,55 @@ mod tests {
         release_last_resort(false);
         Hold::NONE.keep(Rel("after"));
         assert_eq!(events(), ["held", "release deep", "release after"]);
+    }
+
+    /// Draining and TLS teardown both make a reentrant fallback hold release immediately.
+    #[test]
+    fn last_resort_reentrant_release_at_drain_and_thread_exit() {
+        struct Released(Arc<std::sync::Mutex<Vec<&'static str>>>, &'static str);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push(self.1);
+            }
+        }
+        struct Reentrant(Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Drop for Reentrant {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("outer");
+                Hold::NONE.keep(Released(self.0.clone(), "inner"));
+                self.0.lock().unwrap().push("returned");
+            }
+        }
+        for explicit in [true, false] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let thread_events = events.clone();
+            #[allow(clippy::disallowed_methods)] // exercise real TLS teardown on a fresh thread
+            std::thread::spawn(move || {
+                release_last_resort(true);
+                Hold::NONE.keep(Reentrant(thread_events.clone()));
+                if explicit {
+                    release_last_resort(false);
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(*events.lock().unwrap(), ["outer", "inner", "returned"]);
+        }
+    }
+
+    /// Fast access on a fresh non-core thread initializes no holder and releases immediately.
+    #[test]
+    fn last_resort_without_holder_on_fresh_thread_releases_immediately() {
+        let released = Arc::new(AtomicU32::new(0));
+        let thread_released = released.clone();
+        #[allow(clippy::disallowed_methods)] // fresh thread with no installed fallback holder
+        std::thread::spawn(move || {
+            Hold::NONE.keep(Counted(thread_released.clone()));
+            assert_eq!(thread_released.load(Ordering::SeqCst), 1);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 
     /// Counts its releases.

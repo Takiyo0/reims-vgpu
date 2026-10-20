@@ -94,13 +94,22 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     a.extend(c.extra_args.iter().cloned());
 
     let mut env = Vec::new();
-    let mut unset = vec!["REIMS_VGPU_WINDOW".to_string()];
+    let mut unset = vec![
+        "REIMS_VGPU_WINDOW".to_string(),
+        "REIMS_VGPU_GUEST_DISPLAY_PORTS".to_string(),
+    ];
     if c.logs.enabled {
         env.push(("REIMS_VGPU_LOG".into(), c.logs.level.clone()));
     } else {
         unset.push("REIMS_VGPU_LOG".into());
     }
     let library = c.graphics == Graphics::ReimsVgpu;
+    if library && (c.display.count > 1 || c.display.hotplug_displays) {
+        env.push((
+            "REIMS_VGPU_GUEST_DISPLAY_PORTS".into(),
+            c.display.ports().to_string(),
+        ));
+    }
     if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
     }
@@ -161,6 +170,10 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     if !q.cpu_flags.trim().is_empty() {
         cpu.push(',');
         cpu.push_str(q.cpu_flags.trim());
+    }
+    let mut cpu = cpu;
+    if ctx.host.os != Os::Linux {
+        cpu = cpu.replace(",kvm=on", "");
     }
     push(&["-cpu", &cpu]);
     push(&[
@@ -240,12 +253,33 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ]);
     }
     push(&["-vga", "none"]);
+    if let Some(port) = c.display.pointer_agent_port {
+        push(&[
+            "-chardev",
+            &format!("socket,id=reimsptr,host=127.0.0.1,port={port},server=on,wait=off"),
+        ]);
+    }
     let gfx = match c.graphics {
-        Graphics::ReimsVgpu => format!(
-            "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={},resolution={}",
-            c.display.count,
-            c.display.qemu_resolution()?
-        ),
+        Graphics::ReimsVgpu => {
+            let ports = if c.display.hotplug_displays {
+                format!(",display-ports={}", c.display.ports())
+            } else {
+                String::new()
+            };
+            let pointer = if c.display.pointer_agent_port.is_some() {
+                ",pointer-chardev=reimsptr"
+            } else {
+                ""
+            };
+            let rom = crate::install::qemu_rom(&ctx.qemu)
+                .map(|p| format!(",romfile={}", optp(&p)))
+                .unwrap_or_default();
+            format!(
+                "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={}{ports},resolution={}{pointer}{rom}",
+                c.display.count,
+                c.display.qemu_resolution()?
+            )
+        }
         Graphics::VmwareSvga => "vmware-svga,id=gfx,bus=pcie.0,addr=0x4".into(),
     };
     push(&["-device", &gfx]);
@@ -346,11 +380,23 @@ fn audiodev(vm: &Vm, ctx: &Ctx) -> String {
 fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    if let Some(data) = crate::install::qemu_data_dir(&ctx.qemu) {
+        push(&["-L", &optp(&data)]);
+    }
     if !c.network.enabled {
         push(&["-nic", "none"]);
     }
     let qemu_window = c.graphics == Graphics::VmwareSvga && ctx.screen;
-    push(&["-display", if qemu_window { "gtk" } else { "none" }]);
+    let display = if qemu_window {
+        if ctx.host.os == Os::Windows {
+            "sdl"
+        } else {
+            "gtk"
+        }
+    } else {
+        "none"
+    };
+    push(&["-display", display]);
     if c.logs.enabled {
         push(&["-serial", &format!("file:{}", vm.serial_log().display())]);
         push(&["-msg", "timestamp=on"]);
@@ -358,10 +404,11 @@ fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         push(&["-serial", "none"]);
     }
     push(&["-monitor", "none"]);
-    push(&[
-        "-qmp",
-        &format!("unix:{},server=on,wait=off", optp(&vm.qmp_socket())),
-    ]);
+    #[cfg(unix)]
+    let qmp = format!("unix:{},server=on,wait=off", optp(&vm.qmp_socket()));
+    #[cfg(windows)]
+    let qmp = format!("{},server=on,wait=off", vm.qmp_socket().display());
+    push(&["-qmp", &qmp]);
     push(&["-pidfile", &vm.pidfile().to_string_lossy()]);
     Ok(())
 }
@@ -413,6 +460,45 @@ impl Invocation {
         s.push('\n');
         s
     }
+
+    /// A runnable script in the current host's shell.
+    pub fn platform_script(&self, comment: &str) -> String {
+        #[cfg(not(windows))]
+        {
+            self.shell_script(comment)
+        }
+        #[cfg(windows)]
+        {
+            let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+            let mut out = String::new();
+            for line in comment.lines() {
+                out.push_str("# ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            for key in &self.unset {
+                out.push_str(&format!(
+                    "[Environment]::SetEnvironmentVariable({}, $null, 'Process')\n",
+                    quote(key)
+                ));
+            }
+            for (key, value) in &self.env {
+                out.push_str(&format!(
+                    "[Environment]::SetEnvironmentVariable({}, {}, 'Process')\n",
+                    quote(key),
+                    quote(value)
+                ));
+            }
+            out.push_str("& ");
+            out.push_str(&quote(&self.program.to_string_lossy()));
+            for arg in &self.args {
+                out.push(' ');
+                out.push_str(&quote(arg));
+            }
+            out.push_str("\nexit $LASTEXITCODE\n");
+            out
+        }
+    }
 }
 
 pub fn quote(s: &str) -> String {
@@ -426,6 +512,7 @@ pub fn os_word(host: Host) -> &'static str {
     match host.os {
         Os::Mac => "macOS",
         Os::Linux => "Linux",
+        Os::Windows => "Windows",
         Os::Other => "this OS",
     }
 }
@@ -500,8 +587,11 @@ mod tests {
     }
 
     fn has(args: &[String], pair: &[&str]) -> bool {
-        args.windows(pair.len())
-            .any(|w| w.iter().zip(pair).all(|(a, b)| a == b))
+        args.windows(pair.len()).any(|w| {
+            w.iter()
+                .zip(pair)
+                .all(|(a, b)| a.replace('\\', "/") == b.replace('\\', "/"))
+        })
     }
 
     #[test]
@@ -541,15 +631,83 @@ mod tests {
             &["-device", "ich9-intel-hda,id=hda,addr=0x1b"],
             &["-device", "hda-output,bus=hda.0,audiodev=snd0"],
             &["-display", "none"],
-            &["-qmp", "unix:/vms/t/qmp.sock,server=on,wait=off"],
             &["-pidfile", "/vms/t/qemu.pid"],
         ] {
             assert!(has(a, pair), "missing {pair:?} in {a:?}");
         }
+        let qmp = a.iter().position(|arg| arg == "-qmp").unwrap();
+        if cfg!(windows) {
+            assert!(a[qmp + 1].starts_with("tcp:127.0.0.1:"));
+            assert!(a[qmp + 1].ends_with(",server=on,wait=off"));
+        } else {
+            assert!(has(a, &["-qmp", "unix:/vms/t/qmp.sock,server=on,wait=off"]));
+        }
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
         assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
+        assert!(
+            inv.unset
+                .contains(&"REIMS_VGPU_GUEST_DISPLAY_PORTS".to_string())
+        );
         assert!(inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    #[test]
+    fn multiple_displays_are_advertised_to_the_guest() {
+        let mut vm = q35_vm();
+        vm.config.display.count = 2;
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        assert!(has(
+            &inv.args,
+            &[
+                "-device",
+                "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays=2,resolution=1920x1080"
+            ]
+        ));
+        assert!(
+            inv.env
+                .contains(&("REIMS_VGPU_GUEST_DISPLAY_PORTS".into(), "2".into()))
+        );
+    }
+
+    #[test]
+    fn hotplug_reserves_and_advertises_eight_display_ports() {
+        let mut vm = q35_vm();
+        vm.config.display.hotplug_displays = true;
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        assert!(has(
+            &inv.args,
+            &[
+                "-device",
+                "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays=1,display-ports=8,resolution=1920x1080"
+            ]
+        ));
+        assert!(
+            inv.env
+                .contains(&("REIMS_VGPU_GUEST_DISPLAY_PORTS".into(), "8".into()))
+        );
+    }
+
+    #[test]
+    fn pointer_agent_is_wired_to_qemu_and_the_reims_device() {
+        let mut vm = q35_vm();
+        vm.config.display.count = 2;
+        vm.config.display.pointer_agent_port = Some(4455);
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        assert!(has(
+            &inv.args,
+            &[
+                "-chardev",
+                "socket,id=reimsptr,host=127.0.0.1,port=4455,server=on,wait=off"
+            ]
+        ));
+        assert!(has(
+            &inv.args,
+            &[
+                "-device",
+                "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays=2,resolution=1920x1080,pointer-chardev=reimsptr"
+            ]
+        ));
     }
 
     /// A guest that enters S3 keeps a dark display (the module doc), so q35 offers it none.

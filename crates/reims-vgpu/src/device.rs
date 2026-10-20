@@ -213,6 +213,9 @@ pub struct DeviceConfig {
     pub use_iosurface_mapper: bool,
     /// Run each isolated guest task with the task service's semantics (needs a memory map).
     pub process_isolation: bool,
+    /// Isolate nonzero tasks only while the IOSurface device has a mapped descriptor table.
+    /// Argument buffers follow the same condition. Default `false` preserves the static setting.
+    pub process_isolation_follows_guest: bool,
     /// Offer argument buffers: they reach the guest only with process isolation, on a Metal
     /// device that can detach backing and is not itself paravirtual. Default `true`.
     pub argument_buffers: bool,
@@ -230,6 +233,7 @@ impl Default for DeviceConfig {
             memory_map: None,
             use_iosurface_mapper: false,
             process_isolation: false,
+            process_isolation_follows_guest: false,
             argument_buffers: true,
             callbacks: HostCallbacks::default(),
         }
@@ -247,6 +251,7 @@ impl DeviceConfig {
             using_iosurface_mapper: self.use_iosurface_mapper,
             enable_argument_buffers: self.argument_buffers,
             enable_process_isolation: self.process_isolation,
+            process_isolation_follows_guest: self.process_isolation_follows_guest,
             device_feature_level: self.feature_level,
             display_port_connection_types: self.display_port_connection_types,
             ..CoreDeviceConfig::default()
@@ -306,7 +311,10 @@ impl<P: ApiPlatform> Device<P> {
                 .memory_map
                 .as_ref()
                 .map(|map| Arc::from(platform.guest_memory(map)));
-            let core = config.into_core::<P>(metal);
+            let core = {
+                platform.prewarm_guest_memory(metal.as_ref(), config.memory_map.as_ref());
+                config.into_core::<P>(metal)
+            };
             match CoreDevice::new(platform.clone(), core) {
                 Ok(handle) => Ok(Device {
                     handle: Ours::new(handle),

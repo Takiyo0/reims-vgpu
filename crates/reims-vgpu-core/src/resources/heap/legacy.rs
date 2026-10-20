@@ -184,6 +184,10 @@ impl<P: Platform> LegacyHeapResource<P> {
 }
 
 impl<P: Platform> ResourceClass<P> for LegacyHeapResource<P> {
+    fn devolatilize_now(&self, this: &Resource<P>) -> RaiseResult<()> {
+        LegacyHeapResource::devolatilize(self, this)
+    }
+
     fn initial_guest_valid(&self) -> bool {
         true
     }

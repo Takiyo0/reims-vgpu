@@ -15,7 +15,6 @@ use crate::vm::{ImageFormat, Vm};
 use crate::{paths, reims_util, runtime};
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// The Mac an OpenCore image presents: its config.plist's PlatformInfo > Generic, which
@@ -160,6 +159,26 @@ pub fn renew(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Result<String> {
 
 const SECTOR: u64 = 512;
 
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        offset += n as u64;
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
+
 /// The EFI system partition's type GUID, C12A7328-F81F-11D2-BA4B-00A0C93EC93B, as GPT stores
 /// it.
 const ESP_TYPE: [u8; 16] = [
@@ -211,7 +230,7 @@ impl Disk {
             "a read at {offset:#x}, past the image's end"
         );
         match self {
-            Disk::Raw { file, .. } => file.read_exact_at(buf, offset)?,
+            Disk::Raw { file, .. } => read_exact_at(file, buf, offset)?,
             Disk::Qcow2(q) => q.read(offset, buf)?,
         }
         Ok(())
@@ -233,7 +252,7 @@ struct Qcow2 {
 impl Qcow2 {
     fn open(file: File) -> Result<Qcow2> {
         let mut h = [0u8; 48];
-        file.read_exact_at(&mut h, 0)?;
+        read_exact_at(&file, &mut h, 0)?;
         ensure!(&h[..4] == b"QFI\xfb", "not a qcow2 image");
         ensure!(be64(&h, 8) == 0, "a qcow2 image with a backing file");
         let cluster_bits = be32(&h, 20);
@@ -242,7 +261,7 @@ impl Qcow2 {
             "qcow2 clusters of 2^{cluster_bits} bytes"
         );
         let mut l1 = vec![0u8; be32(&h, 36).min(1 << 20) as usize * 8];
-        file.read_exact_at(&mut l1, be64(&h, 40))?;
+        read_exact_at(&file, &mut l1, be64(&h, 40))?;
         Ok(Qcow2 {
             file,
             cluster_bits,
@@ -263,8 +282,11 @@ impl Qcow2 {
             return Ok(None);
         }
         let mut e = [0u8; 8];
-        self.file
-            .read_exact_at(&mut e, (l1 & QCOW2_OFFSET) + index % per_table * 8)?;
+        read_exact_at(
+            &self.file,
+            &mut e,
+            (l1 & QCOW2_OFFSET) + index % per_table * 8,
+        )?;
         let e = u64::from_be_bytes(e);
         ensure!(e & 1 << 62 == 0, "a qcow2 image with compressed clusters");
         // Bit 0: a zero cluster.
@@ -280,7 +302,7 @@ impl Qcow2 {
             let n = ((cluster - within) as usize).min(buf.len() - done);
             let part = &mut buf[done..done + n];
             match self.cluster(at >> self.cluster_bits)? {
-                Some(c) => self.file.read_exact_at(part, c + within)?,
+                Some(c) => read_exact_at(&self.file, part, c + within)?,
                 None => part.fill(0),
             }
             done += n;

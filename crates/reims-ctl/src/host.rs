@@ -18,6 +18,7 @@ use std::fmt;
 pub enum Os {
     Mac,
     Linux,
+    Windows,
     Other,
 }
 
@@ -40,6 +41,8 @@ impl Host {
             Os::Mac
         } else if cfg!(target_os = "linux") {
             Os::Linux
+        } else if cfg!(target_os = "windows") {
+            Os::Windows
         } else {
             Os::Other
         };
@@ -70,6 +73,9 @@ pub fn kvm_nested_vmx() -> bool {
 /// a Wayland compositor or an X server. Without one, QEMU's GTK window ends QEMU as it starts,
 /// where the library's runs headless.
 pub fn has_screen(env: &BTreeMap<String, String>) -> bool {
+    if cfg!(target_os = "windows") {
+        return true;
+    }
     ["WAYLAND_DISPLAY", "DISPLAY"]
         .iter()
         .any(|v| match env.get(*v) {
@@ -83,6 +89,7 @@ impl fmt::Display for Host {
         let os = match self.os {
             Os::Mac => "macOS",
             Os::Linux => "Linux",
+            Os::Windows => "Windows",
             Os::Other => std::env::consts::OS,
         };
         let arch = match self.arch {
@@ -106,7 +113,7 @@ impl Profile {
     pub fn supported_on(host: Host) -> &'static [Profile] {
         match (host.os, host.arch) {
             (Os::Mac, Arch::Aarch64) => &[Profile::VmappleArm64],
-            (Os::Linux, Arch::X86_64) => &[Profile::Q35X86_64],
+            (Os::Linux | Os::Windows, Arch::X86_64) => &[Profile::Q35X86_64],
             _ => &[],
         }
     }
@@ -121,7 +128,7 @@ impl Profile {
     pub fn describe(self) -> &'static str {
         match self {
             Profile::VmappleArm64 => "arm64 macOS guest (vmapple, HVF)",
-            Profile::Q35X86_64 => "x86-64 macOS guest (q35 and OpenCore, KVM)",
+            Profile::Q35X86_64 => "x86-64 macOS guest (q35 and OpenCore, KVM or WHPX)",
         }
     }
 
@@ -139,6 +146,7 @@ impl Profile {
             // vendor/qemu's 4a2e2b3967 boots vmapple guests with the in-kernel GIC.
             (Profile::VmappleArm64, _) => "hvf,kernel-irqchip=on",
             (Profile::Q35X86_64, Os::Mac) => "hvf",
+            (Profile::Q35X86_64, Os::Windows) => "whpx",
             (Profile::Q35X86_64, _) => "kvm",
         }
     }
@@ -195,7 +203,11 @@ mod tests {
         let env = |v: &str| {
             BTreeMap::from(["WAYLAND_DISPLAY", "DISPLAY"].map(|k| (k.to_string(), v.to_string())))
         };
-        assert!(has_screen(&env(":0")));
-        assert!(!has_screen(&env("")));
+        if cfg!(target_os = "windows") {
+            assert!(has_screen(&env("")));
+        } else {
+            assert!(has_screen(&env(":0")));
+            assert!(!has_screen(&env("")));
+        }
     }
 }

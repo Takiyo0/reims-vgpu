@@ -67,10 +67,19 @@ fn run_update(channel: Option<Channel>) -> Result<()> {
     println!("Updating reims-ctl and its QEMU…\n");
     update::update(channel)?;
     println!("\nUpdated. Starting the new reims-ctl…");
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
-    let err = std::process::Command::new(&exe).exec();
-    Err(err).with_context(|| format!("run {}", exe.display()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe()?;
+        let err = std::process::Command::new(&exe).exec();
+        Err(err).with_context(|| format!("run {}", exe.display()))
+    }
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe()?;
+        std::process::Command::new(&exe).spawn()?;
+        std::process::exit(0)
+    }
 }
 
 struct VmRow {
@@ -288,7 +297,10 @@ impl App {
             );
         } else if app.qemu.is_none() {
             app.say(
-                "QEMU is not installed: run scripts/install-ctl.sh in your reims-vgpu checkout",
+                &format!(
+                    "QEMU is not installed: run {} in your reims-vgpu checkout",
+                    paths::install_script()
+                ),
                 Level::Warn,
             );
         }
@@ -779,15 +791,24 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => scroll = max,
             KeyCode::Char('w') => {
                 if let TextKind::Command { vm, script } = &kind {
-                    let r = self
-                        .rows
-                        .iter()
-                        .find(|r| &r.name == vm)
-                        .map(|r| r.dir.join("launch.sh"));
+                    let r = self.rows.iter().find(|r| &r.name == vm).map(|r| {
+                        r.dir.join(if cfg!(windows) {
+                            "launch.ps1"
+                        } else {
+                            "launch.sh"
+                        })
+                    });
                     if let Some(p) = r {
-                        use std::os::unix::fs::PermissionsExt;
                         let res = std::fs::write(&p, script).and_then(|_| {
-                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                            }
+                            #[cfg(windows)]
+                            {
+                                Ok(())
+                            }
                         });
                         match res {
                             Ok(()) => self.say(&format!("wrote {}", paths::tilde(&p)), Level::Ok),
@@ -1089,7 +1110,10 @@ impl App {
     fn ask_update(&mut self) {
         let Some(i) = install::Install::load() else {
             self.say(
-                "no install record: run scripts/install-ctl.sh in your reims-vgpu checkout once",
+                &format!(
+                    "no install record: run {} in your reims-vgpu checkout once",
+                    paths::install_script()
+                ),
                 Level::Error,
             );
             return;
@@ -1195,11 +1219,12 @@ impl App {
         let Some(vm) = self.selected_vm() else { return };
         match runtime::invocation_for_print(&vm, self.host) {
             Ok(inv) => {
-                let script = inv.shell_script(&cli::script_comment(&vm));
+                let script = inv.platform_script(&cli::script_comment(&vm));
                 self.overlay = Some(Overlay::Text {
                     title: format!(
-                        "{}: the QEMU command  (w write launch.sh · y copy · Esc close)",
-                        vm.name()
+                        "{}: the QEMU command  (w write launch.{} · y copy · Esc close)",
+                        vm.name(),
+                        if cfg!(windows) { "ps1" } else { "sh" },
                     ),
                     lines: script.lines().map(String::from).collect(),
                     scroll: 0,
@@ -1414,6 +1439,23 @@ impl App {
             )
             .placeholder("optional"),
         ]);
+        if profile == Profile::Q35X86_64 {
+            fields.push(Field::toggle(
+                "hotplug_displays",
+                "Display hotplug",
+                false,
+                "Reserve eight Reims display ports so a running x86-64 VM can add or remove windows.",
+            ));
+            fields.push(
+                Field::text(
+                    "pointer_agent_port",
+                    "Pointer agent port",
+                    "",
+                    "Optional host port for ReimsPointer in the guest; requires networking and multiple or hotpluggable displays.",
+                )
+                .placeholder("none (guest agent required)"),
+            );
+        }
         let mut form = Form::new("New VM", "create", fields);
         display_help(&mut form);
         self.overlay = Some(Overlay::Form(FormKind::Create, form));
@@ -1478,6 +1520,30 @@ impl App {
             .placeholder("the host screen's")
             .show_if("graphics", library),
         ]);
+        if c.profile == Profile::Q35X86_64 {
+            fields.push(
+                Field::toggle(
+                    "hotplug_displays",
+                    "Display hotplug",
+                    c.display.hotplug_displays,
+                    "Reserve eight Reims display ports so a running VM can add or remove windows.",
+                )
+                .show_if("graphics", library),
+            );
+            fields.push(
+                Field::text(
+                    "pointer_agent_port",
+                    "Pointer agent port",
+                    &c.display
+                        .pointer_agent_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                    "Optional host port for ReimsPointer in the guest; requires networking and multiple or hotpluggable displays.",
+                )
+                .placeholder("none (guest agent required)")
+                .show_if("graphics", library),
+            );
+        }
         if c.profile.gpu_choice(self.host) {
             fields.push(self.gpu_field(&c.gpu).show_if("graphics", library));
         }
@@ -1699,6 +1765,17 @@ impl App {
             None => bail!("this host runs no VMs"),
         }
         s.display.count = f.text("displays").parse().context("displays: a number")?;
+        if f.is_shown("hotplug_displays") {
+            s.display.hotplug_displays = f.toggle("hotplug_displays");
+        }
+        if f.is_shown("pointer_agent_port") {
+            let p = f.text("pointer_agent_port");
+            s.display.pointer_agent_port = if p.is_empty() {
+                None
+            } else {
+                Some(p.parse().context("pointer agent port: a number")?)
+            };
+        }
         s.display.resolution = f.text("resolution");
         s.display.hidpi = f.toggle("hidpi");
         s.display.check()?;
@@ -2176,6 +2253,20 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     // Hidden on VMware SVGA, the displays' settings stay as they were.
     if f.is_shown("displays") {
         c.display.count = f.text("displays").parse().context("displays: a number")?;
+        if f.is_shown("hotplug_displays") {
+            c.display.hotplug_displays = f.toggle("hotplug_displays");
+        } else if c.graphics != Graphics::ReimsVgpu {
+            c.display.hotplug_displays = false;
+            c.display.pointer_agent_port = None;
+        }
+        if f.is_shown("pointer_agent_port") {
+            let p = f.text("pointer_agent_port");
+            c.display.pointer_agent_port = if p.is_empty() {
+                None
+            } else {
+                Some(p.parse().context("pointer agent port: a number")?)
+            };
+        }
         c.display.resolution = f.text("resolution");
         c.display.hidpi = f.toggle("hidpi");
         c.display.borderless = f.toggle("borderless");
@@ -2226,30 +2317,40 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
 /// the terminal's whole foreground process group, so reims-ctl ignores them until less exits,
 /// and less gets them as it would from a shell.
 fn run_less(files: &[PathBuf]) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new("less");
-    cmd.arg("++G").args(files);
-    // SAFETY: only signal, which is async-signal-safe, between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-            Ok(())
-        });
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("less");
+        cmd.arg("++G").args(files);
+        // SAFETY: only signal, which is async-signal-safe, between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        // SAFETY: dispositions set to ignore, then back to what they were.
+        let (int, quit) = unsafe {
+            (
+                libc::signal(libc::SIGINT, libc::SIG_IGN),
+                libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+            )
+        };
+        let status = cmd.status();
+        unsafe {
+            libc::signal(libc::SIGINT, int);
+            libc::signal(libc::SIGQUIT, quit);
+        }
+        status
     }
-    // SAFETY: dispositions set to ignore, then back to what they were.
-    let (int, quit) = unsafe {
-        (
-            libc::signal(libc::SIGINT, libc::SIG_IGN),
-            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
-        )
-    };
-    let status = cmd.status();
-    unsafe {
-        libc::signal(libc::SIGINT, int);
-        libc::signal(libc::SIGQUIT, quit);
+    #[cfg(windows)]
+    {
+        std::process::Command::new("less")
+            .arg("++G")
+            .args(files)
+            .status()
     }
-    status
 }
 
 /// Has the terminal report the mouse's buttons and wheel, or stop: X11's reports (mode 1000)
@@ -2326,7 +2427,7 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
               GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
               and on x86-64 its installer image and graphics: reims-vgpu, or QEMU's VMware
               SVGA, one display with no GPU acceleration, in QEMU's own window
-  c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
+  c           show the QEMU command it runs, to write as launch.ps1/launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
               mouse from here: for a host with no screen, over SSH too. Ctrl-] comes back

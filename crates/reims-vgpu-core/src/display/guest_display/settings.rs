@@ -304,10 +304,20 @@ impl<P: Platform> GuestDisplay<P> {
             p.w8(sp::SCALE_FACTOR, c.scale_factor());
             changed = true;
         }
+        // EXPERIMENT(display-nits): REIMS_VGPU_DISPLAY_NITS="min,max,maxsdr" overrides the
+        // descriptor's nits, to see whether the guest composites in 8-bit with an SDR display.
+        static NITS: std::sync::OnceLock<Option<(f32, f32, f32)>> = std::sync::OnceLock::new();
+        let nits = NITS.get_or_init(|| {
+            let v = std::env::var("REIMS_VGPU_DISPLAY_NITS").ok()?;
+            let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (n.len() == 3).then(|| (n[0], n[1], n[2]))
+        });
+        let (min_nits, max_nits, max_sdr_nits) =
+            nits.unwrap_or((d.min_nits, d.max_nits, d.max_sdr_nits));
         for (off, v) in [
-            (sp::MIN_NITS, d.min_nits),
-            (sp::MAX_NITS, d.max_nits),
-            (sp::MAX_SDR_NITS, d.max_sdr_nits),
+            (sp::MIN_NITS, min_nits),
+            (sp::MAX_NITS, max_nits),
+            (sp::MAX_SDR_NITS, max_sdr_nits),
         ] {
             if p.rf32(off) != v {
                 p.wf32(off, v);

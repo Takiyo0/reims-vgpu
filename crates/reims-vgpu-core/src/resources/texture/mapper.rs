@@ -317,7 +317,9 @@ mod tests {
             Arc::downgrade(&other)
         };
         let (t, sid) = surface_texture(&p);
-        let r = MapperRefTextureResource::new(gone, 9, t, 0, 0).unwrap().unwrap();
+        let r = MapperRefTextureResource::new(gone, 9, t, 0, 0)
+            .unwrap()
+            .unwrap();
         drop(r);
         assert_eq!(p.call_log().count("release_io_surface_with_mapping_id"), 0);
         // The texture is released; the surface lives on through the leaked retain.

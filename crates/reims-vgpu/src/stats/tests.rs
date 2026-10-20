@@ -98,17 +98,28 @@ fn a_line_with_a_window() {
     s.window_gpu_time(Duration::from_micros(400));
     s.window_gpu_time(Duration::from_micros(1_000));
     s.window_gpu_time(Duration::from_micros(700));
+    s.window_stage_time(WindowStage::Acquire, Duration::from_millis(1));
+    s.window_stage_time(WindowStage::Acquire, Duration::from_millis(2));
+    s.window_stage_time(WindowStage::Encode, Duration::from_micros(500));
+    s.window_stage_time(WindowStage::PresentCall, Duration::from_millis(4));
+    s.window_outcome(WindowOutcome::Presented);
+    s.window_outcome(WindowOutcome::Retry);
+    s.window_outcome(WindowOutcome::Retry);
     clock.at(500);
     assert_eq!(
         s.report(),
         "reims-vgpu stats: port 1: guest 6.0/s, max gap 458.0 ms; window 6.0/s, max gap 458.0 ms; \
-         window GPU 0.70 ms avg, 1.00 ms max"
+         window GPU 0.70 ms avg, 1.00 ms max; window CPU acquire 2 calls, 3.00 ms total, 2.00 ms max; \
+         window CPU encode 1 calls, 0.50 ms total, 0.50 ms max; window CPU present-call 1 calls, \
+         4.00 ms total, 4.00 ms max; window outcomes 1 presented, 2 retry, 0 ended, 0 nothing"
     );
     clock.at(1000);
     assert_eq!(
         s.report(),
         "reims-vgpu stats: port 1: guest 0.0/s, max gap 958.0 ms; window 0.0/s, max gap 958.0 ms; \
-         window GPU -"
+         window GPU -; window CPU acquire 0 calls, 0.00 ms total, 0.00 ms max; window CPU encode \
+         0 calls, 0.00 ms total, 0.00 ms max; window CPU present-call 0 calls, 0.00 ms total, \
+         0.00 ms max; window outcomes 0 presented, 0 retry, 0 ended, 0 nothing"
     );
 }
 

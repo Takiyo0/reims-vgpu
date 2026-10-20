@@ -229,7 +229,7 @@ The header has 35 functions and every type, callback typedef and constant, with 
 
 Everything a host can set that shapes what the guest is offered or what the library does, beside the guest's own input. Each stays configurable.
 
-- **The device config** (`RvgDeviceConfig`, the Rust API's `DeviceConfig`): `feature_level`, `display_port_connection_types` and `disable_argument_buffers` (above), with `metal_registry_id`, the memory map, `use_iosurface_mapper` and `process_isolation`. Zero is every field's default (section 1).
+- **The device config** (`RvgDeviceConfig`, the Rust API's `DeviceConfig`): `feature_level`, `display_port_connection_types` and `disable_argument_buffers` (above), with `metal_registry_id`, the memory map, `use_iosurface_mapper`, `process_isolation` and `process_isolation_follows_guest`. When the latter is true, nonzero guest tasks are isolated only while the IOSurface device has a mapped descriptor table, and argument buffers are offered under the same condition. Zero is every field's default (section 1).
 - **A mode's flags**: `RVG_DISPLAY_MODE_EDR` and `RVG_DISPLAY_MODE_10BPC` (the Rust API's `supports_edr`, `supports_10bpc`).
 - **Preferences**, in the Rust API only: `DisplayConfig::apply_preferences` takes the display's nits, and `DisplayMode::with_preferences` a mode's EDR and 10 bpc, from a `Preferences` reader the host gives. The library reads no preferences domain itself: `singleton::preferences()` answers every key absent.
 - **A display's window**: `RvgDisplayConfig.window` (above).
@@ -361,6 +361,7 @@ pub struct DeviceConfig {
     pub memory_map: Option<MemoryMap>,
     pub use_iosurface_mapper: bool,
     pub process_isolation: bool,
+    pub process_isolation_follows_guest: bool,
     pub argument_buffers: bool,               // Default: true
     pub callbacks: HostCallbacks,
 }

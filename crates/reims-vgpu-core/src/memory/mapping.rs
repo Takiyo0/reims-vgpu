@@ -40,7 +40,8 @@ pub enum Teardown<P: Platform> {
         /// The discontiguous buffer details.
         buffer: Arc<crate::memory::map::DiscontiguousBuffer>,
         /// Weak reference to the discontiguous buffers list for unregistration.
-        discontiguous: std::sync::Weak<crate::sync::Mutex<Vec<Arc<crate::memory::map::DiscontiguousBuffer>>>>,
+        discontiguous:
+            std::sync::Weak<crate::sync::Mutex<Vec<Arc<crate::memory::map::DiscontiguousBuffer>>>>,
     },
 }
 
@@ -124,10 +125,23 @@ impl<P: Platform> Drop for Mapping<P> {
                 buffer,
                 discontiguous,
             } => {
+                // DIAG(pool-a): the teardown's time, written for a buffer of 1 MiB or more.
+                let start = std::time::Instant::now();
                 if let Some(d) = discontiguous.upgrade() {
                     d.lock().retain(|b| !Arc::ptr_eq(b, buffer));
                 }
-                let _ = platform.vm().deallocate(self.virtual_address, self.length);
+                // The whole scratch range the fallback took, for a later fallback to reuse.
+                let _ = platform
+                    .vm()
+                    .free_scratch(self.virtual_address, buffer.alloc_length);
+                if self.length >= 0x10_0000 {
+                    log::debug!(
+                        target: "reims_vgpu_core::memory::map",
+                        "discontiguous teardown: {:.2} ms for {:#x} bytes",
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        self.length
+                    );
+                }
             }
             Teardown::RootTask { device } => {
                 // A gone device is skipped. A host `unmapMemory` that raises ends the process

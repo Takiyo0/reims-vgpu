@@ -170,6 +170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -221,6 +230,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metal2vulkan"
 version = "0.2.0"
+source = "git+https://github.com/Takiyo0/metal2vulkan?branch=master#5736c5f51318d3172a578cb77d527104dd5b4256"
 dependencies = [
  "ash",
  "metal2vulkan-air",
@@ -231,6 +241,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-air"
 version = "0.2.0"
+source = "git+https://github.com/Takiyo0/metal2vulkan?branch=master#5736c5f51318d3172a578cb77d527104dd5b4256"
 dependencies = [
  "sha2",
 ]
@@ -238,12 +249,22 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
+source = "git+https://github.com/Takiyo0/metal2vulkan?branch=master#5736c5f51318d3172a578cb77d527104dd5b4256"
 dependencies = [
  "ash",
  "libc",
  "metal2vulkan",
  "sha2",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -476,12 +497,12 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "mimalloc",
  "objc2",
  "objc2-foundation",
  "parking_lot",
  "reims-vgpu",
  "reims-vgpu-core",
- "tikv-jemallocator",
  "windows-sys 0.59.0",
 ]
 
@@ -694,26 +715,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tikv-jemalloc-sys"
-version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
-dependencies = [
- "cc",
- "libc",
-]
-
-[[package]]
-name = "tikv-jemallocator"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
-dependencies = [
- "libc",
- "tikv-jemalloc-sys",
 ]
 
 [[package]]

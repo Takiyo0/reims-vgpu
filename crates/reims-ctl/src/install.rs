@@ -48,13 +48,12 @@ pub fn qemu_binary(profile: Profile) -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("REIMS_CTL_QEMU") {
         return Ok(PathBuf::from(p));
     }
-    let bin = paths::qemu_root()
-        .join("current/bin")
-        .join(profile.qemu_binary());
+    let bin = qemu_install_path(profile);
     if !bin.exists() {
         bail!(
-            "QEMU is not installed ({} is missing): run scripts/install-ctl.sh in your reims-vgpu \
-             checkout, or set REIMS_CTL_QEMU to a qemu-system binary",
+            "QEMU is not installed ({} is missing): run scripts/install-ctl.sh (Unix) or \
+             scripts/install-ctl.ps1 (Windows) in your reims-vgpu checkout, or set \
+             REIMS_CTL_QEMU to a qemu-system binary",
             bin.display()
         );
     }
@@ -63,20 +62,26 @@ pub fn qemu_binary(profile: Profile) -> Result<PathBuf> {
 
 /// The QEMU binary for `profile`, or where it would be, for printing a command.
 pub fn qemu_binary_or_default(profile: Profile) -> PathBuf {
-    qemu_binary(profile).unwrap_or_else(|_| {
-        paths::qemu_root()
-            .join("current/bin")
-            .join(profile.qemu_binary())
-    })
+    qemu_binary(profile).unwrap_or_else(|_| qemu_install_path(profile))
+}
+
+fn qemu_install_path(profile: Profile) -> PathBuf {
+    let name = profile.qemu_binary();
+    #[cfg(windows)]
+    let name = format!("{name}.exe");
+    paths::qemu_root().join("current/bin").join(name)
 }
 
 /// `qemu-img`, beside the QEMU binary.
 pub fn qemu_img(profile: Profile) -> Result<PathBuf> {
     let bin = qemu_binary(profile)?;
+    #[cfg(windows)]
+    let img = bin.with_file_name("qemu-img.exe");
+    #[cfg(not(windows))]
     let img = bin.with_file_name("qemu-img");
     if !img.exists() {
         bail!(
-            "{} is missing: reinstall with scripts/install-ctl.sh",
+            "{} is missing: reinstall with scripts/install-ctl.sh (Unix) or scripts/install-ctl.ps1 (Windows)",
             img.display()
         );
     }
@@ -124,6 +129,8 @@ fn backends(qemu: &Path, option: &'static str) -> Vec<String> {
 pub fn default_audio_backend(available: &[String]) -> String {
     let wanted: &[&str] = if cfg!(target_os = "macos") {
         &["coreaudio"]
+    } else if cfg!(target_os = "windows") {
+        &["dsound", "wasapi", "sdl"]
     } else {
         &["pipewire", "pa", "alsa", "sdl"]
     };
@@ -136,6 +143,8 @@ pub fn default_audio_backend(available: &[String]) -> String {
         // QEMU could not be asked (not installed yet): its usual choice.
         return if cfg!(target_os = "macos") {
             "coreaudio"
+        } else if cfg!(target_os = "windows") {
+            "dsound"
         } else {
             "pipewire"
         }
@@ -156,6 +165,54 @@ pub fn qemu_version(qemu: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Whether this QEMU build exposes the Windows Hypervisor Platform accelerator.
+pub fn has_whpx(qemu: &Path) -> bool {
+    let Ok(output) = std::process::Command::new(qemu)
+        .args(["-accel", "help"])
+        .output()
+    else {
+        return false;
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.status.success() && text.lines().any(|line| line.trim() == "whpx")
+}
+
+/// Whether `qemu -device help` lists a device this controller needs.
+pub fn has_device(qemu: &Path, device: &str) -> bool {
+    let Ok(output) = std::process::Command::new(qemu)
+        .args(["-device", "help"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains(&format!("name \"{device}\""))
+}
+
+/// QEMU's firmware/data directory, either explicitly given or at the usual install-prefix path.
+pub fn qemu_data_dir(qemu: &Path) -> Option<PathBuf> {
+    std::env::var_os("REIMS_CTL_QEMU_DATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let bin = qemu.parent()?;
+            let prefix = bin.parent()?;
+            let data = prefix.join("share/qemu");
+            data.is_dir().then_some(data)
+        })
+}
+
+/// The Reims option ROM, if present at its explicit path or in QEMU's data directory.
+pub fn qemu_rom(qemu: &Path) -> Option<PathBuf> {
+    std::env::var_os("REIMS_CTL_QEMU_ROM")
+        .map(PathBuf::from)
+        .or_else(|| qemu_data_dir(qemu).map(|d| d.join("ReimsVgpu.rom")))
+        .filter(|p| p.is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,12 +225,14 @@ mod tests {
                 default_audio_backend(&v(&["none", "coreaudio"])),
                 "coreaudio"
             );
-        } else {
+        } else if cfg!(target_os = "linux") {
             assert_eq!(
                 default_audio_backend(&v(&["none", "alsa", "pa", "pipewire"])),
                 "pipewire"
             );
             assert_eq!(default_audio_backend(&v(&["none", "alsa"])), "alsa");
+        } else {
+            assert_eq!(default_audio_backend(&v(&["none", "wasapi"])), "wasapi");
         }
         assert_eq!(default_audio_backend(&v(&["none", "dbus"])), "none");
     }

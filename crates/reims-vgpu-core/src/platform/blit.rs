@@ -344,4 +344,19 @@ pub trait BlitEncoder<P: Platform>: Handle {
     /// Sends one [`BlitCmd`]. `on` says what a raise in a command reached both under a handler
     /// and with none (`EndEncoding`) does; the other commands are reached one way only.
     fn encode(&self, on: OnFault, cmd: BlitCmd<'_, P>) -> RaiseResult<()>;
+
+    /// Not a Metal call: copies host memory into `destination` on the GPU, each
+    /// `(host address, destination offset, length)` of `ranges`, in this encoder's order with its
+    /// other commands. `Ok(false)` where the platform has no such copy (the default) or cannot
+    /// reach a range's memory from the GPU, having encoded nothing: the caller then copies on the
+    /// CPU. A host whose guest pages are not contiguous in its memory (WHPX) gathers a texture's
+    /// pages with it rather than with a CPU copy into the transfer buffer.
+    fn gather_host_ranges(
+        &self,
+        destination: &P::Buffer,
+        ranges: &[(crate::host::HostPtr, u64, u64)],
+    ) -> RaiseResult<bool> {
+        let _ = (destination, ranges);
+        Ok(false)
+    }
 }

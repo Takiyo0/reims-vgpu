@@ -43,7 +43,10 @@ pub(crate) enum ToHost {
         buttons: u32,
     },
     /// Wheel notches, and the smooth distance in 1/256 point.
-    Wheel { notches: (i32, i32), smooth: (i32, i32) },
+    Wheel {
+        notches: (i32, i32),
+        smooth: (i32, i32),
+    },
     /// A key down or up.
     Key(KeyEvent),
 }

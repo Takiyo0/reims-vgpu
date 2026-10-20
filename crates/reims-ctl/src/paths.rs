@@ -15,6 +15,19 @@
 use std::path::{Path, PathBuf};
 
 pub fn home() -> PathBuf {
+    #[cfg(windows)]
+    {
+        return std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                Some(
+                    PathBuf::from(std::env::var_os("HOMEDRIVE")?)
+                        .join(std::env::var_os("HOMEPATH")?),
+                )
+            })
+            .unwrap_or_else(|| PathBuf::from("C:\\"));
+    }
+    #[cfg(not(windows))]
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -30,19 +43,41 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 pub fn config_dir() -> PathBuf {
     match std::env::var_os("REIMS_CTL_CONFIG_DIR") {
         Some(v) => PathBuf::from(v),
-        None => xdg("XDG_CONFIG_HOME", ".config").join("reims-ctl"),
+        None => {
+            #[cfg(windows)]
+            let base = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join("AppData/Roaming"));
+            #[cfg(not(windows))]
+            let base = xdg("XDG_CONFIG_HOME", ".config");
+            base.join("reims-ctl")
+        }
     }
 }
 
 pub fn data_dir() -> PathBuf {
     match std::env::var_os("REIMS_CTL_DATA_DIR") {
         Some(v) => PathBuf::from(v),
-        None => xdg("XDG_DATA_HOME", ".local/share").join("reims-ctl"),
+        None => {
+            #[cfg(windows)]
+            let base = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join("AppData/Local"));
+            #[cfg(not(windows))]
+            let base = xdg("XDG_DATA_HOME", ".local/share");
+            base.join("reims-ctl")
+        }
     }
 }
 
 pub fn cache_dir() -> PathBuf {
-    xdg("XDG_CACHE_HOME", ".cache").join("reims-ctl")
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData/Local"));
+    #[cfg(not(windows))]
+    let base = xdg("XDG_CACHE_HOME", ".cache");
+    base.join("reims-ctl/cache")
 }
 
 pub fn installers_dir() -> PathBuf {
@@ -65,19 +100,44 @@ pub fn install_file() -> PathBuf {
     config_dir().join("install.toml")
 }
 
-pub fn runtime_dir() -> PathBuf {
-    if let Some(v) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| Path::new(v).is_absolute()) {
-        return PathBuf::from(v).join("reims-ctl");
+pub fn install_script() -> &'static str {
+    if cfg!(windows) {
+        "scripts/install-ctl.ps1"
+    } else {
+        "scripts/install-ctl.sh"
     }
-    let tmp = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    // SAFETY: getuid has no preconditions.
-    tmp.join(format!("reims-ctl-{}", unsafe { libc::getuid() }))
+}
+
+pub fn runtime_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        return std::env::var_os("TEMP")
+            .or_else(|| std::env::var_os("TMP"))
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("reims-ctl");
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(v) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| Path::new(v).is_absolute())
+        {
+            return PathBuf::from(v).join("reims-ctl");
+        }
+        let tmp = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        // SAFETY: getuid has no preconditions.
+        tmp.join(format!("reims-ctl-{}", unsafe { libc::getuid() }))
+    }
 }
 
 /// Where a bug report's zip goes: `$XDG_DOWNLOAD_DIR`, else `~/Downloads`, else the home.
 pub fn downloads_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let d = home().join("Downloads");
+        return if d.is_dir() { d } else { home() };
+    }
     if let Some(v) = std::env::var_os("XDG_DOWNLOAD_DIR").filter(|v| Path::new(v).is_absolute()) {
         return PathBuf::from(v);
     }

@@ -268,7 +268,7 @@ pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     use std::io::Write as _;
     // One write, so the line never interleaves with another thread's.
     let _ = std::io::stderr().write_all(line.as_bytes());
-    // The trace's last lines, the events that led here (a diagnostic).
+    // Preserve the trace leading to this fatal path before the process aborts.
     crate::trace::flush_before_death();
     // Windows has no signal handler to mark this abort (`std::process::abort` ends through
     // `__fastfail`, which no in-process handler sees), so the one fatal path marks the death in

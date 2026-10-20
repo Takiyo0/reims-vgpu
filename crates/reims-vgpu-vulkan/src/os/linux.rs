@@ -30,10 +30,8 @@ pub use vm::LinuxVm;
 /// mapped `MAP_SHARED` on Linux.
 pub use std::os::fd::OwnedFd as BackingHandle;
 
-pub(crate) use import::{
-    TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view, shown_at,
-};
-pub(crate) use surface::{plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix};
+pub(crate) use import::{TWINS_READ_ONLY, allocate_zeros, import_view, shown_at};
+pub(crate) use surface::{plane_at, plane_shape, recorded_mut, ycbcr_matrix};
 #[cfg(test)]
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

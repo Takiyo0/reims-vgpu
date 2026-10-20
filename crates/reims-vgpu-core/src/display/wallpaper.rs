@@ -49,34 +49,33 @@ pub const AUTHENTIC_RECOVERY_SAMPLE_GRID_HEIGHT: usize = 20;
 
 /// Static authentic Sonoma recovery sample grid (32x20 = 640 bytes).
 pub const AUTHENTIC_RECOVERY_SAMPLE_GRID: [u8; 640] = [
-    15, 16, 16, 17, 17, 18, 19, 19, 19, 20, 21, 21, 22, 21, 22, 22, 22, 22, 21, 21, 21, 21, 21,
-    20, 19, 19, 18, 18, 17, 17, 16, 15, 16, 16, 17, 17, 19, 19, 20, 20, 20, 21, 21, 22, 22, 22,
-    22, 23, 22, 23, 23, 23, 22, 21, 21, 20, 20, 20, 19, 18, 17, 17, 16, 16, 16, 17, 18, 19, 19,
-    20, 20, 20, 22, 22, 23, 23, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 22, 22, 21, 20, 19, 19,
-    19, 18, 17, 16, 16, 17, 18, 19, 19, 20, 21, 22, 22, 23, 23, 24, 24, 25, 24, 25, 25, 25, 25,
-    25, 23, 23, 23, 22, 21, 21, 20, 20, 19, 18, 17, 16, 16, 17, 19, 19, 20, 20, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 21, 20, 20, 19, 19, 18, 16, 17,
-    18, 18, 20, 21, 22, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    30, 22, 22, 20, 20, 19, 18, 17, 18, 18, 19, 20, 21, 22, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 22, 21, 20, 20, 19, 19, 18, 18, 18, 19, 20, 21, 22,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 23, 21, 20, 20,
-    19, 19, 18, 17, 18, 19, 20, 20, 21, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 22, 22, 21, 20, 20, 19, 17, 17, 18, 19, 19, 20, 22, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 22, 21, 20, 19, 19, 18, 17, 17, 18,
-    19, 19, 20, 21, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    22, 21, 20, 19, 19, 18, 17, 17, 18, 18, 19, 20, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 21, 20, 20, 19, 18, 17, 17, 16, 17, 18, 18, 19, 20, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 21, 20, 19, 18, 18,
-    17, 16, 15, 17, 18, 18, 18, 19, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 20, 19, 18, 18, 17, 16, 15, 16, 16, 17, 17, 18, 18, 30, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 19, 18, 18, 18, 17, 16, 16, 15, 15, 16,
-    17, 17, 18, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 19,
-    18, 17, 16, 16, 16, 15, 15, 15, 16, 16, 16, 17, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
-    30, 30, 30, 30, 30, 30, 30, 30, 18, 17, 16, 15, 16, 15, 15, 15, 15, 15, 15, 15, 16, 16, 17,
-    18, 17, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 18, 18, 18, 18, 17, 16, 16, 16, 15, 15, 15,
-    15, 15, 15, 15, 15, 15, 15, 15, 16, 16, 17, 17, 18, 18, 18, 17, 18, 18, 17, 18, 18, 17, 17,
-    17, 16, 16, 16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 16, 15, 16, 16,
-    16, 16, 17, 17, 16, 17, 16, 16, 16, 16, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15, 16, 16, 17, 17, 18, 19, 19, 19, 20, 21, 21, 22, 21, 22, 22, 22, 22, 21, 21, 21, 21, 21, 20,
+    19, 19, 18, 18, 17, 17, 16, 15, 16, 16, 17, 17, 19, 19, 20, 20, 20, 21, 21, 22, 22, 22, 22, 23,
+    22, 23, 23, 23, 22, 21, 21, 20, 20, 20, 19, 18, 17, 17, 16, 16, 16, 17, 18, 19, 19, 20, 20, 20,
+    22, 22, 23, 23, 24, 24, 24, 24, 24, 24, 23, 23, 23, 23, 22, 22, 21, 20, 19, 19, 19, 18, 17, 16,
+    16, 17, 18, 19, 19, 20, 21, 22, 22, 23, 23, 24, 24, 25, 24, 25, 25, 25, 25, 25, 23, 23, 23, 22,
+    21, 21, 20, 20, 19, 18, 17, 16, 16, 17, 19, 19, 20, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 21, 20, 20, 19, 19, 18, 16, 17, 18, 18, 20, 21, 22, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 22, 22, 20, 20, 19, 18, 17,
+    18, 18, 19, 20, 21, 22, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 22, 21, 20, 20, 19, 19, 18, 18, 18, 19, 20, 21, 22, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 23, 21, 20, 20, 19, 19, 18, 17, 18, 19, 20, 20, 21, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 22, 22, 21, 20, 20, 19, 17,
+    17, 18, 19, 19, 20, 22, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 22, 21, 20, 19, 19, 18, 17, 17, 18, 19, 19, 20, 21, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 22, 21, 20, 19, 19, 18, 17, 17, 18, 18, 19, 20, 20, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 21, 20, 20, 19, 18, 17, 17,
+    16, 17, 18, 18, 19, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 21, 20, 19, 18, 18, 17, 16, 15, 17, 18, 18, 18, 19, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 20, 19, 18, 18, 17, 16, 15, 16, 16, 17, 17, 18, 18, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 19, 18, 18, 18, 17, 16, 16,
+    15, 15, 16, 17, 17, 18, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 19, 18, 17, 16, 16, 16, 15, 15, 15, 16, 16, 16, 17, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 18, 17, 16, 15, 16, 15, 15, 15, 15, 15, 15, 15, 16, 16, 17,
+    18, 17, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 18, 18, 18, 18, 17, 16, 16, 16, 15, 15, 15, 15,
+    15, 15, 15, 15, 15, 15, 15, 16, 16, 17, 17, 18, 18, 18, 17, 18, 18, 17, 18, 18, 17, 17, 17, 16,
+    16, 16, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 16, 15, 16, 16, 16, 16, 17,
+    17, 16, 17, 16, 16, 16, 16, 15, 15, 15, 15, 15, 15, 15, 15, 15,
 ];
 
 /// Computes the exact grayscale intensity `[15..=30]` at `(x, y)` for a canvas of `width` × `height`.
@@ -204,12 +203,7 @@ pub fn generate_recovery_wallpaper_rgb(width: u32, height: u32) -> Vec<u8> {
 }
 
 /// Fills an existing memory buffer with the authentic Sonoma recovery wallpaper in BGRA8 format.
-pub fn fill_recovery_wallpaper_bgra(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    stride_bytes: usize,
-) {
+pub fn fill_recovery_wallpaper_bgra(buf: &mut [u8], width: u32, height: u32, stride_bytes: usize) {
     let w_usize = usize::try_from(width).unwrap_or(0);
     let row_len = w_usize.saturating_mul(4);
     for y in 0..height {
@@ -232,12 +226,7 @@ pub fn fill_recovery_wallpaper_bgra(
 }
 
 /// Fills an existing memory buffer with the authentic Sonoma recovery wallpaper in RGBA8 format.
-pub fn fill_recovery_wallpaper_rgba(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    stride_bytes: usize,
-) {
+pub fn fill_recovery_wallpaper_rgba(buf: &mut [u8], width: u32, height: u32, stride_bytes: usize) {
     let w_usize = usize::try_from(width).unwrap_or(0);
     let row_len = w_usize.saturating_mul(4);
     for y in 0..height {
@@ -260,12 +249,7 @@ pub fn fill_recovery_wallpaper_rgba(
 }
 
 /// Fills an existing memory buffer with the authentic Sonoma recovery wallpaper in RGB24 format.
-pub fn fill_recovery_wallpaper_rgb(
-    buf: &mut [u8],
-    width: u32,
-    height: u32,
-    stride_bytes: usize,
-) {
+pub fn fill_recovery_wallpaper_rgb(buf: &mut [u8], width: u32, height: u32, stride_bytes: usize) {
     let w_usize = usize::try_from(width).unwrap_or(0);
     let row_len = w_usize.saturating_mul(3);
     for y in 0..height {
@@ -485,13 +469,8 @@ mod tests {
         let mut center_samples = Vec::new();
         let mut corner_samples = Vec::new();
         let mut all_channel_diffs = Vec::new();
-        let mut ring_lums: [Vec<f64>; 5] = [
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ];
+        let mut ring_lums: [Vec<f64>; 5] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
         let get_bgra = |x: u32, y: u32| -> (u8, u8, u8, u8) {
             let idx = ((y * width + x) * 4) as usize;
@@ -531,13 +510,10 @@ mod tests {
             y += step_y;
         }
 
-        let center_lum_mean =
-            center_samples.iter().sum::<f64>() / center_samples.len() as f64;
-        let corner_lum_mean =
-            corner_samples.iter().sum::<f64>() / corner_samples.len() as f64;
+        let center_lum_mean = center_samples.iter().sum::<f64>() / center_samples.len() as f64;
+        let corner_lum_mean = corner_samples.iter().sum::<f64>() / corner_samples.len() as f64;
         let delta_lum = center_lum_mean - corner_lum_mean;
-        let mean_ch_diff =
-            all_channel_diffs.iter().sum::<f64>() / all_channel_diffs.len() as f64;
+        let mean_ch_diff = all_channel_diffs.iter().sum::<f64>() / all_channel_diffs.len() as f64;
 
         let ring_averages: Vec<f64> = ring_lums
             .iter()
@@ -557,10 +533,7 @@ mod tests {
         );
 
         // 3. Radial delta >= 5.0 falloff from center to edge
-        assert!(
-            delta_lum >= 5.0,
-            "delta_lum {delta_lum} must be >= 5.0"
-        );
+        assert!(delta_lum >= 5.0, "delta_lum {delta_lum} must be >= 5.0");
 
         // 4. Color neutrality: neutral slate gray channels
         assert!(
@@ -599,7 +572,8 @@ mod tests {
 
                 if bx < width - 1 {
                     let (b2, g2, r2, _) = get_bgra(bx + 1, by);
-                    let lum2 = 0.299 * f64::from(r2) + 0.587 * f64::from(g2) + 0.114 * f64::from(b2);
+                    let lum2 =
+                        0.299 * f64::from(r2) + 0.587 * f64::from(g2) + 0.114 * f64::from(b2);
                     let adj = (lum - lum2).abs();
                     if adj > max_adj_diff {
                         max_adj_diff = adj;
@@ -620,6 +594,9 @@ mod tests {
             "br_mean {br_mean} not in [12.0, 22.0]"
         );
         assert!(br_std < 4.0, "br_std {br_std} must be < 4.0");
-        assert!(max_adj_diff <= 5.0, "max_adj_diff {max_adj_diff} must be <= 5.0");
+        assert!(
+            max_adj_diff <= 5.0,
+            "max_adj_diff {max_adj_diff} must be <= 5.0"
+        );
     }
 }

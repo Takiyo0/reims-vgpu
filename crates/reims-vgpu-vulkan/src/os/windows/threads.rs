@@ -112,6 +112,9 @@ mod tests {
                     .unwrap();
             }),
         );
-        assert_eq!(rx.recv_timeout(WAIT).unwrap().as_deref(), Some("reims-vgpu.ui"));
+        assert_eq!(
+            rx.recv_timeout(WAIT).unwrap().as_deref(),
+            Some("reims-vgpu.ui")
+        );
     }
 }

@@ -58,6 +58,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,8 +101,7 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
     if runtime::pid(vm).is_none() {
         bail!("{name} is not running: reims-ctl start {name}");
     }
-    // SAFETY: isatty only reads its descriptor's state.
-    if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("reims-ctl view draws in a terminal: run it in one");
     }
     let target = Target::for_vm(vm, opts.display)?;
@@ -240,18 +240,25 @@ struct FrameDir(PathBuf);
 
 impl FrameDir {
     fn new() -> Result<FrameDir> {
+        #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt;
+        #[cfg(unix)]
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .or_else(|| Some(PathBuf::from("/dev/shm")).filter(|p| p.is_dir()))
             .unwrap_or_else(std::env::temp_dir);
+        #[cfg(windows)]
+        let base = std::env::temp_dir();
         let dir = base.join(format!("reims-ctl-view-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        #[cfg(unix)]
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
+        #[cfg(windows)]
+        std::fs::create_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
         Ok(FrameDir(dir))
     }
 }
@@ -342,8 +349,11 @@ impl Drop for TermGuard {
         }
         let _ = out.flush();
         // Reports that came in before the terminal stopped sending them go unread.
+        #[cfg(unix)]
         // SAFETY: tcflush only discards stdin's queued input.
-        unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+        unsafe {
+            libc::tcflush(0, libc::TCIFLUSH)
+        };
         ratatui::restore();
     }
 }

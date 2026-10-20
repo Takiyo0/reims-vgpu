@@ -312,11 +312,7 @@ fn synthesise_abort_marker(
     Some(Record {
         kind: RecordKind::Death(signal),
         text: String::new(),
-        thread: ThreadTag {
-            tid,
-            name,
-            body,
-        },
+        thread: ThreadTag { tid, name, body },
     })
 }
 

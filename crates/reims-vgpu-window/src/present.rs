@@ -10,8 +10,9 @@
 //! ([`Presenter::draw`]): taking the image is the pacing, at the screen's own rate. Where no image
 //! came in time the render thread tries again after [`RETRY`]. A presenter that can draw no more
 //! ([`Drawn::Ended`]: its surface is lost) is let go, and the next draw asks the sink for a new
-//! one, up to [`RENEWALS`] times in a row without a frame presented; the window then stays as it
-//! is.
+//! one, up to [`RENEWALS`] times in a row without a frame presented; the render thread then waits
+//! [`PAUSE`] before it starts again, so a window never stays frozen for good (a driver that needs
+//! a while after a minimize, a surface that comes back).
 
 use std::time::Duration;
 
@@ -24,8 +25,12 @@ use crate::handle::PixelRect;
 pub(crate) const RETRY: Duration = Duration::from_millis(8);
 
 /// How many presenters in a row the render thread makes again after one ends, with no frame
-/// presented between: past that, the window stays as it is.
+/// presented between: past that, it waits [`PAUSE`] first.
 const RENEWALS: u32 = 3;
+
+/// How long the render thread waits before it makes presenters again, after [`RENEWALS`] ended in
+/// a row or the sink made none.
+const PAUSE: Duration = Duration::from_secs(2);
 
 /// What a draw did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,9 +74,11 @@ pub trait VulkanTarget {
 pub(crate) struct Presenting {
     /// The presenter, once made.
     presenter: Option<Box<dyn Presenter>>,
-    /// The window stays as it is: the sink made no presenter, or the presenters ended too many
+    /// No presenter is made before this: the sink made none, or the presenters ended too many
     /// times in a row.
-    ended: bool,
+    paused_until: Option<std::time::Instant>,
+    /// A pause was logged since the last frame presented: the next is not.
+    pause_logged: bool,
     /// The presenters made again since the last frame presented.
     renewals: Renewals,
 }
@@ -79,38 +86,66 @@ pub(crate) struct Presenting {
 impl Presenting {
     /// Whether the next draw needs a presenter made first ([`Presenting::make`]).
     pub(crate) fn needs_presenter(&self) -> bool {
-        !self.ended && self.presenter.is_none()
+        self.presenter.is_none() && !self.paused()
+    }
+
+    /// Whether presenters are not made yet ([`PAUSE`]).
+    fn paused(&self) -> bool {
+        self.paused_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// Makes no presenter for [`PAUSE`], logging `why` once a streak.
+    fn pause(&mut self, why: &str) {
+        if !self.pause_logged {
+            log::warn!(
+                target: "reims_vgpu_window",
+                "{why}: the window tries again every {} s",
+                PAUSE.as_secs()
+            );
+            self.pause_logged = true;
+        }
+        self.presenter = None;
+        self.renewals = Renewals::default();
+        self.paused_until = Some(std::time::Instant::now() + PAUSE);
     }
 
     /// Makes the presenter with `make`, the sink's: where it makes none, the window stays as it
     /// is.
     pub(crate) fn make(&mut self, make: impl FnOnce() -> Option<Box<dyn Presenter>>) {
         self.presenter = make();
-        self.ended |= self.presenter.is_none();
+        if self.presenter.is_none() {
+            self.pause("the window has no presenter");
+        }
     }
 
     /// Has the presenter draw the current frame into an image of `drawable` pixels over
-    /// `region`: whether to draw again after [`RETRY`] (no image came in time). Nothing without
-    /// a presenter.
+    /// `region`: whether to draw again after [`RETRY`] (no image came in time, or presenters are
+    /// paused). Without a presenter, a draw again only while paused.
     pub(crate) fn draw(&mut self, drawable: (u64, u64), region: PixelRect) -> bool {
-        if self.ended {
-            return false;
-        }
         let Some(presenter) = self.presenter.as_mut() else {
-            return false;
+            return self.paused();
         };
         let drawn = presenter.draw(drawable, region);
-        if drawn == Drawn::Ended {
-            self.presenter = None;
+        match drawn {
+            Drawn::Ended => self.presenter = None,
+            Drawn::Presented => {
+                if self.pause_logged {
+                    log::warn!(target: "reims_vgpu_window", "the window presents again");
+                }
+                self.pause_logged = false;
+                self.paused_until = None;
+            }
+            Drawn::Nothing | Drawn::Retry => {}
         }
         if !self.renewals.after(drawn) {
-            log::warn!(
-                target: "reims_vgpu_window",
-                "the window's presenter ended {RENEWALS} times in a row: the window stays as it is"
-            );
-            self.ended = true;
+            self.pause(&format!(
+                "the window's presenter ended {RENEWALS} times in a row"
+            ));
+            return true;
         }
-        drawn == Drawn::Retry
+        // An ended presenter is made again at the next try, not at the next guest frame.
+        drawn == Drawn::Retry || drawn == Drawn::Ended
     }
 }
 
@@ -172,12 +207,12 @@ mod tests {
         for _ in 0..RENEWALS {
             assert!(r.after(Drawn::Ended));
         }
-        assert!(!r.after(Drawn::Ended), "the window stays as it is");
+        assert!(!r.after(Drawn::Ended), "past the renewals: a pause");
     }
 
     /// The presenter is made at the first draw and kept; a draw with no image asks for a retry;
-    /// one that ends is made again at the next draw; a sink that makes none leaves the window as
-    /// it is, asked no more
+    /// one that ends is made again at the next try; a sink that makes none pauses presenters
+    /// for [`PAUSE`], with retries asked meanwhile
     #[test]
     fn presenting_makes_keeps_and_renews_the_presenter() {
         let mut p = Presenting::default();
@@ -186,25 +221,32 @@ mod tests {
         assert!(!p.needs_presenter());
         assert!(p.draw((4, 4), REGION), "no image: a retry");
         assert!(!p.draw((4, 4), REGION));
-        assert!(!p.draw((4, 4), REGION));
+        assert!(p.draw((4, 4), REGION), "ended: tried again");
         assert!(p.needs_presenter(), "an ended presenter is made again");
         p.make(|| None);
+        assert!(!p.needs_presenter(), "no presenter: paused");
+        assert!(p.draw((4, 4), REGION), "paused: tried again later");
+        p.paused_until = Some(std::time::Instant::now());
         assert!(
-            !p.needs_presenter(),
-            "no presenter: the window stays as it is"
+            p.needs_presenter(),
+            "after the pause, a presenter is made again"
         );
-        assert!(!p.draw((4, 4), REGION));
     }
 
-    /// Presenters that end too many times in a row leave the window as it is
+    /// Presenters that end too many times in a row pause the window, then it tries again
     #[test]
-    fn presenters_ending_in_a_row_leave_the_window_as_it_is() {
+    fn presenters_ending_in_a_row_pause_then_try_again() {
         let mut p = Presenting::default();
         for _ in 0..=RENEWALS {
             assert!(p.needs_presenter());
             p.make(|| scripted(&[Drawn::Ended]));
-            p.draw((4, 4), REGION);
+            assert!(p.draw((4, 4), REGION));
         }
-        assert!(!p.needs_presenter());
+        assert!(!p.needs_presenter(), "paused");
+        p.paused_until = Some(std::time::Instant::now());
+        assert!(p.needs_presenter(), "tried again after the pause");
+        p.make(|| scripted(&[Drawn::Presented]));
+        assert!(!p.draw((4, 4), REGION));
+        assert!(p.paused_until.is_none() && !p.pause_logged);
     }
 }

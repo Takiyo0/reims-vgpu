@@ -29,29 +29,29 @@ use reims_vgpu_core::sync::{Condvar, Mutex};
 use reims_vgpu_vulkan::os::OsThreads;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW, ENUM_CURRENT_SETTINGS,
-    HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
+    DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors,
+    EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
-    AdjustWindowRectExForDpi, GetDpiForMonitor, SetProcessDpiAwarenessContext,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
+    SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, MapVirtualKeyW, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
-    TRACKMOUSEEVENT, TME_LEAVE,
+    GetCapture, MapVirtualKeyW, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, HCURSOR,
-    ICONINFO, IDC_ARROW, LoadCursorW, PostThreadMessageW, RegisterClassExW, SetCursor, SetCursorPos,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_ACTIVATE, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateIconIndirect, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, HCURSOR, ICONINFO, IDC_ARROW, LoadCursorW, MSG,
+    PostThreadMessageW, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SetCursor, SetCursorPos, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_ACTIVATE, WM_APP,
+    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::geometry::{self, Insets, Layout};
@@ -396,7 +396,9 @@ pub(crate) fn open_window(window: &std::sync::Arc<Window>) {
             },
         );
     });
-    window.surface().set_target(super::render::Target { hwnd, hinstance });
+    window
+        .surface()
+        .set_target(super::render::Target { hwnd, hinstance });
     lay_out(id, hwnd);
     // SAFETY: `hwnd` is this thread's window.
     unsafe { ShowWindow(hwnd, SW_SHOW) };
@@ -633,7 +635,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_SIZE => {
             if id != 0 {
-                lay_out(id, hwnd);
+                // A minimized window (SIZE_MINIMIZED) has no pixels: it is not drawn, and its
+                // swapchain is kept as it is rather than made again at no size. Shown again, it
+                // lays out and draws.
+                let minimized = wparam == 1;
+                WINDOWS.with(|w| {
+                    if let Some(o) = w.borrow().get(&id) {
+                        o.window.surface().set_visible(!minimized);
+                    }
+                });
+                if !minimized {
+                    lay_out(id, hwnd);
+                }
             }
             0
         }
@@ -695,7 +708,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (hcur, visible, has_guest_cursor) = WINDOWS.with(|w| {
                     w.borrow()
                         .get(&id)
-                        .map(|o| (o.cursor, o.cursor_visible, o.window.guest().cursor.is_some()))
+                        .map(|o| {
+                            (
+                                o.cursor,
+                                o.cursor_visible,
+                                o.window.guest().cursor.is_some(),
+                            )
+                        })
                         .unwrap_or((None, true, false))
                 });
                 if has_guest_cursor && visible {
@@ -936,7 +955,10 @@ unsafe extern "system" fn monitor_proc(
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     // SAFETY: `monitor` is from the enumeration; `info` is a sized MONITORINFOEXW.
     let ok = unsafe {
-        GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO)
+        GetMonitorInfoW(
+            monitor,
+            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+        )
     };
     if ok == 0 {
         return 1;
@@ -954,9 +976,8 @@ unsafe extern "system" fn monitor_proc(
     let mut dm: DEVMODEW = unsafe { std::mem::zeroed() };
     dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
     // SAFETY: szDevice is a NUL-terminated device name; `dm` is a sized DEVMODEW out-slot.
-    let got = unsafe {
-        EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut dm)
-    };
+    let got =
+        unsafe { EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut dm) };
     let max_refresh_hz = if got != 0 && dm.dmDisplayFrequency > 1 {
         f64::from(dm.dmDisplayFrequency)
     } else {

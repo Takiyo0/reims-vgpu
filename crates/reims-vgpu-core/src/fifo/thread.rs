@@ -55,7 +55,11 @@ impl<P: Platform> Fifo<P> {
         // woken, sees the FIFO unquiesced and runs on. A child's new thread starts from the
         // node's read count while the FIFO's stays where the old thread left it. A root's new
         // thread reads on from the shared cursors.
-        log::info!("FIFO channel {}: thread spawning (is_root={})", self.stamp_index(), self.is_root_fifo());
+        log::info!(
+            "FIFO channel {}: thread spawning (is_root={})",
+            self.stamp_index(),
+            self.is_root_fifo()
+        );
         let me = Arc::clone(self);
         spawn_named(
             self.platform.threads(),
@@ -100,6 +104,7 @@ impl<P: Platform> Fifo<P> {
             self.quiesced.load(Ordering::SeqCst),
             DeathKind::DrainUnquiesced
         );
+        self.decode.drain();
         {
             let mut g = self.lock.lock();
             if self.running.load(Ordering::Relaxed) {
@@ -169,6 +174,7 @@ impl<P: Platform> Fifo<P> {
     /// The thread's body has no handler and no holder ([`Hold::NONE`]). The barrier wait has a
     /// handler of its own, and each command a holder of its own ([`Fifo::dispatch`]).
     fn run(self: &Arc<Self>) {
+        crate::fifo::decode_worker::raise_priority();
         let hold = Hold::NONE;
         // One read of the length serves the buffer and the bound (only a racing second thread
         // could make two reads differ). The buffer is zero-allocated, so the pages no command
@@ -214,30 +220,33 @@ impl<P: Platform> Fifo<P> {
             if !self.read_bytes(body) {
                 continue;
             }
-            if crate::trace::on() {
-                // cmd: FIFO, opcode, stamp value, barrier count, first barrier's slot and value
-                let first = |at: usize| {
-                    barriers
-                        .get(at..at.wrapping_add(4))
-                        .and_then(|b| <[u8; 4]>::try_from(b).ok())
-                        .map_or(0, |b| u64::from(u32::from_le_bytes(b)))
-                };
-                let (index, value) = if barrier_count == 0 {
-                    (0, 0)
-                } else {
-                    (first(0), first(4))
-                };
-                crate::trace::event(
-                    "cmd",
-                    &[
-                        u64::from(self.stamp_index()),
-                        u64::from(command.command_id),
-                        u64::from(command.stamp_value),
-                        u64::from(barrier_count),
-                        index,
-                        value,
-                    ],
+            // DIAG(empty-entry): a SetObjectList (51) or ExecIndirect2 (55) with its stamp, its
+            // barriers and the stamp slots 1 and 0 as they are now.
+            // Debug only: nothing is built or asked of the device unless it is written.
+            if (command.command_id == 51 || command.command_id == 55)
+                && log::log_enabled!(log::Level::Debug)
+            {
+                let list = barriers.get(..barrier_len).unwrap_or(&[]);
+                let waits: Vec<(u32, u32)> = list
+                    .chunks_exact(8)
+                    .map(|c| {
+                        (
+                            u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                            u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                        )
+                    })
+                    .collect();
+                let now = self
+                    .device
+                    .upgrade()
+                    .map(|d| (d.current_stamp(0), d.current_stamp(1)));
+                let msg = format!(
+                    "channel {} command {} stamp {:#x} barriers {waits:x?} slots(0,1) now {now:x?}",
+                    self.stamp_index(),
+                    command.command_id,
+                    command.stamp_value
                 );
+                log::debug!("{msg}");
             }
             let waited = (|| -> RaiseResult<_> {
                 if barrier_count == 0 {
@@ -293,6 +302,8 @@ impl<P: Platform> Fifo<P> {
             );
         }
         drop(payload);
+        // Every exec handed on finishes before the thread's end
+        self.decode.drain();
         // Outside the lock
         self.rewind();
         let _g = self.lock.lock();

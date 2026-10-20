@@ -29,7 +29,10 @@
 // limit of 128 (E0275), as the C crate's does.
 #![recursion_limit = "256"]
 
-#[cfg(all(any(target_os = "linux", target_os = "windows"), not(feature = "vulkan")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    not(feature = "vulkan")
+))]
 compile_error!(
     "on Linux and Windows the library is the Vulkan platform's: build it with the `vulkan` feature"
 );

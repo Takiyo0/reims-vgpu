@@ -855,8 +855,7 @@ mod encode_render_frame {
         assert_eq!(d.in_flight_frame_count.load(Ordering::SeqCst), 0);
     }
 
-    /// A complete IOSurface-backed macOS frame is drawn without blending over the generated
-    /// fallback backdrop; the background draw remains underneath only for pixels outside the viewport.
+    /// A complete IOSurface-backed macOS frame supplies its own background.
     #[test]
     fn guest_composite_frame_is_not_blended_over_host_backdrop() {
         let e = env();
@@ -875,14 +874,31 @@ mod encode_render_frame {
         let m = e.p.call_log().mark();
         d.encode_render_frame(&frame, &dst, &cb, vp_guest).unwrap();
         let calls = e.p.call_log().since(m);
-        assert!(calls.iter().any(|c| c.sel == "newTextureWithDescriptor:"));
-        assert!(calls.iter().any(|c| c.sel == "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"));
+        assert!(!calls.iter().any(
+            |c| c.sel == "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"
+        ));
         let draw_calls: Vec<_> = calls
             .iter()
             .filter(|c| c.sel == "drawPrimitives:vertexStart:vertexCount:")
             .collect();
-        assert_eq!(draw_calls.len(), 2);
+        assert_eq!(draw_calls.len(), 1);
+        assert!(d.display_mutex.lock().wallpaper_backdrop.is_none());
+        assert!(!d.display_mutex.lock().pipeline.blend);
+
+        // A cached firmware fallback must also be skipped after the guest takes over.
+        d.encode_render_frame(&texture(&e, 800, 600), &dst, &cb, vp_guest)
+            .unwrap();
         assert!(d.display_mutex.lock().wallpaper_backdrop.is_some());
+        let m = e.p.call_log().mark();
+        d.encode_render_frame(&frame, &dst, &cb, vp_guest).unwrap();
+        assert_eq!(
+            e.p.call_log()
+                .since(m)
+                .iter()
+                .filter(|c| c.sel == "drawPrimitives:vertexStart:vertexCount:")
+                .count(),
+            1
+        );
         assert!(!d.display_mutex.lock().pipeline.blend);
     }
 

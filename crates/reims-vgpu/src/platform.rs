@@ -57,6 +57,13 @@ pub trait ApiPlatform: Platform {
         let _ = map;
         Box::new(())
     }
+
+    /// Called as a device is made over `map`, after [`ApiPlatform::guest_memory`] and before the
+    /// guest runs, with the Metal device the config named (if any): the platform may import the
+    /// guest's RAM into its GPU once (roadmap #2). Nothing by default; it must never fail.
+    fn prewarm_guest_memory(&self, device: Option<&Self::Device>, map: Option<&MemoryMap>) {
+        let _ = (device, map);
+    }
 }
 
 /// The API's state for one platform instance.

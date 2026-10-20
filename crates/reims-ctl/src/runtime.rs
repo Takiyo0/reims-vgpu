@@ -16,7 +16,6 @@ use crate::vm::{Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,18 +29,48 @@ pub fn pid(vm: &Vm) -> Option<i32> {
     if pid <= 0 || !alive(pid) {
         return None;
     }
-    let pidfile = vm.pidfile();
-    let needle = pidfile.as_os_str().as_encoded_bytes();
-    let cmd = cmdline(pid)?;
-    cmd.windows(needle.len())
-        .any(|w| w == needle)
-        .then_some(pid)
+    #[cfg(windows)]
+    {
+        // A PID may be reused after QEMU exits. Confirm the local QMP listener is this VM.
+        let mut q = qmp::Qmp::connect(&vm.qmp_socket(), Duration::from_millis(250)).ok()?;
+        let name = q.execute("query-name", None).ok()?;
+        return (name.get("name").and_then(serde_json::Value::as_str) == Some(vm.name()))
+            .then_some(pid);
+    }
+    #[cfg(not(windows))]
+    {
+        let pidfile = vm.pidfile();
+        let needle = pidfile.as_os_str().as_encoded_bytes();
+        let cmd = cmdline(pid)?;
+        cmd.windows(needle.len())
+            .any(|w| w == needle)
+            .then_some(pid)
+    }
 }
 
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks the pid.
     let r = unsafe { libc::kill(pid, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: OpenProcess returns a handle that is closed below; PID comes from QEMU's pidfile.
+    let handle = unsafe { OpenProcess(SYNCHRONIZATION_SYNCHRONIZE, 0, pid as u32) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: handle is open and valid.
+    let running = unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT };
+    // SAFETY: handle was returned by OpenProcess.
+    unsafe { CloseHandle(handle) };
+    running
 }
 
 #[cfg(target_os = "linux")]
@@ -146,6 +175,15 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
             bail!(
                 "/dev/kvm cannot be opened ({e}): enable virtualization in the firmware, and add \
                  yourself to the kvm group (sudo usermod -aG kvm $USER, then log in again)"
+            );
+        }
+    }
+    if host.os == Os::Windows {
+        let qemu = crate::install::qemu_binary(c.profile)?;
+        if !crate::install::has_whpx(&qemu) {
+            bail!(
+                "{} does not list WHPX (`qemu-system-x86_64 -accel help`): use a QEMU build compiled with --enable-whpx",
+                qemu.display()
             );
         }
     }
@@ -278,7 +316,6 @@ fn may_run_on_radv(gpu: &crate::vm::Gpu) -> bool {
 /// carries on from the bytes already read while the file is the same (by inode) and has not
 /// shrunk.
 fn emptied_entry_lines(log: &Path) -> usize {
-    use std::os::unix::fs::MetadataExt;
     const EMPTIED: &[u8] = b"has an empty entry";
     static READ: std::sync::Mutex<(std::path::PathBuf, u64, u64, usize)> =
         std::sync::Mutex::new((std::path::PathBuf::new(), 0, 0, 0));
@@ -287,8 +324,9 @@ fn emptied_entry_lines(log: &Path) -> usize {
     };
     let Ok(meta) = f.metadata() else { return 0 };
     let mut r = READ.lock().unwrap_or_else(|e| e.into_inner());
-    if r.0 != log || r.1 != meta.ino() || r.2 > meta.len() {
-        *r = (log.to_path_buf(), meta.ino(), 0, 0);
+    let id = metadata_id(&f, &meta);
+    if r.0 != log || r.1 != id || r.2 > meta.len() {
+        *r = (log.to_path_buf(), id, 0, 0);
     }
     let mut buf = Vec::new();
     if f.seek(SeekFrom::Start(r.2)).is_ok() {
@@ -305,6 +343,29 @@ fn emptied_entry_lines(log: &Path) -> usize {
     }
     r.2 += end as u64;
     r.3
+}
+
+#[cfg(unix)]
+fn metadata_id(_file: &std::fs::File, meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(windows)]
+fn metadata_id(file: &std::fs::File, _meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a valid handle and `info` points to writable storage of the right type.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return 0;
+    }
+    // SAFETY: the successful call initialized `info`.
+    let info = unsafe { info.assume_init() };
+    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)
 }
 
 /// Keeps the last five of a log: `x.log` becomes `x.1.log`, and so on.
@@ -356,11 +417,9 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
     let screen = crate::host::has_screen(&vm.config.extra_env);
     if vm.config.graphics == Graphics::VmwareSvga && screen {
         let displays = crate::install::display_backends(&qemu);
-        if !displays.is_empty() && !displays.iter().any(|d| d == "gtk") {
-            bail!(
-                "this QEMU has no window of its own, which VMware SVGA shows the display in: \
-                 reims-ctl update builds one with GTK"
-            );
+        let wanted = if host.os == Os::Windows { "sdl" } else { "gtk" };
+        if !displays.is_empty() && !displays.iter().any(|d| d == wanted) {
+            bail!("this QEMU has no {wanted} window, which VMware SVGA shows the display in");
         }
     }
     Ok(Ctx {
@@ -388,15 +447,21 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
 }
 
 pub fn now_stamp(fmt: &str) -> String {
-    // SAFETY: time and localtime_r fill the structs given; strftime writes at most buf's size.
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        let mut buf = [0u8; 64];
-        let f = std::ffi::CString::new(fmt).unwrap();
-        let n = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), f.as_ptr(), &tm);
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let date = now.date();
+    let clock = now.time();
+    let offset = now.offset().whole_seconds();
+    let sign = if offset < 0 { '-' } else { '+' };
+    let offset = offset.unsigned_abs();
+    let zone = format!("{sign}{:02}{:02}", offset / 3600, (offset % 3600) / 60);
+    let (year, month, day) = (date.year(), u8::from(date.month()), date.day());
+    let (hour, minute, second) = (clock.hour(), clock.minute(), clock.second());
+    match fmt {
+        "%Y%m%d-%H%M%S" => format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}"),
+        "%Y-%m-%d %H:%M:%S %z" => {
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {zone}")
+        }
+        _ => format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {zone}"),
     }
 }
 
@@ -419,9 +484,11 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         rotate(&vm.serial_log());
     }
     let sock = vm.qmp_socket();
+    #[cfg(unix)]
     if let Some(d) = sock.parent() {
         std::fs::create_dir_all(d)?;
     }
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(vm.pidfile());
 
@@ -436,7 +503,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         vm.name(),
         now_stamp("%Y-%m-%d %H:%M:%S %z")
     )?;
-    log.write_all(inv.shell_script("the command").as_bytes())?;
+    log.write_all(inv.platform_script("the command").as_bytes())?;
     writeln!(log, "----")?;
     let err = log.try_clone()?;
 
@@ -445,8 +512,10 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err);
+    #[cfg(unix)]
     // SAFETY: only async-signal-safe calls between fork and exec: setsid, fork, _exit.
     unsafe {
+        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -458,10 +527,19 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
             }
         });
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("run {}", inv.program.display()))?;
+    #[cfg(unix)]
     let _ = child.wait();
+    #[cfg(windows)]
+    drop(child);
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = false;
@@ -544,14 +622,34 @@ fn power_off(vm: &Vm, p: i32, progress: &mut impl FnMut(&str)) -> Result<()> {
         progress("powered off");
         return Ok(());
     }
+    #[cfg(unix)]
     // SAFETY: p is our QEMU's pid, checked by pid().
-    unsafe { libc::kill(p, libc::SIGTERM) };
+    unsafe {
+        libc::kill(p, libc::SIGTERM)
+    };
     if wait_gone(p, Duration::from_secs(5)) {
         progress("powered off (SIGTERM)");
         return Ok(());
     }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        // SAFETY: the PID was read from the VM's pidfile and QMP identified its name.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, p as u32) };
+        if !handle.is_null() {
+            // SAFETY: handle is an opened process handle.
+            unsafe { TerminateProcess(handle, 1) };
+            // SAFETY: handle was returned by OpenProcess.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        }
+    }
+    #[cfg(unix)]
     // SAFETY: as above.
-    unsafe { libc::kill(p, libc::SIGKILL) };
+    unsafe {
+        libc::kill(p, libc::SIGKILL)
+    };
     if wait_gone(p, Duration::from_secs(5)) {
         progress("killed (SIGKILL)");
         return Ok(());

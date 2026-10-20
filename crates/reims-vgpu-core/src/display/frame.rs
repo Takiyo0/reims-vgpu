@@ -73,15 +73,25 @@ impl<P: Platform> DisplayCore<P> {
         color_matrix: Option<&dyn ColorMatrix>,
         completion: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
+        // DIAG(present-wait): the display lock and the in-flight wait, written at debug where they
+        // take 1 ms or more.
+        let timed = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+        let waited = std::time::Instant::now();
         let mut g = self.display_mutex.lock();
-        // present: frames in flight, waited for next
-        crate::trace::event(
-            "present",
-            &[u64::from(self.in_flight_frame_count.load(Ordering::SeqCst))],
-        );
+        let locked = timed.map(|t| t.elapsed());
+        let in_flight = self.in_flight_frame_count.load(Ordering::SeqCst);
         self.wait_for_pending_frames(&mut g);
-        // presented: frames in flight were waited for
-        crate::trace::event("presented", &[]);
+        crate::perfstats::PRESENT_WAIT.add(waited.elapsed());
+        if let (Some(t), Some(locked)) = (timed, locked) {
+            let all = t.elapsed();
+            if all.as_secs_f64() >= 0.001 {
+                log::debug!(
+                    "present wait: {:.2} ms ({:.2} ms for the display lock, {in_flight} frame(s) in flight at the lock)",
+                    all.as_secs_f64() * 1000.0,
+                    locked.as_secs_f64() * 1000.0
+                );
+            }
+        }
         if self.guest_color_space_dirty() {
             // The guest display's colour space (nil without a guest display). The guest display
             // pointer is read without its lock held across the call; the cell is a leaf.
@@ -106,6 +116,12 @@ impl<P: Platform> DisplayCore<P> {
             || protection_requirements != g.protection_requirements
             || self.guest_color_space_dirty()
         {
+            // Rare (a mode change): the guest's presented size and IOSurface format, e.g. 'RGhA'
+            // (half float) or 'BGRA'.
+            log::debug!(
+                "present mode: {width}x{height} iosurface format {:?} ({iosurface_pixel_format:#x})",
+                String::from_utf8_lossy(&iosurface_pixel_format.to_be_bytes())
+            );
             self.set_guest_color_space_dirty(false);
             self.mode_change_locked(
                 &mut g,

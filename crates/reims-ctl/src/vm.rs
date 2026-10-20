@@ -130,6 +130,12 @@ impl Graphics {
 pub struct Display {
     /// The guest's display ports, 1 to 8, each with a window of its own.
     pub count: u32,
+    /// Reserve all eight PCI display ports so a running x86 VM can add and remove displays.
+    #[serde(default)]
+    pub hotplug_displays: bool,
+    /// Host TCP port for the optional per-window pointer agent used by multi-display guests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_agent_port: Option<u16>,
     /// The mode the guest runs first, `<width>x<height>`, or `host` for the host screen's own
     /// modes at its density.
     pub resolution: String,
@@ -147,6 +153,8 @@ impl Default for Display {
     fn default() -> Display {
         Display {
             count: 1,
+            hotplug_displays: false,
+            pointer_agent_port: None,
             resolution: "1920x1080".into(),
             hidpi: false,
             borderless: false,
@@ -156,6 +164,11 @@ impl Default for Display {
 }
 
 impl Display {
+    /// The guest/QEMU display-port capacity. Hotplug is currently supported by the PCI device.
+    pub fn ports(&self) -> u32 {
+        if self.hotplug_displays { 8 } else { self.count }
+    }
+
     /// The `resolution` property apple-gfx takes, checked as QEMU checks it.
     pub fn qemu_resolution(&self) -> Result<String> {
         let r = self.resolution.trim();
@@ -393,6 +406,25 @@ impl VmConfig {
                 self.name
             );
         }
+        if self.display.hotplug_displays
+            && (self.profile != Profile::Q35X86_64 || self.graphics != Graphics::ReimsVgpu)
+        {
+            bail!("hotplug displays requires an x86-64 VM using reims-vgpu");
+        }
+        if let Some(port) = self.display.pointer_agent_port {
+            if port == 0 {
+                bail!("pointer agent port must be 1 to 65535");
+            }
+            if self.profile != Profile::Q35X86_64
+                || self.graphics != Graphics::ReimsVgpu
+                || !self.network.enabled
+                || (self.display.count < 2 && !self.display.hotplug_displays)
+            {
+                bail!(
+                    "the pointer agent requires an x86-64 Reims VM, networking, and multiple or hotpluggable displays"
+                );
+            }
+        }
         match self.profile {
             Profile::Q35X86_64 if self.q35.is_none() => bail!("{}: no [q35] settings", self.name),
             Profile::VmappleArm64 if self.vmapple.is_none() => {
@@ -567,11 +599,21 @@ impl Vm {
     /// The QMP socket: in the VM's directory where the path fits a Unix socket's 104 bytes
     /// (macOS's limit; Linux's is 108), else in the runtime directory.
     pub fn qmp_socket(&self) -> PathBuf {
-        let own = self.dir.join("qmp.sock");
-        if own.as_os_str().len() < 100 {
-            own
-        } else {
-            paths::runtime_dir().join(format!("{}.qmp", self.config.name))
+        #[cfg(windows)]
+        {
+            // QEMU on Windows does not provide Unix-domain sockets. Keep a stable per-VM TCP
+            // endpoint on loopback so stopped/running state survives reims-ctl restarts.
+            let port = 20_000 + crc32fast::hash(self.config.name.as_bytes()) % 40_000;
+            return PathBuf::from(format!("tcp:127.0.0.1:{port}"));
+        }
+        #[cfg(not(windows))]
+        {
+            let own = self.dir.join("qmp.sock");
+            if own.as_os_str().len() < 100 {
+                own
+            } else {
+                paths::runtime_dir().join(format!("{}.qmp", self.config.name))
+            }
         }
     }
 
@@ -758,6 +800,14 @@ mod tests {
         let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        let old_text = text.replace("hotplug_displays = false\n", "");
+        assert!(!old_text.contains("hotplug_displays"));
+        assert!(
+            !toml::from_str::<VmConfig>(&old_text)
+                .unwrap()
+                .display
+                .hotplug_displays
+        );
         // A VM on reims-vgpu saves as it did before the choice existed.
         assert!(!text.contains("graphics"), "{text}");
         c.graphics = Graphics::VmwareSvga;
@@ -784,6 +834,22 @@ mod tests {
         assert!(c.check().is_ok());
         assert_eq!(c.display_count(), 2);
         assert!(Graphics::parse("vga").is_err());
+    }
+
+    #[test]
+    fn hotplug_and_pointer_agent_require_supported_x86_reims_setup() {
+        let mut c = x86_64_config();
+        c.display.hotplug_displays = true;
+        assert!(c.check().is_ok());
+        assert_eq!(c.display.ports(), 8);
+
+        c.display.pointer_agent_port = Some(4455);
+        assert!(c.check().is_ok());
+        c.network.enabled = false;
+        assert!(c.check().is_err());
+        c.network.enabled = true;
+        c.graphics = Graphics::VmwareSvga;
+        assert!(c.check().is_err());
     }
 
     #[test]

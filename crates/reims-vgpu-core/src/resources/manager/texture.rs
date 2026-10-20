@@ -1322,18 +1322,18 @@ pub(crate) fn create_mapper_ref_texture<P: Platform, E: CreateEnv<P>>(
             header.command_type
         )));
     };
-    let (texture, _) = match new_iosurface_texture(env, command, Some(&surface), &mut cursor, placement)
-    {
-        Ok(Ok((texture, plane))) => (texture, plane),
-        Ok(Err(e)) => {
-            host.release_io_surface_with_mapping_id(mapping_id, Some(surface));
-            return Ok(Err(e));
-        }
-        Err(raised) => {
-            keep_forever(surface, Kept::SurfaceUseCount);
-            return Err(raised);
-        }
-    };
+    let (texture, _) =
+        match new_iosurface_texture(env, command, Some(&surface), &mut cursor, placement) {
+            Ok(Ok((texture, plane))) => (texture, plane),
+            Ok(Err(e)) => {
+                host.release_io_surface_with_mapping_id(mapping_id, Some(surface));
+                return Ok(Err(e));
+            }
+            Err(raised) => {
+                keep_forever(surface, Kept::SurfaceUseCount);
+                return Err(raised);
+            }
+        };
     use crate::platform::os::surface::Surface as _;
     let surface_base = surface.base_address().addr().to_u64();
     let surface_size = surface.alloc_size();

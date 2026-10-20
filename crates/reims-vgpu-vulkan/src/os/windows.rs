@@ -22,6 +22,7 @@ use std::ffi::CStr;
 
 use ash::vk;
 use metal2vulkan_runtime as rt;
+use reims_vgpu_core::platform::Handle as _;
 
 pub use clock::WindowsClock;
 pub use files::{GuestMemoryLease, lease_guest_memory};
@@ -72,6 +73,27 @@ pub(crate) unsafe fn map_view_of_file3(
 
 pub(crate) use import::{TWINS_READ_ONLY, allocate_zeros, import_view, shown_at};
 pub(crate) use surface::{plane_at, plane_shape, recorded_mut, ycbcr_matrix};
+
+/// The runtime's host memory at `at`, a range of guest RAM or a Windows mapping ([`ImportView`]):
+/// imported directly through `VK_EXT_external_memory_host`.
+///
+/// # Safety
+///
+/// `rt::HostMemory::new`'s contract, for the memory at `at`.
+pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>) -> rt::HostMemory {
+    // SAFETY: the caller's.
+    unsafe { rt::HostMemory::new(at) }
+}
+
+/// Why an import could not make a dma-buf source: Windows imports host pointers directly.
+pub(crate) fn dma_buf_refusal() -> Option<String> {
+    None
+}
+
+/// Keeps a surface's own section or guest-memory view mapped for an import at its base address.
+pub(crate) fn surface_memory_hold(surface: &WindowsSurface) -> impl Send + 'static {
+    surface.clone_ref()
+}
 #[cfg(test)]
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

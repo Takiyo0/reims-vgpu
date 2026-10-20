@@ -311,7 +311,10 @@ fn map_view(at: u64, length: u64, backing: &Backing, prot: Prot) -> Result<(), K
 /// table, so no view can be made *of* it as a source.
 fn map_zeros(at: u64, length: u64) -> Result<(), KernReturn> {
     let section = Arc::new(Section::new(length).ok_or(NO_SPACE)?);
-    let backing = Backing::Section { fd: section, offset: 0 };
+    let backing = Backing::Section {
+        fd: section,
+        offset: 0,
+    };
     map_view(at, length, &backing, Prot::READ_WRITE)
 }
 /// section view is unmapped preserving its placeholder, a private committed region is freed
@@ -444,7 +447,10 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     }
     let section = Arc::new(Section::new(length).ok_or(NO_SPACE)?);
     let at = reserve_placeholder(None, length)?;
-    let backing = Backing::Section { fd: section, offset: 0 };
+    let backing = Backing::Section {
+        fd: section,
+        offset: 0,
+    };
     map_view(at, length, &backing, Prot::READ_WRITE)?;
     files::record(at, length, backing, Prot::READ_WRITE);
     Ok(HostAddr::from_addr(at.to_usize()))
@@ -470,7 +476,10 @@ impl OwnMemory {
         }
         let section = Arc::new(Section::new(length)?);
         let first = reserve_placeholder(None, length).ok()?;
-        let backing = Backing::Section { fd: section, offset: 0 };
+        let backing = Backing::Section {
+            fd: section,
+            offset: 0,
+        };
         map_view(first, length, &backing, Prot::READ_WRITE).ok()?;
         Some(OwnMemory {
             first,
@@ -591,7 +600,7 @@ impl WindowsVm {
 /// `VirtualQuery`.
 fn query_readable(first: u64, length: u64) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEMORY_BASIC_INFORMATION, MEM_COMMIT as STATE_COMMIT, VirtualQuery,
+        MEM_COMMIT as STATE_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     let end = first + length;
     let mut at = first;
@@ -749,7 +758,10 @@ impl HostVm for WindowsVm {
 }
 
 /// The death at `call` naming a Win32 last-error (shared by the submodules).
-#[allow(dead_code, reason = "used by section.rs via a shared helper in a later step")]
+#[allow(
+    dead_code,
+    reason = "used by section.rs via a shared helper in a later step"
+)]
 pub(super) fn fatal_win32(call: &'static str, detail: &str) -> ! {
     fatal_with_detail(
         DeathId::Platform {
@@ -789,7 +801,7 @@ pub(crate) mod tests {
     /// (`VirtualQuery`).
     pub(crate) fn writable(at: HostAddr, len: u64) -> bool {
         use windows_sys::Win32::System::Memory::{
-            MEMORY_BASIC_INFORMATION, MEM_COMMIT as STATE_COMMIT, VirtualQuery,
+            MEM_COMMIT as STATE_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
         let first = at.addr().to_u64();
         let end = first.saturating_add(len);
@@ -814,7 +826,7 @@ pub(crate) mod tests {
     /// Whether the page at `at` is committed at all (`VirtualQuery`).
     pub(crate) fn mapped(at: HostAddr) -> bool {
         use windows_sys::Win32::System::Memory::{
-            MEMORY_BASIC_INFORMATION, MEM_COMMIT as STATE_COMMIT, VirtualQuery,
+            MEM_COMMIT as STATE_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
         let mut info = unsafe { std::mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
         let got = unsafe {

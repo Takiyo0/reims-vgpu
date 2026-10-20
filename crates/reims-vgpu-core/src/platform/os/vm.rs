@@ -82,6 +82,19 @@ pub trait HostVm: Send + Sync {
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn>;
     /// `mach_vm_deallocate(task, addr, len)`. Every caller ignores the result.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn;
+    /// A read-write range of `len` bytes whose contents are unspecified: the caller writes every
+    /// byte before reading any (the discontiguous copy fallback's buffers, which it fills from the
+    /// guest). A platform may hand back a range [`free_scratch`](HostVm::free_scratch) returned;
+    /// by default a fresh one, as [`allocate_anywhere`](HostVm::allocate_anywhere).
+    fn allocate_scratch(&self, len: u64) -> Result<HostAddr, KernReturn> {
+        self.allocate_anywhere(len)
+    }
+    /// Gives back a range [`allocate_scratch`](HostVm::allocate_scratch) answered, `len` its
+    /// length then. A platform may keep it for a later one; by default it is unmapped, as
+    /// [`deallocate`](HostVm::deallocate).
+    fn free_scratch(&self, addr: HostAddr, len: u64) -> KernReturn {
+        self.deallocate(addr, len)
+    }
 }
 
 #[cfg(test)]

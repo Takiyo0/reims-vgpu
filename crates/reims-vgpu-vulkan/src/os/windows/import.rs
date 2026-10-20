@@ -176,7 +176,10 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
 /// pages, shared, read and write, but zeros' (private zeros); `None` where the host maps none.
 fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
     let base = vm::reserve_twin(length).ok()?;
-    let twin = Twin { first: base, length };
+    let twin = Twin {
+        first: base,
+        length,
+    };
     for piece in pieces {
         let at = base + piece.at;
         if zeros(&piece.backing) {
@@ -258,7 +261,11 @@ mod tests {
         assert_ne!(twin, addr(p));
         assert_eq!(twin & (p0 - 1), 0x40, "the offset in its page");
         write(twin + p0, 0x5a);
-        assert_eq!(read(first + 0x40 + p0), 0x5a, "the twin's writes reach the pages");
+        assert_eq!(
+            read(first + 0x40 + p0),
+            0x5a,
+            "the twin's writes reach the pages"
+        );
         assert_eq!(shown_at(view.at()), p);
         let inside = address(twin + 0x10).unwrap();
         assert_eq!(addr(shown_at(inside)), addr(p) + 0x10);
@@ -270,7 +277,11 @@ mod tests {
         let (free, kept) = view.release(p, Some(inner));
         free.unwrap()(address(twin).unwrap(), p0);
         assert_eq!(*given.lock(), Some((addr(p), p0)));
-        assert_eq!(addr(shown_at(inside)), addr(p) + 0x10, "the twin outlives it");
+        assert_eq!(
+            addr(shown_at(inside)),
+            addr(p) + 0x10,
+            "the twin outlives it"
+        );
         drop(kept);
         assert_eq!(addr(shown_at(inside)), twin + 0x10, "the twin is gone");
         assert!(vm.deallocate(at, 2 * p0).is_success());

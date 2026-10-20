@@ -87,7 +87,9 @@ impl<P: Platform> PrivateBufferResource<P> {
         // its page and its length.
         crate::trace::event("tobj", &[2, u64::from(self.page), self.length]);
         let tb = match self.task.upgrade() {
-            Some(t) => Some(t.new_buffer_for_virtual_page(hold, self.page, self.length)?),
+            Some(t) => {
+                Some(t.new_transfer_buffer_for_virtual_page(hold, self.page, self.length)?)
+            }
             None => None,
         };
         let Some(tb) = tb else {
@@ -154,6 +156,10 @@ impl<P: Platform> Drop for PrivateBufferResource<P> {
 }
 
 impl<P: Platform> ResourceClass<P> for PrivateBufferResource<P> {
+    fn devolatilize_now(&self, this: &Resource<P>) -> RaiseResult<()> {
+        PrivateBufferResource::devolatilize(self, this)
+    }
+
     fn initial_guest_valid(&self) -> bool {
         true
     }
@@ -181,12 +187,29 @@ impl<P: Platform> ResourceClass<P> for PrivateBufferResource<P> {
         if !this.state.guest_valid() {
             log::warn!("preparing a private buffer whose guest copy is not valid");
         }
-        self.ensure_physical(hold)?;
-        if let Some(tb) = self.transfer_buffer.lock().as_ref() {
+        // A transfer buffer made here is filled just below, every byte: its copy fallback leaves
+        // it unfilled (`with_lazy_fallback`), and the GPU gathers a scattered large one in the
+        // encoder (`BlitEncoder::gather_host_ranges`); the CPU fills what is not gathered.
+        if crate::memory::map::gpu_gather_wanted() {
+            crate::memory::map::with_lazy_fallback(|| self.ensure_physical(hold))?;
+        } else {
+            self.ensure_physical(hold)?;
+        }
+        let tb = self.transfer_buffer.lock().as_ref().map(Handle::clone_ref);
+        if let Some(tb) = tb {
             if let Some(t) = self.task.upgrade() {
                 if let Some(map) = t.memory_map() {
                     use crate::platform::resource::Buffer as _;
-                    map.sync_range_from_guest(tb.contents(), tb.length());
+                    let mut gathered = false;
+                    if let (Some(e), Some(ranges)) = (
+                        encoder,
+                        map.discontiguous_ranges(tb.contents(), tb.length()),
+                    ) {
+                        gathered = e.gather_host_ranges(&tb, &ranges)?;
+                    }
+                    if !gathered {
+                        map.sync_range_from_guest(tb.contents(), tb.length());
+                    }
                 }
             }
         }

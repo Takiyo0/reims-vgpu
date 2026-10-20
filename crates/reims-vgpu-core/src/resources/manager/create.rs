@@ -1164,8 +1164,12 @@ mod tests {
                 surface_base: u64,
                 surface_size: u64,
             ) -> RaiseResult<Option<Res>> {
-                self.0
-                    .new_mapper_ref_texture_resource(mapping_id, texture, surface_base, surface_size)
+                self.0.new_mapper_ref_texture_resource(
+                    mapping_id,
+                    texture,
+                    surface_base,
+                    surface_size,
+                )
             }
             fn new_shared_texture_resource(
                 &self,

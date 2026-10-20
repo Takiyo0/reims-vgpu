@@ -339,6 +339,11 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
 }
 
 impl<P: Platform> HostDeviceCore<P> {
+    /// Whether the guest has an active, mapped IOSurface descriptor table.
+    pub(crate) fn has_descriptor_table(&self) -> bool {
+        self.state.lock().table.is_some()
+    }
+
     /// This state, for a block the device queues: the state, never the host's device, so the
     /// host's last release during a block is the last one; the teardown runs on the releasing
     /// thread and waits for the block, and the block's caller returns normally. `None` never
