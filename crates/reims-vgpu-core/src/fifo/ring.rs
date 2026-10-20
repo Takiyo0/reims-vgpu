@@ -35,6 +35,23 @@ pub(crate) const NODE_PAGE_LIST_PAGE: u64 = 0x10;
 /// The page list's entries: one guest page of `u32` page numbers (4096, 1024 on x86-64).
 pub(crate) const PAGE_LIST_ENTRIES: u64 = APV_PAGE_SIZE.wrapping_shr(2);
 
+fn copy_from_ring_pages(pages: &[GuestPtr], offset: u32, mut dst: &mut [u8]) {
+    let mut current_offset = offset;
+    while !dst.is_empty() {
+        let page_idx = (current_offset as u64 / APV_PAGE_SIZE) as usize;
+        let page_off = current_offset as u64 % APV_PAGE_SIZE;
+        let Some(&page_ptr) = pages.get(page_idx) else {
+            break;
+        };
+        let bytes_in_page = (APV_PAGE_SIZE - page_off) as usize;
+        let to_copy = dst.len().min(bytes_in_page);
+        let (chunk, rest) = std::mem::take(&mut dst).split_at_mut(to_copy);
+        page_ptr.copy_to(page_off, chunk, DeathKind::RingNull);
+        current_offset = current_offset.wrapping_add(to_copy as u32);
+        dst = rest;
+    }
+}
+
 /// A FIFO's ring, by kind.
 #[derive(Debug)]
 pub(crate) enum Ring {
@@ -74,6 +91,8 @@ pub(crate) struct ChildRing {
     stamp_index: u32,
     /// The mapped ring; NULL while unmapped.
     pub(super) base: Mutex<GuestPtr>,
+    /// The resolved physical pages of the ring (for discontiguous physical rings on WHPX).
+    pub(super) pages: Mutex<Vec<GuestPtr>>,
     /// Where the next byte is read.
     pub(super) read_offset: AtomicU32,
     /// The read offset at the last advance.
@@ -130,6 +149,7 @@ impl ChildRing {
             node,
             stamp_index,
             base: Mutex::new(GuestPtr::default()),
+            pages: Mutex::new(Vec::new()),
             read_offset: AtomicU32::new(0),
             last_read_offset: AtomicU32::new(0),
             read_count: AtomicU32::new(0),
@@ -316,8 +336,13 @@ impl<P: Platform> Fifo<P> {
             let count = copy_count(count, dst.len(), until_wrap);
             let offset = c.read_offset.load(Ordering::Relaxed);
             let (head, tail) = std::mem::take(&mut dst).split_at_mut(count.to_usize());
-            let base = *c.base.lock();
-            base.copy_to(u64::from(offset), head, DeathKind::RingNull);
+            let pages = c.pages.lock();
+            if !pages.is_empty() {
+                copy_from_ring_pages(&pages, offset, head);
+            } else {
+                let base = *c.base.lock();
+                base.copy_to(u64::from(offset), head, DeathKind::RingNull);
+            }
             dst = tail;
             c.read_offset
                 .store(offset.wrapping_add(count), Ordering::Relaxed);
@@ -389,10 +414,20 @@ impl<P: Platform> Fifo<P> {
         let device = self.device.upgrade();
         // The node's page list is read again at every start.
         let list_page = c.node.read_u32(NODE_PAGE_LIST_PAGE, DeathKind::NodeNull);
+        log::info!(
+            "FIFO channel {}: mapping child ring, list_page={:#x}",
+            self.stamp_index(),
+            list_page
+        );
         let list_mapping = device
             .as_ref()
             .and_then(|d| d.new_contiguous_mapping(list_page, APV_PAGE_SIZE));
         let Some(list_mapping) = list_mapping else {
+            log::warn!(
+                "FIFO channel {}: failed to map list_page {:#x}",
+                self.stamp_index(),
+                list_page
+            );
             return false;
         };
         let list = GuestPtr::new(list_mapping.virtual_address());
@@ -405,6 +440,18 @@ impl<P: Platform> Fifo<P> {
             }
             page_count = page_count.wrapping_add(1);
         }
+        let mut entries_str = String::new();
+        for i in 0..page_count {
+            use std::fmt::Write as _;
+            let _ = write!(entries_str, " {:#x}", entry(i));
+        }
+        log::info!(
+            "FIFO channel {}: list_page={:#x} page_count={} entries:{}",
+            self.stamp_index(),
+            list_page,
+            page_count,
+            entries_str
+        );
         if page_count == 0 {
             drop(list_mapping);
             return false;
@@ -417,15 +464,42 @@ impl<P: Platform> Fifo<P> {
             })
             .collect();
         drop(list_mapping);
+        let mut resolved_pages = Vec::with_capacity(page_count as usize);
+        let mut all_pages_resolved = false;
+        if let Some(dev) = device.as_ref() {
+            if let Some(map) = dev.memory_map() {
+                let mut ok = true;
+                for i in 0..page_count {
+                    let phys = u64::from(entry(i)).wrapping_mul(APV_PAGE_SIZE);
+                    let host_va = map.virtual_address_for_physical(phys, APV_PAGE_SIZE);
+                    if host_va.is_null() {
+                        log::warn!(
+                            "FIFO channel {}: page {} phys={:#x} host_va is NULL",
+                            self.stamp_index(),
+                            i,
+                            phys
+                        );
+                        ok = false;
+                        break;
+                    }
+                    resolved_pages.push(GuestPtr::new(host_va));
+                }
+                all_pages_resolved = ok;
+            }
+        }
+
         let length = u64::from(page_count).wrapping_mul(APV_PAGE_SIZE).low_u32();
         let mapping = device
             .as_ref()
             .and_then(|d| d.new_range_mapping(&ranges, u64::from(length), false));
         drop(ranges);
-        let base = mapping
+        let mut base = mapping
             .as_ref()
             .map_or_else(GuestPtr::default, |m| GuestPtr::new(m.virtual_address()));
-        let mapped = mapping.is_some();
+        if base.is_null() && all_pages_resolved {
+            base = resolved_pages.first().copied().unwrap_or_default();
+        }
+        let mapped = mapping.is_some() || all_pages_resolved;
         // A mapping already here (a second thread's start) is kept for good: the first ring's
         // unmap never comes.
         if let Some(old) = std::mem::replace(&mut *self.mapping.lock(), mapping) {
@@ -434,11 +508,18 @@ impl<P: Platform> Fifo<P> {
         // The length is set even when the pages could not be mapped
         self.ring_length.store(length, Ordering::Relaxed);
         *c.base.lock() = base;
+        *c.pages.lock() = resolved_pages;
         // From the node's read count, not the FIFO's
         let node_read_count = c.node.load_seqcst_u32(NODE_READ_COUNT, DeathKind::NodeNull);
         let read_offset = num::rem0(node_read_count, length);
         c.read_offset.store(read_offset, Ordering::Relaxed);
         c.last_read_offset.store(read_offset, Ordering::Relaxed);
+        log::info!(
+            "FIFO channel {}: map_child_ring final mapped={} (all_resolved={})",
+            self.stamp_index(),
+            mapped,
+            all_pages_resolved
+        );
         mapped
     }
 
@@ -447,6 +528,7 @@ impl<P: Platform> Fifo<P> {
         if let Ring::Child(c) = &self.ring {
             let old = self.mapping.lock().take();
             drop(old);
+            c.pages.lock().clear();
             self.ring_length.store(0, Ordering::Relaxed);
             *c.base.lock() = GuestPtr::default();
         }

@@ -55,8 +55,9 @@ pub mod screens;
 pub mod scroll;
 
 // The SDL3 window: Linux's (`native/linux.rs`), and macOS's with the `macos-sdl` feature, behind
-// `REIMS_VGPU_WINDOW_IMPL`.
-#[cfg(any(target_os = "linux", feature = "macos-sdl"))]
+// `REIMS_VGPU_WINDOW_IMPL`. Never on Windows, whose window is raw Win32 (`native/windows.rs`) and
+// which links no SDL, even though `macos-sdl` is a default feature.
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-sdl")))]
 mod sdl;
 
 pub use config::{

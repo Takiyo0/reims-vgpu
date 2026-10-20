@@ -22,6 +22,9 @@ macos-sdl = ["reims-vgpu/macos-sdl"]
 # `VulkanPlatform` in place of `MetalPlatform`. Off by default: the Metal platform is the product.
 # `cargo xtask dist --platform vulkan` builds the dist tree with it.
 vulkan = ["reims-vgpu/vulkan"]
+# Per-record decoder timings (`reims-vgpu-core`); off in normal release builds to avoid timing
+# every guest render command on the FIFO thread.
+record-timing = ["reims-vgpu-core/record-timing"]
 
 [dependencies]
 reims-vgpu.workspace = true
@@ -33,13 +36,18 @@ parking_lot.workspace = true
 # `fstat` and the host's page size, for the files behind a memory map's ranges.
 libc.workspace = true
 
-[target.'cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
-# The library's global allocator on the two targets that ship (lib.rs).
-tikv-jemallocator.workspace = true
+[target.'cfg(windows)'.dependencies]
+# The library's allocator on Windows: the process heap (ntdll) took about a fifth of the decode and
+# FIFO threads' busy time in a profile; mimalloc's thread-local free lists take none of its locks.
+mimalloc = { version = "0.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `exception::catch` around every call of a host function (`ffi::host_call`, `ffi/catch/macos.rs`).
 objc2.workspace = true
+
+# The host's page size via GetSystemInfo on Windows (`device::host_page_size`).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 reims-vgpu = { workspace = true, features = ["testkit"] }

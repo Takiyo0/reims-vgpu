@@ -322,9 +322,11 @@ impl<P: Platform> Deserializer<P> {
         hold: Hold<'_>,
         reference: u32,
     ) -> RaiseResult<P::ComputePipeline> {
+        let t_lookup = std::time::Instant::now();
         let found = self
             .object_delegate
             .get_compute_pipeline_state(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::ComputePipeline, reference)
     }
 
@@ -334,21 +336,27 @@ impl<P: Platform> Deserializer<P> {
         hold: Hold<'_>,
         reference: u32,
     ) -> RaiseResult<P::RenderPipeline> {
+        let t_lookup = std::time::Instant::now();
         let found = self
             .object_delegate
             .get_render_pipeline_state(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::RenderPipeline, reference)
     }
 
     /// The buffer `reference` names, or a raise.
     pub fn require_buffer(&self, hold: Hold<'_>, reference: u32) -> RaiseResult<P::Buffer> {
+        let t_lookup = std::time::Instant::now();
         let found = self.object_delegate.get_buffer(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::Buffer, reference)
     }
 
     /// The texture `reference` names, or a raise.
     pub fn require_texture(&self, hold: Hold<'_>, reference: u32) -> RaiseResult<P::Texture> {
+        let t_lookup = std::time::Instant::now();
         let found = self.object_delegate.get_texture(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::Texture, reference)
     }
 
@@ -358,7 +366,9 @@ impl<P: Platform> Deserializer<P> {
         hold: Hold<'_>,
         reference: u32,
     ) -> RaiseResult<P::SamplerState> {
+        let t_lookup = std::time::Instant::now();
         let found = self.object_delegate.get_sampler_state(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::SamplerState, reference)
     }
 
@@ -368,21 +378,27 @@ impl<P: Platform> Deserializer<P> {
         hold: Hold<'_>,
         reference: u32,
     ) -> RaiseResult<P::DepthStencilState> {
+        let t_lookup = std::time::Instant::now();
         let found = self
             .object_delegate
             .get_depth_stencil_state(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::DepthStencilState, reference)
     }
 
     /// The fence `reference` names, or a raise.
     pub fn require_fence(&self, hold: Hold<'_>, reference: u32) -> RaiseResult<P::Fence> {
+        let t_lookup = std::time::Instant::now();
         let found = self.object_delegate.get_fence(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::Fence, reference)
     }
 
     /// The heap `reference` names, or a raise.
     pub fn require_heap(&self, hold: Hold<'_>, reference: u32) -> RaiseResult<P::Heap> {
+        let t_lookup = std::time::Instant::now();
         let found = self.object_delegate.get_heap(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::Heap, reference)
     }
 
@@ -392,9 +408,11 @@ impl<P: Platform> Deserializer<P> {
         hold: Hold<'_>,
         reference: u32,
     ) -> RaiseResult<P::RateMap> {
+        let t_lookup = std::time::Instant::now();
         let found = self
             .object_delegate
             .get_rasterization_rate_map(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::RateMap, reference)
     }
 
@@ -404,9 +422,11 @@ impl<P: Platform> Deserializer<P> {
         hold: Hold<'_>,
         reference: u32,
     ) -> RaiseResult<P::Icb> {
+        let t_lookup = std::time::Instant::now();
         let found = self
             .object_delegate
             .get_indirect_command_buffer(hold, reference)?;
+        crate::perfstats::DECODE_LOOKUP.add(t_lookup.elapsed());
         required(found, ObjectKind::Icb, reference)
     }
 }

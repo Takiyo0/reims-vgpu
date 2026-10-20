@@ -12,9 +12,11 @@ use crate::platform::descriptor::RenderPassDescriptor;
 use crate::platform::device::GpuDevice;
 use crate::platform::render::{RenderCmd, RenderEncoder};
 use crate::platform::resource::{Buffer, GpuResource, Texture};
-use crate::platform::types::{ClearColor, CommandBufferStatus, MtlRegion, MtlViewport, NsRange};
-use crate::platform::values::ColorAttachmentSet;
-use crate::platform::{Handle, Platform};
+use crate::platform::types::{
+    ClearColor, CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize, MtlViewport, NsRange, Swizzle,
+};
+use crate::platform::values::{ColorAttachmentSet, TextureDesc};
+use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
 use crate::rt::pool;
 
@@ -109,6 +111,7 @@ impl<P: Platform> Display<P> {
         g.pipeline = PipelineKey {
             format: MTL_PIXEL_FORMAT_BGRA8_UNORM,
             gamma: true,
+            blend: false,
         };
         let with_gamma = cache.pipeline_for(g.pipeline);
         g.pipeline.gamma = false;
@@ -171,6 +174,46 @@ impl<P: Platform> DisplayCore<P> {
         Ok(true)
     }
 
+    /// DIAG(clear-test): a single clear pass over `texture` to `color`, no guest draw — the
+    /// window present bypass of advisor experiment 3. Same device checks and command-buffer
+    /// shape as [`encode_current_frame`], but it only clears, so a cycling colour on screen
+    /// proves the surface/present/compositor path and localises the fault to the frame encode.
+    /// `false`, nothing encoded, for a texture of another device or without render-target usage.
+    pub fn clear_test_frame(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        texture: &P::Texture,
+        color: ClearColor,
+    ) -> RaiseResult<bool> {
+        let dev = self.mtl_device().map(Handle::id);
+        if command_buffer.device().map(|d| d.id()) != dev
+            || texture.device().map(|d| d.id()) != dev
+            || (texture.usage() & self.minimum_texture_usage()) != self.minimum_texture_usage()
+        {
+            return Ok(false);
+        }
+        pool::around(&*self.platform, || {
+            let pass = self.platform.render_pass_descriptor();
+            pass.set_color_attachment(
+                OnFault::Die,
+                0,
+                &ColorAttachmentSet {
+                    texture: Some(Some(texture)),
+                    load_action: Some(MTL_LOAD_ACTION_CLEAR),
+                    store_action: Some(MTL_STORE_ACTION_STORE),
+                    clear_color: Some(color),
+                    ..ColorAttachmentSet::default()
+                },
+            )?;
+            // An encoder opened and ended at once performs the clear with no draw.
+            let encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
+            if let Some(encoder) = encoder {
+                encoder.encode(OnFault::Die, RenderCmd::EndEncoding)?;
+            }
+            Ok(true)
+        })
+    }
+
     /// The encode of the current frame, taking the display mutex (tests; the product holds it).
     #[cfg(test)]
     pub(crate) fn internal_encode_current_frame(
@@ -217,6 +260,30 @@ impl<P: Platform> DisplayCore<P> {
         self.encode_render_frame_locked(&mut g, Some(frame), dst, command_buffer, viewport)
     }
 
+    /// Generates an authentic Sonoma recovery procedural backdrop texture (256x256 BGRA8).
+    pub(crate) fn generate_sonoma_backdrop_texture(&self) -> Option<P::Texture> {
+        let mtl_device = self.mtl_device()?;
+        let d = self.platform.texture_descriptor(&TextureDesc {
+            pixel_format: MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            width: 256,
+            height: 256,
+            ..TextureDesc::default()
+        });
+        let tex = mtl_device.new_texture(OnFault::Return, &d).ok().flatten()?;
+        let bgra_bytes = crate::display::wallpaper::generate_recovery_wallpaper_bgra(256, 256);
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(256, 256, 1));
+        let pixels = HostRange::of_slice(&bgra_bytes);
+        let _ = tex.replace_region(region, 0, 0, pixels, 256 * 4, 256 * 256 * 4);
+        Some(tex)
+    }
+
+    /// Ensures that `g.wallpaper_backdrop` is populated with a persistent backdrop texture.
+    pub(crate) fn ensure_wallpaper_backdrop_locked(&self, g: &mut DisplayLocked<P>) {
+        if g.wallpaper_backdrop.is_none() {
+            g.wallpaper_backdrop = self.generate_sonoma_backdrop_texture();
+        }
+    }
+
     /// The pass that draws `frame` (`None`: the current frame) into `dst`, with the display mutex
     /// held, and its completion, which counts the frame out of flight. Even with no frame and no
     /// guest display, one frame is counted in. Only the host's encode, an API entry with no
@@ -229,10 +296,16 @@ impl<P: Platform> DisplayCore<P> {
         command_buffer: &P::CommandBuffer,
         viewport: MtlViewport,
     ) -> RaiseResult<()> {
+        // Whether this pass counts as the frame in flight: not where it draws a copy.
+        let mut counted = true;
         // Still under the display mutex, in a pool (the pass descriptor and the encoder are
         // Metal's `+0`), which a raise leaves pushed.
         pool::around(&*self.platform, || {
             let pass = self.platform.render_pass_descriptor();
+            // Opt-in coverage probe: a magenta clear with the synthetic backdrop bypassed makes
+            // any part of the target the present draw misses visible in the VNC capture.
+            let debug_present_coverage =
+                std::env::var_os("REIMS_VGPU_DEBUG_PRESENT_COVERAGE").is_some();
             // The whole destination is cleared, not only the region.
             pass.set_color_attachment(
                 OnFault::Die,
@@ -242,109 +315,284 @@ impl<P: Platform> DisplayCore<P> {
                     load_action: Some(MTL_LOAD_ACTION_CLEAR),
                     store_action: Some(MTL_STORE_ACTION_STORE),
                     clear_color: Some(ClearColor {
-                        red: 0.0,
+                        red: if debug_present_coverage { 1.0 } else { 0.0 },
                         green: 0.0,
-                        blue: 0.0,
+                        blue: if debug_present_coverage { 1.0 } else { 0.0 },
                         alpha: 1.0,
                     }),
                     ..ColorAttachmentSet::default()
                 },
             )?;
-            let frame = match frame {
-                Some(f) => Some(f),
-                None => g.current_frame.as_ref(),
+            // Completed guest frames supply their own wallpaper. Keep the fallback
+            // confined to firmware frames, which do not have an IOSurface.
+            let firmware_backdrop = frame
+                .or(g.current_frame.as_ref())
+                .is_some_and(|frame| frame.iosurface().is_none());
+            if !debug_present_coverage
+                && firmware_backdrop
+                && (dst.width() > 8 || dst.height() > 8)
+                && g.wallpaper_backdrop.is_none()
+            {
+                self.ensure_wallpaper_backdrop_locked(g);
+            }
+            let has_backdrop =
+                !debug_present_coverage && firmware_backdrop && g.wallpaper_backdrop.is_some();
+            if debug_present_coverage {
+                static NOTICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if NOTICE.fetch_add(1, Ordering::Relaxed) == 0 {
+                    log::warn!(
+                        target: "reims_vgpu::window",
+                        "DIAG present-coverage: magenta clear, generated backdrop skipped"
+                    );
+                }
+            }
+            let frame_owned = match frame {
+                Some(f) => Some(f.clone_ref()),
+                None => g.current_frame.as_ref().map(Handle::clone_ref),
             };
+            // A guest frame (an IOSurface's) is drawn from the host's copy of it where one can be
+            // made (`FrameCopy`): then only the copy counts in flight, not this pass.
+            let guest_frame = frame_owned
+                .as_ref()
+                .is_some_and(|f| f.iosurface().is_some());
+            let copied = match &frame_owned {
+                Some(f) if guest_frame && frame_copy_enabled() => {
+                    self.copy_frame_locked(g, f, command_buffer)?
+                }
+                _ => None,
+            };
+            counted = copied.is_none();
+            let frame = copied.as_ref().or(frame_owned.as_ref());
+            // DIAG(frame-trace): report the guest frame texture bound into the present pass, so
+            // an empty/wrong source can be told from a draw that emits nothing. Throttled.
+            {
+                use std::sync::atomic::{AtomicU64, Ordering as DiagOrd};
+                static DIAG_N: AtomicU64 = AtomicU64::new(0);
+                let n = DIAG_N.fetch_add(1, DiagOrd::Relaxed);
+                if n == 0 || n % 60 == 0 {
+                    match frame {
+                        Some(f) => log::info!(
+                            target: "reims_vgpu::window",
+                            "DIAG frame-trace #{n}: guest frame tex id={:#x} {}x{} fmt={} usage={:#x} iosurface={} guest_presents={} host_presents={} vtx_count={} dst {}x{} fmt={}",
+                            f.unique_identifier(), f.width(), f.height(), f.pixel_format(),
+                            f.usage(), f.iosurface().is_some(),
+                            self.guest_present_count(), self.host_present_count(), g.vtx_count,
+                            dst.width(), dst.height(), dst.pixel_format()
+                        ),
+                        None => log::info!(
+                            target: "reims_vgpu::window",
+                            "DIAG frame-trace #{n}: NO guest current_frame (clear-only); guest_presents={} host_presents={} dst {}x{} fmt={}",
+                            self.guest_present_count(), self.host_present_count(),
+                            dst.width(), dst.height(), dst.pixel_format()
+                        ),
+                    }
+                }
+            }
             let encoder;
-            if let Some(frame) = frame {
+            if frame.is_some() || has_backdrop {
                 if g.protection_requirements != 0 {
                     command_buffer
                         .set_protection_options(OnFault::Die, g.protection_requirements)?;
                 }
                 encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
-                g.pipeline.format = dst.pixel_format();
-                let pipeline = match &self.render_pipeline_cache {
-                    Some(cache) => cache.pipeline_for(g.pipeline),
-                    None => None,
-                };
-                // A nil pipeline (an integer render target) is set as nil, and Metal crashes at
-                // the draw (testing.md 7.4).
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetRenderPipelineState {
-                            pipeline_state: pipeline.as_ref()
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(OnFault::Die, RenderCmd::SetViewport { viewport })
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetVertexBuffer {
-                            buffer: g.pos_buf.as_ref(),
-                            offset: 0,
-                            index: 0
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetVertexBuffer {
-                            buffer: g.tex_buf.as_ref(),
-                            offset: 0,
-                            index: 1
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetFragmentTexture {
-                            texture: g.gamma_table_tex.as_ref(),
-                            index: 1
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetFragmentTexture {
-                            texture: Some(frame),
-                            index: 0
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::SetFragmentBuffer {
-                            buffer: g.frag_shader_property_buf.as_ref(),
-                            offset: 0,
-                            index: 0
-                        }
-                    )
-                )?;
-                crate::nil_send!(
-                    encoder,
-                    encode(
-                        OnFault::Die,
-                        RenderCmd::DrawPrimitives {
-                            primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
-                            vertex_start: 0,
-                            vertex_count: g.vtx_count
-                        }
-                    )
-                )?;
+                if let Some(backdrop) = g.wallpaper_backdrop.as_ref().filter(|_| has_backdrop) {
+                    let backdrop_key = PipelineKey {
+                        format: dst.pixel_format(),
+                        gamma: false,
+                        blend: false,
+                    };
+                    let backdrop_pipeline = match &self.render_pipeline_cache {
+                        Some(cache) => cache.pipeline_for(backdrop_key),
+                        None => None,
+                    };
+                    #[expect(clippy::as_conversions, reason = "u64 to f64 rounds to nearest")]
+                    let full_viewport = MtlViewport {
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        width: dst.width() as f64,
+                        height: dst.height() as f64,
+                        znear: 0.0,
+                        zfar: 0.0,
+                    };
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetRenderPipelineState {
+                                pipeline_state: backdrop_pipeline.as_ref()
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetViewport {
+                                viewport: full_viewport
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.pos_buf.as_ref(),
+                                offset: 0,
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.tex_buf.as_ref(),
+                                offset: 0,
+                                index: 1
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentTexture {
+                                texture: Some(backdrop),
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::DrawPrimitives {
+                                primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
+                                vertex_start: 0,
+                                vertex_count: g.vtx_count
+                            }
+                        )
+                    )?;
+                }
+                if let Some(frame) = frame {
+                    g.pipeline.format = dst.pixel_format();
+                    // A macOS display frame is already the guest's complete, composited screen.
+                    // Its alpha is not a layer opacity and must not blend the screen over the
+                    // host's generated recovery backdrop. The EFI framebuffer is the one path
+                    // that may use that backdrop to fill its transparent pixels.
+                    g.pipeline.blend = has_backdrop && !guest_frame;
+                    let pipeline = match &self.render_pipeline_cache {
+                        Some(cache) => cache.pipeline_for(g.pipeline),
+                        None => None,
+                    };
+                    // A complete IOSurface-backed guest composite must reach the host as an opaque
+                    // image. Keep RGB untouched and force only the sampled alpha to one; guest
+                    // shadows are already composited into the guest frame. EFI may retain alpha
+                    // when a backdrop is present so its transparent pixels reveal that fallback.
+                    let opaque_view =
+                        if guest_frame || (!guest_frame && !g.pipeline.gamma && !has_backdrop) {
+                            let swizzle = Swizzle {
+                                red: 2,
+                                green: 3,
+                                blue: 4,
+                                alpha: 1,
+                            };
+                            frame
+                                .new_swizzled_texture_subview(
+                                    frame.pixel_format(),
+                                    frame.texture_type(),
+                                    NsRange::new(0, frame.mipmap_level_count().max(1)),
+                                    NsRange::new(0, frame.array_length().max(1)),
+                                    swizzle,
+                                )
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                    let sampled: &P::Texture = opaque_view.as_ref().unwrap_or(frame);
+                    // A nil pipeline (an integer render target) is set as nil, and Metal crashes at
+                    // the draw (testing.md 7.4).
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetRenderPipelineState {
+                                pipeline_state: pipeline.as_ref()
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(OnFault::Die, RenderCmd::SetViewport { viewport })
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.pos_buf.as_ref(),
+                                offset: 0,
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetVertexBuffer {
+                                buffer: g.tex_buf.as_ref(),
+                                offset: 0,
+                                index: 1
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentTexture {
+                                texture: g.gamma_table_tex.as_ref(),
+                                index: 1
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentTexture {
+                                texture: Some(sampled),
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::SetFragmentBuffer {
+                                buffer: g.frag_shader_property_buf.as_ref(),
+                                offset: 0,
+                                index: 0
+                            }
+                        )
+                    )?;
+                    crate::nil_send!(
+                        encoder,
+                        encode(
+                            OnFault::Die,
+                            RenderCmd::DrawPrimitives {
+                                primitive_type: MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP,
+                                vertex_start: 0,
+                                vertex_count: g.vtx_count
+                            }
+                        )
+                    )?;
+                }
             } else {
                 encoder = command_buffer.render_encoder(OnFault::Die, &pass)?;
             }
@@ -352,8 +600,20 @@ impl<P: Platform> DisplayCore<P> {
             // The encoder and the pass go before the pool pops.
             drop(encoder);
             drop(pass);
+            if let Some(frame) = frame {
+                super::probe::encode(
+                    &*self.platform,
+                    frame,
+                    dst,
+                    command_buffer,
+                    g.pipeline.gamma,
+                )?;
+            }
             Ok(())
         })?;
+        if !counted {
+            return Ok(());
+        }
         self.in_flight_frame_count.fetch_add(1, Ordering::SeqCst);
         // The block holds the display (a display whose last release has begun: its core), and the
         // command buffer lets it go when it has run.
@@ -466,5 +726,210 @@ impl<P: Platform> DisplayCore<P> {
                 NsRange::new(0, FRAG_SHADER_PROPERTIES_SIZE)
             )
         )?)
+    }
+}
+
+/// How many host copies of guest frames a display keeps (`FrameCopy`).
+const FRAME_COPY_SLOTS: usize = 3;
+
+/// Whether the host draws guest frames from copies of its own (`REIMS_VGPU_FRAME_COPY`, on
+/// unless `0`).
+fn frame_copy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REIMS_VGPU_FRAME_COPY").map_or(true, |v| v != "0"))
+}
+
+/// One copy of a guest frame.
+pub(crate) struct FrameCopySlot<P: Platform> {
+    texture: P::Texture,
+    /// The window passes reading it that have not completed.
+    readers: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The guest frame and the guest present it copies.
+    source: (crate::platform::ObjId, u64),
+    /// The copy event's value its copy signals.
+    value: u64,
+}
+
+/// The host's copies of guest frames: a guest frame is copied once, on a queue of the display's
+/// own, and the window draws from the copy. Only the copy counts as a frame in flight, so a guest
+/// present waits for that blit (well under a millisecond) instead of the window's whole pass, and
+/// not at all while the window draws a frame it already copied. A slot is written again only once
+/// no window pass reads it.
+pub(crate) struct FrameCopy<P: Platform> {
+    queue: P::CommandQueue,
+    event: P::Event,
+    value: u64,
+    slots: Vec<FrameCopySlot<P>>,
+    /// The slot the last copy went to.
+    current: Option<usize>,
+}
+
+impl<P: Platform> DisplayCore<P> {
+    /// The copy of the guest frame `src` for a window pass in `composite` (made now, or the last
+    /// one when it copies the same frame and present), with the pass's wait for it encoded and
+    /// its slot's reader count raised until the pass completes; `None` where no copy can be made
+    /// (the caller draws `src` itself, counted in flight as before).
+    fn copy_frame_locked(
+        &self,
+        g: &mut DisplayLocked<P>,
+        src: &P::Texture,
+        composite: &P::CommandBuffer,
+    ) -> RaiseResult<Option<P::Texture>> {
+        use crate::platform::blit::{BlitCmd, BlitEncoder};
+        use crate::platform::command::CommandQueue;
+        use crate::platform::event::EventRef;
+        use crate::platform::types::{MtlOrigin, MtlSize};
+        let Some(device) = self.mtl_device() else {
+            return Ok(None);
+        };
+        if g.frame_copy.is_none() {
+            let (Some(queue), Some(event)) = (
+                device.new_command_queue(),
+                device.new_event(OnFault::Return)?,
+            ) else {
+                return Ok(None);
+            };
+            g.frame_copy = Some(FrameCopy {
+                queue,
+                event,
+                value: 0,
+                slots: Vec::new(),
+                current: None,
+            });
+        }
+        let source = (src.id(), self.guest_present_count());
+        let Some(fc) = g.frame_copy.as_mut() else {
+            return Ok(None);
+        };
+        let reuse = fc
+            .current
+            .filter(|&i| fc.slots.get(i).is_some_and(|s| s.source == source));
+        let index = match reuse {
+            Some(i) => i,
+            None => {
+                // A slot no pass reads, of the frame's shape; else a new one; else none
+                let fits = |t: &P::Texture| {
+                    t.width() == src.width()
+                        && t.height() == src.height()
+                        && t.pixel_format() == src.pixel_format()
+                };
+                let free = (0..fc.slots.len()).find(|&i| {
+                    Some(i) != fc.current
+                        && fc.slots[i].readers.load(Ordering::SeqCst) == 0
+                        && fits(&fc.slots[i].texture)
+                });
+                let free = match free {
+                    Some(i) => Some(i),
+                    None => {
+                        // A slot of another shape no pass reads is replaced
+                        let stale = (0..fc.slots.len()).find(|&i| {
+                            Some(i) != fc.current && fc.slots[i].readers.load(Ordering::SeqCst) == 0
+                        });
+                        if stale.is_none() && fc.slots.len() >= FRAME_COPY_SLOTS {
+                            return Ok(None);
+                        }
+                        let desc = self.platform.texture_descriptor(&TextureDesc {
+                            texture_type: src.texture_type(),
+                            pixel_format: src.pixel_format(),
+                            width: src.width(),
+                            height: src.height(),
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            // Shader read, and pixel-format views (the pass's swizzled view)
+                            usage: 0x1 | 0x10,
+                            ..TextureDesc::default()
+                        });
+                        let Some(texture) = device.new_texture(OnFault::Return, &desc)? else {
+                            return Ok(None);
+                        };
+                        let slot = FrameCopySlot {
+                            texture,
+                            readers: std::sync::Arc::default(),
+                            source: (src.id(), u64::MAX),
+                            value: 0,
+                        };
+                        match stale {
+                            Some(i) => {
+                                fc.slots[i] = slot;
+                                Some(i)
+                            }
+                            None => {
+                                fc.slots.push(slot);
+                                Some(fc.slots.len() - 1)
+                            }
+                        }
+                    }
+                };
+                let Some(i) = free else {
+                    return Ok(None);
+                };
+                let Some(buffer) = fc.queue.command_buffer(OnFault::Return)? else {
+                    return Ok(None);
+                };
+                let Some(encoder) = buffer.blit_encoder(OnFault::Return)? else {
+                    return Ok(None);
+                };
+                let slot = &fc.slots[i];
+                encoder.encode(
+                    OnFault::Return,
+                    BlitCmd::CopyTextureRegion {
+                        source_texture: src,
+                        source_slice: 0,
+                        source_level: 0,
+                        source_origin: MtlOrigin::new(0, 0, 0),
+                        source_size: MtlSize::new(src.width(), src.height(), 1),
+                        destination_texture: &slot.texture,
+                        destination_slice: 0,
+                        destination_level: 0,
+                        destination_origin: MtlOrigin::new(0, 0, 0),
+                    },
+                )?;
+                encoder.encode(OnFault::Return, BlitCmd::EndEncoding)?;
+                drop(encoder);
+                fc.value = fc.value.wrapping_add(1);
+                let value = fc.value;
+                buffer.encode_signal(Some(EventRef::Event(&fc.event)), value)?;
+                // The copy is the frame in flight: the guest may reuse its surface once it ran
+                self.in_flight_frame_count.fetch_add(1, Ordering::SeqCst);
+                let this = self.block_self();
+                buffer.add_completed_handler(
+                    OnFault::Die,
+                    Box::new(move |info: CompletedInfo| {
+                        if info.status == CommandBufferStatus::ERROR {
+                            log::error!("a frame copy's command buffer failed");
+                        }
+                        if let Some(this) = this {
+                            let _g = this.display_mutex.lock();
+                            let left = this
+                                .in_flight_frame_count
+                                .fetch_sub(1, Ordering::SeqCst)
+                                .wrapping_sub(1);
+                            if left == 0 {
+                                this.in_flight_condition.notify_all();
+                            }
+                        }
+                    }),
+                )?;
+                buffer.commit(OnFault::Return)?;
+                let slot = &mut fc.slots[i];
+                slot.source = source;
+                slot.value = value;
+                fc.current = Some(i);
+                i
+            }
+        };
+        let slot = &fc.slots[index];
+        composite.encode_wait(Some(EventRef::Event(&fc.event)), slot.value)?;
+        slot.readers.fetch_add(1, Ordering::SeqCst);
+        let readers = std::sync::Arc::clone(&slot.readers);
+        composite.add_completed_handler(
+            OnFault::Die,
+            Box::new(move |_info: CompletedInfo| {
+                readers.fetch_sub(1, Ordering::SeqCst);
+            }),
+        )?;
+        Ok(Some(slot.texture.clone_ref()))
     }
 }

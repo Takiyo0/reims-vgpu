@@ -44,6 +44,11 @@ pub type OsSurface = MetalSurface;
 /// IOSurface creation: [`VulkanSurfaces`].
 pub type OsSurfaces = VulkanSurfaces;
 
+/// The backing object behind a guest-RAM range (`crate::os::GuestRamFile`): unused on macOS,
+/// where Mach makes a view by remapping addresses rather than mapping a backing object, but the
+/// field is still typed, so the alias stands.
+pub use std::os::fd::OwnedFd as BackingHandle;
+
 /// Installs what the process's platform needs before it runs: the Objective-C autorelease pool
 /// core's pools push, as `MetalPlatform::new` does. IOSurface and Foundation still autorelease
 /// into it.

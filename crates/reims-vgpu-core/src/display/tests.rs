@@ -137,6 +137,21 @@ fn texture(e: &Env, w: u64, h: u64) -> Fk<kind::Texture> {
     texture_on(&e.p.device(), e, w, h, 4 | 1, 80)
 }
 
+fn texture_with_surface(e: &Env, w: u64, h: u64) -> Fk<kind::Texture> {
+    let surface = e.p.fake_surfaces().make_simple(w, h, 0x4247_5241, 4);
+    let descriptor = e.p.texture_descriptor(&TextureDesc {
+        width: w,
+        height: h,
+        usage: 4 | 1,
+        pixel_format: 80,
+        ..TextureDesc::default()
+    });
+    e.p.device()
+        .new_texture_on_surface(&descriptor, Some(&surface), 0)
+        .unwrap()
+        .unwrap()
+}
+
 fn cmdbuf_on(dev: &Fk<kind::Device>) -> Fk<kind::CommandBuffer> {
     dev.new_command_queue()
         .unwrap()
@@ -839,6 +854,65 @@ mod encode_render_frame {
         );
         assert_eq!(d.in_flight_frame_count.load(Ordering::SeqCst), 0);
     }
+
+    /// A complete IOSurface-backed macOS frame supplies its own background.
+    #[test]
+    fn guest_composite_frame_is_not_blended_over_host_backdrop() {
+        let e = env();
+        let d = make(&e);
+        let cb = cmdbuf(&e);
+        let dst = texture(&e, 1024, 768);
+        let frame = texture_with_surface(&e, 800, 600);
+        let vp_guest = MtlViewport {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 800.0,
+            height: 600.0,
+            znear: 0.0,
+            zfar: 0.0,
+        };
+        let m = e.p.call_log().mark();
+        d.encode_render_frame(&frame, &dst, &cb, vp_guest).unwrap();
+        let calls = e.p.call_log().since(m);
+        assert!(!calls.iter().any(
+            |c| c.sel == "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"
+        ));
+        let draw_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sel == "drawPrimitives:vertexStart:vertexCount:")
+            .collect();
+        assert_eq!(draw_calls.len(), 1);
+        assert!(d.display_mutex.lock().wallpaper_backdrop.is_none());
+        assert!(!d.display_mutex.lock().pipeline.blend);
+
+        // A cached firmware fallback must also be skipped after the guest takes over.
+        d.encode_render_frame(&texture(&e, 800, 600), &dst, &cb, vp_guest)
+            .unwrap();
+        assert!(d.display_mutex.lock().wallpaper_backdrop.is_some());
+        let m = e.p.call_log().mark();
+        d.encode_render_frame(&frame, &dst, &cb, vp_guest).unwrap();
+        assert_eq!(
+            e.p.call_log()
+                .since(m)
+                .iter()
+                .filter(|c| c.sel == "drawPrimitives:vertexStart:vertexCount:")
+                .count(),
+            1
+        );
+        assert!(!d.display_mutex.lock().pipeline.blend);
+    }
+
+    /// An EFI frame without an IOSurface can still use source-over to reveal the host fallback.
+    #[test]
+    fn efi_frame_uses_backdrop_blending() {
+        let e = env();
+        let d = make(&e);
+        let cb = cmdbuf(&e);
+        let dst = texture(&e, 1024, 768);
+        let frame = texture(&e, 800, 600);
+        d.encode_render_frame(&frame, &dst, &cb, vp()).unwrap();
+        assert!(d.display_mutex.lock().pipeline.blend);
+    }
 }
 
 mod wait_for_pending_frames {
@@ -1247,6 +1321,7 @@ fn the_display_holds_no_mtl_device_of_its_own() {
         let mut pd = PipelineKey {
             format: 80,
             gamma: true,
+            blend: false,
         };
         drop(cache.pipeline_for(pd));
         pd.gamma = false;

@@ -913,6 +913,8 @@ fn labelled_queue<P: Platform>(mtl: &P::Device, label: &str) -> Option<P::Comman
 struct Capabilities {
     /// Tasks other than task 0 are isolated: each is run by a service of its own.
     process_isolation: bool,
+    /// Isolation and argument buffers follow the live IOSurface descriptor table.
+    process_isolation_follows_guest: bool,
     /// Always true, whatever the descriptor asks (module doc).
     protected_content: bool,
     shared_textures: bool,
@@ -1138,8 +1140,15 @@ impl<P: Platform> DeviceCore<P> {
             return Err(DeviceRefusal::Metal);
         }
         let enable_process_isolation = descriptor.enable_process_isolation;
+        let process_isolation_follows_guest = descriptor.process_isolation_follows_guest;
         if enable_process_isolation {
-            log::info!("device isolates every task but task 0");
+            if process_isolation_follows_guest {
+                log::info!(
+                    "device isolates user tasks while the IOSurface descriptor table is mapped"
+                );
+            } else {
+                log::info!("device isolates every task but task 0");
+            }
         }
         let supports_shared_textures = mtl_caps.flags.supports_shared_texture_handles;
         let supports_buffer_with_iosurface = mtl_caps.flags.supports_buffer_with_iosurface;
@@ -1225,6 +1234,7 @@ impl<P: Platform> DeviceCore<P> {
                     tasks: Mutex::new(tasks),
                     caps: Capabilities {
                         process_isolation: enable_process_isolation,
+                        process_isolation_follows_guest,
                         protected_content: true,
                         shared_textures: supports_shared_textures,
                         buffer_with_iosurface: supports_buffer_with_iosurface,
@@ -1342,7 +1352,7 @@ impl<P: Platform> DeviceCore<P> {
         DeviceInfoSnapshot {
             features: self.features.load(),
             device_feature_level: self.caps.feature_level,
-            supports_argument_buffers: self.supports_argument_buffers.load(Ordering::Relaxed),
+            supports_argument_buffers: self.supports_argument_buffers_now(),
             guest_device_info_max_key: self.guest_device_info_max_key.load(Ordering::Relaxed),
             supports_buffer_with_iosurface: self.caps.buffer_with_iosurface,
             supports_shared_textures: self.caps.shared_textures,
@@ -1351,6 +1361,22 @@ impl<P: Platform> DeviceCore<P> {
             supports_range_buffer: self.caps.range_buffer,
             supports_shared_memory_heap: self.caps.shared_memory_heap,
         }
+    }
+
+    /// Whether a guest user task should run in its isolated service. When requested, the guest's
+    /// IOSurface descriptor table is the signal that its task backings can be mapped there.
+    pub(crate) fn isolates_guest_tasks(&self) -> bool {
+        self.caps.process_isolation
+            && (!self.caps.process_isolation_follows_guest
+                || self
+                    .mapper_service()
+                    .is_some_and(|service| service.has_descriptor_table()))
+    }
+
+    /// Whether to offer argument buffers now. The guest mapper must be ready when isolation is
+    /// configured to follow it, because argument-buffer tasks use the same isolated path.
+    fn supports_argument_buffers_now(&self) -> bool {
+        self.supports_argument_buffers.load(Ordering::Relaxed) && self.isolates_guest_tasks()
     }
 
     /// The last release: the EFI display tears down (it releases itself), the root is torn down as
@@ -1483,7 +1509,7 @@ mod seam_impls {
 
         /// Whether the device supports argument buffers.
         pub fn supports_argument_buffers(&self) -> bool {
-            self.supports_argument_buffers.load(Ordering::Relaxed)
+            self.supports_argument_buffers_now()
         }
 
         /// A task's paging queue. Retained; `None` where Metal answered nil, which is never

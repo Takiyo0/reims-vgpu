@@ -117,6 +117,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::{BarrierScope, DispatchType, ResourceUsage};
@@ -1500,6 +1501,53 @@ impl Unit {
         written
     }
 
+    /// Claim surface writes at work, using the kernel's access reflection. Read-only
+    /// bindings must remain eligible for later guest-memory refreshes.
+    fn mark_surface_writes(&self, inherits: Option<Inherits>) {
+        let kernel = self.bindings.pipeline.as_ref();
+        let writes = |texture, slot: u32, untold| match kernel {
+            Some(k) => Whether::Slot(
+                Arc::clone(&k.reflection),
+                Slot {
+                    stage: 0,
+                    texture,
+                    slot: u64::from(slot),
+                    untold,
+                },
+            )
+            .holds(),
+            None => untold,
+        };
+        if inherits.is_none_or(|i| i.pipeline) {
+            let untold = kernel.is_some_and(|k| plain(|| k.raw.writes_textures()));
+            for (&slot, t) in &self.bindings.textures {
+                if writes(true, slot, untold) {
+                    t.mark_gpu_written();
+                }
+            }
+        }
+        if inherits.is_none_or(|i| i.buffers) {
+            for (&slot, (b, ..)) in &self.bindings.buffers {
+                if inherits.is_some_and(|i| !i.pipeline) || writes(false, slot, true) {
+                    b.mark_gpu_written();
+                }
+            }
+        }
+        for u in &self.used {
+            if let Use::Resources(list, usage) = u
+                && usage.contains(ResourceUsage::WRITE)
+            {
+                for r in list {
+                    match r {
+                        Resource::Texture(t) => t.mark_gpu_written(),
+                        Resource::Buffer(b) => b.mark_gpu_written(),
+                        Resource::Icb(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// How the open encoder's next work, `inherits` what an execution's commands take of the
     /// encoder, writes through an object over memory the runtime imports through a writable twin
     /// of read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture bound
@@ -1936,6 +1984,97 @@ impl Work<'_> {
     }
 }
 
+/// Bounded trace of compute dispatches that touch a wallpaper-sized texture.
+fn trace_wallpaper_compute_work(u: &Unit, work: &Work<'_>, sel: &'static str) {
+    if std::env::var_os("REIMS_VGPU_CAPTURE_DIR").is_none() {
+        return;
+    }
+    let has_wallpaper_texture = u
+        .bindings
+        .textures
+        .values()
+        .any(|t| plain(|| t.raw.width()) >= 3840 && plain(|| t.raw.height()) >= 2160);
+    if !has_wallpaper_texture {
+        return;
+    }
+    static CAPTURES: AtomicU64 = AtomicU64::new(0);
+    let capture = CAPTURES.fetch_add(1, Ordering::Relaxed);
+    if capture >= 64 {
+        return;
+    }
+
+    let pipeline = u.bindings.pipeline.as_ref();
+    let pipeline_id = pipeline.map(|p| p.unique_identifier);
+    let grid = match work {
+        Work::Threadgroups { groups, threads } => format!(
+            "threadgroups groups={:?} threads_per_group={:?}",
+            axes(*groups),
+            axes(*threads)
+        ),
+        Work::ThreadgroupsIndirect {
+            buffer,
+            offset,
+            threads,
+        } => format!(
+            "threadgroups_indirect buffer_length={} offset={offset:#x} threads_per_group={:?}",
+            plain(|| buffer.length()),
+            axes(*threads)
+        ),
+        Work::Threads { threads, per_group } => format!(
+            "threads grid={:?} threads_per_group={:?}",
+            axes(*threads),
+            axes(*per_group)
+        ),
+        Work::ThreadsIndirect { buffer, offset } => format!(
+            "threads_indirect buffer_length={} offset={offset:#x}",
+            plain(|| buffer.length())
+        ),
+        Work::Execute { range, .. } => format!("execute range={range:?}"),
+        Work::ExecuteIndirect { buffer, offset, .. } => format!(
+            "execute_indirect buffer_length={} offset={offset:#x}",
+            plain(|| buffer.length())
+        ),
+    };
+    let textures: Vec<_> = u
+        .bindings
+        .textures
+        .iter()
+        .map(|(&slot, texture)| {
+            let writes = pipeline.is_some_and(|p| {
+                Whether::Slot(
+                    Arc::clone(&p.reflection),
+                    Slot {
+                        stage: 0,
+                        texture: true,
+                        slot: u64::from(slot),
+                        untold: plain(|| p.raw.writes_textures()),
+                    },
+                )
+                .holds()
+            });
+            format!(
+                "slot={slot} writes={writes} {}",
+                crate::gpu::resource::wallpaper_texture_lineage(texture)
+            )
+        })
+        .collect();
+    let buffers: Vec<_> = u
+        .bindings
+        .buffers
+        .iter()
+        .map(|(&slot, (buffer, offset, stride))| {
+            format!(
+                "slot={slot} id={:#x} offset={offset:#x} stride={stride} length={}",
+                buffer.id().0,
+                plain(|| buffer.raw.length())
+            )
+        })
+        .collect();
+    log::warn!(
+        "wallpaper compute work #{capture} selector={sel} pipeline={pipeline_id:?} grid={grid} textures={textures:?} buffers={buffers:?}"
+    );
+}
+
 /// `work`, `sel`: sent as it is outside a block that can skip, as its indirect form inside one,
 /// and not at all in a unit an unbalanced record emptied, as Metal drops it there.
 pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> RaiseResult<()> {
@@ -1965,6 +2104,9 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     }
     // An execution of no command runs nothing: it writes and samples nothing.
     let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
+    if !empty {
+        trace_wallpaper_compute_work(&u, &work, sel);
+    }
     // A write through an object over memory the runtime imports through a writable twin of
     // read-only pages dies, at every extent.
     if crate::os::TWINS_READ_ONLY
@@ -2001,6 +2143,7 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
         return send(sel, Policy::Dies, || enc.with(sel, |e| work.direct(e)));
     }
     u.work = true;
+    u.mark_surface_writes(work.inherits());
     if !u.predicated() {
         drop(u);
         return send(sel, Policy::Dies, || enc.with(sel, |e| work.direct(e)));

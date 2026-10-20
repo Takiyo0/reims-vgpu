@@ -277,6 +277,7 @@ impl<P: Platform> ComputeDecoder<P> {
         segment: &mut Cursor,
     ) -> RaiseResult<()> {
         if header.continues_previous == 0 {
+            let t_encoder = std::time::Instant::now();
             let descriptor = self.decode_compute_pass_descriptor(segment)?;
             self.concurrent = descriptor.dispatch_type == Some(1);
             let encoder = match &self.command_buffer {
@@ -288,12 +289,15 @@ impl<P: Platform> ComputeDecoder<P> {
             if let Some(old) = std::mem::replace(&mut self.encoder, encoder) {
                 keep_forever(old, Kept::MetalNumbering);
             }
+            crate::perfstats::DECODE_ENCODER.add(t_encoder.elapsed());
         }
         if self.encoder.is_none() {
             refuse!(hold, NoEncoder, "no compute encoder");
         }
         while let Some((record_header, mut record)) = next_record(segment)? {
             let c = &mut record;
+            #[cfg(feature = "record-timing")]
+            let t_record = std::time::Instant::now();
             match record_header.command_id {
                 0xc8 => self.decode_dispatch_threadgroups(c)?,
                 0xc9 => self.decode_dispatch_threadgroups_indirect(hold, c)?,
@@ -333,6 +337,8 @@ impl<P: Platform> ComputeDecoder<P> {
                     format_args!("unknown command {id}")
                 ),
             }
+            #[cfg(feature = "record-timing")]
+            crate::perfstats::record(record_header.command_id, t_record.elapsed());
         }
         if header.continued_by_next == 0 {
             // The encoder is ended, not released or dropped.

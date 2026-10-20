@@ -1,4 +1,4 @@
 [submodule "vendor/qemu"]
 	path = vendor/qemu
-	url = https://github.com/steelbrain/qemu-reims-vgpu
-	branch = steelbrain/reims-vgpu
+	url = https://github.com/Takiyo0/qemu-sanctum-vgpu
+	branch = master

@@ -3,19 +3,34 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(unix)]
+type QmpStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type QmpStream = std::net::TcpStream;
+
 pub struct Qmp {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<QmpStream>,
+    writer: QmpStream,
 }
 
 impl Qmp {
     pub fn connect(socket: &Path, timeout: Duration) -> Result<Qmp> {
-        let s = UnixStream::connect(socket)
+        #[cfg(unix)]
+        let s = QmpStream::connect(socket)
             .with_context(|| format!("connect to {}", socket.display()))?;
+        #[cfg(windows)]
+        let s = {
+            let endpoint = socket.to_string_lossy();
+            let address = endpoint
+                .strip_prefix("tcp:")
+                .context("Windows QMP endpoint must be tcp:HOST:PORT")?;
+            let address = address.parse().context("invalid Windows QMP address")?;
+            QmpStream::connect_timeout(&address, timeout)
+                .with_context(|| format!("connect to {}", socket.display()))?
+        };
         s.set_read_timeout(Some(timeout))?;
         s.set_write_timeout(Some(timeout))?;
         let mut q = Qmp {

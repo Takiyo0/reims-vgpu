@@ -10,9 +10,9 @@
 #   1. checks the build's dependencies, and offers to install those missing
 #      (Homebrew on macOS; apt or pacman on Linux, through sudo), and Rust
 #      through rustup.rs, whose installer asks its own questions;
-#   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
-#      build fetches what it needs); cargo fetches metal2vulkan itself, at the
-#      commit the library's Cargo.toml names;
+#   2. fetches vendor/qemu's configured branch, QEMU's source, without QEMU's own submodules (its
+#      build fetches what it needs); Cargo fetches metal2vulkan from its configured branch,
+#      with Cargo.lock recording the resolved commit;
 #   3. builds the library (cargo xtask dist) and QEMU on it, in
 #      ~/.cache/reims-ctl, and installs QEMU into
 #      ~/.local/share/reims-ctl/qemu/<build>, linking qemu/current to it. A
@@ -215,12 +215,11 @@ fi
 
 # ------------------------------------------------------------------ sources
 
-# vendor/qemu at the commit this checkout names: shallow, else whole (a server
-# that refuses a shallow fetch of a commit by its hash).
+# vendor/qemu at its configured remote branch, shallow where supported.
 fetch_qemu() {
-  git -C "$ROOT" submodule update --init --depth 1 vendor/qemu ||
-    git -C "$ROOT" submodule update --init vendor/qemu ||
-    die "could not fetch vendor/qemu's commit $(git -C "$ROOT" ls-tree HEAD vendor/qemu | awk '{print $3}') from $(git -C "$ROOT" config -f .gitmodules --get submodule.vendor/qemu.url): check that you can read that repository; a commit it does not have was not pushed to it"
+  git -C "$ROOT" submodule update --init --remote --depth 1 vendor/qemu ||
+    git -C "$ROOT" submodule update --init --remote vendor/qemu ||
+    die "could not fetch vendor/qemu's configured branch from $(git -C "$ROOT" config -f .gitmodules --get submodule.vendor/qemu.url): check that you can read that repository"
 }
 
 if [[ $SKIP_QEMU == 0 ]]; then

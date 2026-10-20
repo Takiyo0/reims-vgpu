@@ -15,6 +15,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::FrameSink;
@@ -32,3 +34,7 @@ pub(crate) use macos::{
     key_input_captured, launched, monitored_events, open, quit_requested, release_key_input,
     screens_changed,
 };
+#[cfg(target_os = "windows")]
+pub use windows::FrameSink;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{Surface, close, cursor_changed, guest_mode_changed, host_screens, open};

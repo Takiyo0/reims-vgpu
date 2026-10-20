@@ -67,19 +67,20 @@ static float gamma_lookup(texture1d_array<float> table, uint channel, float v, f
 }
 
 // With a gamma table: each channel through its table, then row c of the colour matrix gives
-// output c = m[c][0] r + m[c][1] g + m[c][2] b + m[c][3]. Alpha is 1, whatever the frame holds.
+// output c = m[c][0] r + m[c][1] g + m[c][2] b + m[c][3]. Preserves the frame's sampled alpha.
 fragment float4 displayPresentFragmentWithGammaTableAndColorMatrix(
     PresentVertex in [[stage_in]], texture2d<float> frame [[texture(0)]],
     texture1d_array<float> gamma_table [[texture(1)]],
     constant DisplayFragmentProperties &properties [[buffer(0)]]) {
-    float3 color = frame.sample(frame_sampler, in.tex).rgb;
+    float4 sampled = frame.sample(frame_sampler, in.tex);
+    float3 color = sampled.rgb;
     float3 slope_at_zero = properties.gamma_slope_at_zero;
     float3 slope_at_one = properties.gamma_slope_at_one;
     float3 looked_up;
     for (uint c = 0; c < 3; c++) {
         looked_up[c] = gamma_lookup(gamma_table, c, color[c], slope_at_zero[c], slope_at_one[c]);
     }
-    return float4(properties.color_matrix * float4(looked_up, 1.0f), 1.0f);
+    return float4(properties.color_matrix * float4(looked_up, 1.0f), sampled.a);
 }
 
 // ---- XR10 two-plane textures (pixel formats 550 and 551) ----

@@ -280,6 +280,7 @@ impl<P: Platform> GuestDisplay<P> {
         let Some(io) = io_surface else {
             crate::fatal!(DeathKind::PresentWithoutSurface)
         };
+        io.sync_from_guest();
         let pixel_format = io.pixel_format();
         let mut mtl_format = 0u64;
         if pixel_format == FOURCC_BGRA {
@@ -409,6 +410,7 @@ impl<P: Platform> GuestDisplay<P> {
         let Some(io) = io_surface else {
             crate::raise!(RaiseKind::MappingId, "no surface under the mapping id");
         };
+        io.sync_from_guest();
         let mut texture: Option<P::Texture> = None;
         let presented = (|| -> RaiseResult<()> {
             let pixel_format = io.pixel_format();

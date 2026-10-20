@@ -21,11 +21,17 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::ToUsize;
+use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+use reims_vgpu_core::platform::command::CommandBuffer as _;
+use reims_vgpu_core::platform::device::GpuDevice as _;
+use reims_vgpu_core::platform::os::surface::Surface as _;
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, DepthStencilState, GpuResource, Heap, Library, RenderPipeline,
     SamplerState, Texture,
 };
-use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use reims_vgpu_core::platform::types::{
+    CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle,
+};
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
@@ -36,6 +42,7 @@ use crate::answer::{
 };
 use crate::gpu;
 use crate::gpu::backing::{Backing, REPLACE};
+use crate::gpu::command::VulkanCommandBuffer;
 use crate::gpu::desc::{Maker, VulkanTextureDescriptor, format_refused};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_space::Hold;
@@ -82,12 +89,23 @@ pub(crate) fn reach(offset: u64, length: u64) -> Option<std::ops::Range<u64>> {
 }
 
 impl BufferObject {
+    /// Marks the underlying surface as GPU-written.
+    pub fn mark_gpu_written(&self) {
+        if let Some(surface) = &self.surface {
+            surface.refresh();
+            surface.mark_gpu_written();
+        }
+    }
+
     /// A command's use `sel` of the buffer's bytes `bytes`, all of them where `bytes` is `None`,
     /// as for a bind, whose reach a shader decides. It dies where they lie over the guest's pages
     /// under a texture of a heap nothing may share a byte with that lives
     /// ([`crate::gpu::over_pages`]). The use is kept where the buffer is over the guest's pages:
     /// given them by a replace, or made over them ([`BufferObject::over_guest_pages`]).
     pub(crate) fn used(&self, sel: &'static str, bytes: Option<std::ops::Range<u64>>) {
+        if let Some(surface) = &self.surface {
+            surface.refresh();
+        }
         // A placed buffer's bytes lie in its heap's, whose use it is.
         let owner = self
             .heap
@@ -296,7 +314,51 @@ impl TextureObject {
     /// Metal does, and refuses what it does not build (a view of one, CPU access or a blit whose
     /// rows run past its buffer), each refusal dying at its send ([`crate::gpu::desc`]).
     pub fn texels(&self, _sel: &'static str) -> &rt::Texture {
+        if let Some(surface) = &self.surface {
+            surface.refresh();
+            capture_wallpaper_surface(
+                surface,
+                self as *const Self as usize as u64,
+                self.raw.gpu_resource_id().0,
+                plain(|| self.raw.width()),
+                plain(|| self.raw.height()),
+                plain(|| self.raw.pixel_format()),
+                "use",
+            );
+        }
+        if let Some(Under::Buffer(buffer, _)) = &self.under {
+            if let Some(surface) = &buffer.surface {
+                surface.refresh();
+            }
+        }
         &self.raw
+    }
+
+    /// Marks the underlying surface (or buffer's surface) as GPU-written.
+    pub fn mark_gpu_written(&self) {
+        if let Some(surface) = &self.surface {
+            surface.refresh();
+            surface.mark_gpu_written();
+            schedule_wallpaper_surface_captures(
+                surface,
+                self as *const Self as usize as u64,
+                self.raw.gpu_resource_id().0,
+                plain(|| self.raw.width()),
+                plain(|| self.raw.height()),
+                plain(|| self.raw.pixel_format()),
+            );
+        }
+        if let Some(Under::Buffer(buffer, _)) = &self.under {
+            buffer.mark_gpu_written();
+        }
+    }
+
+    /// The texture's usage flags.
+    pub fn usage(&self) -> u64 {
+        if self.gpu_read_only() {
+            return self.private_usage;
+        }
+        u64::from(plain(|| self.raw.usage()).as_raw()) | self.private_usage
     }
 
     /// The runtime's texture, for `sel`, a blit or a CPU access that reads or writes its texels,
@@ -400,6 +462,304 @@ impl TextureObject {
     pub fn kept(&self, _sel: &'static str) -> &rt::Texture {
         &self.raw
     }
+}
+
+/// Whether `surface` is a full-size 4-byte wallpaper backing in either channel order.
+fn is_wallpaper_surface(surface: &OsSurface) -> bool {
+    matches!(
+        surface.pixel_format(),
+        format if format == u32::from_be_bytes(*b"RGBA")
+            || format == u32::from_be_bytes(*b"BGRA")
+    )
+}
+
+/// A compact lineage record for an image large enough to contain the guest wallpaper.
+pub(crate) fn wallpaper_texture_lineage(texture: &VulkanTexture) -> String {
+    let object = &**texture;
+    let (width, height, format) = (
+        plain(|| object.raw.width()),
+        plain(|| object.raw.height()),
+        plain(|| object.raw.pixel_format()),
+    );
+    let backing = match (&object.surface, &object.under) {
+        (Some(surface), under) => format!(
+            "surface={:#x}/fourcc={:#x}/{}x{}/pitch={}/plane={:?} under={}",
+            surface.id().0,
+            surface.pixel_format(),
+            surface.width(),
+            surface.height(),
+            surface.bytes_per_row(),
+            object.plane,
+            match under {
+                Some(Under::Buffer(buffer, range)) => format!(
+                    "buffer={:#x}[{:#x}..{:#x}]",
+                    buffer.id().0,
+                    range.start,
+                    range.end
+                ),
+                Some(Under::Heap(heap, range)) => format!(
+                    "heap={:#x}[{:#x}..{:#x}]",
+                    heap.id().0,
+                    range.start,
+                    range.end
+                ),
+                None => "none".to_owned(),
+            }
+        ),
+        (None, Some(Under::Buffer(buffer, range))) => format!(
+            "buffer={:#x}[{:#x}..{:#x}] buffer_surface={:?}",
+            buffer.id().0,
+            range.start,
+            range.end,
+            buffer.surface.as_ref().map(|surface| (
+                surface.id().0,
+                surface.pixel_format(),
+                surface.width(),
+                surface.height(),
+                surface.bytes_per_row(),
+            )),
+        ),
+        (None, Some(Under::Heap(heap, range))) => {
+            format!(
+                "heap={:#x}[{:#x}..{:#x}]",
+                heap.id().0,
+                range.start,
+                range.end
+            )
+        }
+        (None, None) => "image-owned".to_owned(),
+    };
+    format!(
+        "object_id={:#x} resource_id={:#x} size={}x{} format={format:?} storage={:?} {backing}",
+        texture.id().0,
+        object.raw.gpu_resource_id().0,
+        width,
+        height,
+        plain(|| object.raw.storage_mode())
+    )
+}
+
+/// A bounded diagnostic of the guest bytes behind the wallpaper IOSurface.
+/// Enabled only with `REIMS_VGPU_CAPTURE_DIR`; it runs after surface refresh at texture use.
+fn capture_wallpaper_surface(
+    surface: &OsSurface,
+    texture_object_id: u64,
+    texture_id: u64,
+    texture_width: u64,
+    texture_height: u64,
+    texture_format: PixelFormat,
+    stage: &str,
+) {
+    if std::env::var_os("REIMS_VGPU_CAPTURE_DIR").is_none()
+        || texture_width < 3840
+        || texture_height < 2160
+        || surface.width() < 3840
+        || surface.height() < 2160
+        || !is_wallpaper_surface(surface)
+    {
+        return;
+    }
+    static CAPTURES: AtomicU64 = AtomicU64::new(0);
+    static INITIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if stage == "use" && INITIAL.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let capture = CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if capture >= 3 {
+        return;
+    }
+    let (width, height, pitch, alloc_size) = (
+        surface.width(),
+        surface.height(),
+        surface.bytes_per_row(),
+        surface.alloc_size(),
+    );
+    let Some(row_bytes) = width.checked_mul(4) else {
+        return;
+    };
+    let Some(total) = pitch.checked_mul(height) else {
+        return;
+    };
+    let (Ok(width), Ok(height), Ok(pitch), Ok(total), Ok(row_bytes)) = (
+        usize::try_from(width),
+        usize::try_from(height),
+        usize::try_from(pitch),
+        usize::try_from(total),
+        usize::try_from(row_bytes),
+    ) else {
+        return;
+    };
+    let base = surface.base_address();
+    if base.is_null() || pitch < row_bytes || total as u64 > alloc_size || total > 128 * 1024 * 1024
+    {
+        return;
+    }
+    let mut rows = vec![0u8; total];
+    // IOSurfaceGetBaseAddress is valid for the lifetime of the retained surface, and refresh()
+    // above has synchronized guest pages before this bounded read.
+    unsafe {
+        std::ptr::copy_nonoverlapping(base.as_ptr::<u8>(), rows.as_mut_ptr(), total);
+    }
+    let Some(packed_len) = width.checked_mul(height).and_then(|v| v.checked_mul(4)) else {
+        return;
+    };
+    let mut pixels = vec![0u8; packed_len];
+    for y in 0..height {
+        let src = y * pitch;
+        let dst = y * width * 4;
+        pixels[dst..dst + row_bytes].copy_from_slice(&rows[src..src + row_bytes]);
+    }
+    // IOSurface 'BGRA' backing is stored B,G,R,A while PAM RGB_ALPHA expects R,G,B,A.
+    if surface.pixel_format() == u32::from_be_bytes(*b"BGRA") {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    let dir = std::path::PathBuf::from(std::env::var_os("REIMS_VGPU_CAPTURE_DIR").unwrap());
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let header = format!(
+        "P7\n# capture={capture} stage={stage} texture_object_id={texture_object_id:#x} texture_id={texture_id:#x} surface_id={:#x} texture_format={texture_format:?} surface_format={:#x} pitch={pitch}\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+        surface.id().0,
+        surface.pixel_format(),
+    );
+    let mut pam = header.into_bytes();
+    pam.extend_from_slice(&pixels);
+    let path = dir.join(format!(
+        "{}-wallpaper-surface-{capture:02}-{stage}-object-{texture_object_id:x}-texture-{texture_id:x}-surface-{:x}.pam",
+        std::process::id(),
+        surface.id().0,
+    ));
+    if let Err(error) = std::fs::write(&path, pam) {
+        log::warn!(
+            "wallpaper surface capture {} failed: {error}",
+            path.display()
+        );
+    } else {
+        log::info!("wallpaper surface capture {}", path.display());
+    }
+}
+
+/// Capture the same candidate surface after the GPU has had time to finish its first writes.
+/// The immediate texture-use snapshot above is intentionally too early to judge a render target.
+fn schedule_wallpaper_surface_captures(
+    surface: &Arc<OsSurface>,
+    texture_object_id: u64,
+    texture_id: u64,
+    texture_width: u64,
+    texture_height: u64,
+    texture_format: PixelFormat,
+) {
+    if std::env::var_os("REIMS_VGPU_CAPTURE_DIR").is_none()
+        || texture_width < 3840
+        || texture_height < 2160
+        || surface.width() < 3840
+        || surface.height() < 2160
+        || !is_wallpaper_surface(surface)
+    {
+        return;
+    }
+    static SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let surface = Arc::clone(surface);
+    let _ = std::thread::Builder::new()
+        .name("reims-wallpaper-probe".into())
+        .spawn(move || {
+            for delay in [250, 1000] {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                surface.refresh();
+                capture_wallpaper_surface(
+                    &surface,
+                    texture_object_id,
+                    texture_id,
+                    texture_width,
+                    texture_height,
+                    texture_format,
+                    if delay == 250 {
+                        "after-250ms"
+                    } else {
+                        "after-1000ms"
+                    },
+                );
+            }
+        });
+}
+
+/// Capture the 4K texture sampled by the guest's background shaders. For `Storage::Shadow`, the
+/// runtime may expose the shadow buffer's backing bytes here rather than its private GPU image;
+/// the logged storage mode and lineage make that distinction explicit.
+pub(crate) fn capture_sampled_wallpaper_texture(texture: &VulkanTexture) {
+    if std::env::var_os("REIMS_VGPU_CAPTURE_DIR").is_none()
+        || plain(|| texture.raw.width()) < 3840
+        || plain(|| texture.raw.height()) < 2160
+    {
+        return;
+    }
+    let format = plain(|| texture.raw.pixel_format());
+    if !matches!(format, PixelFormat::RGBA16Unorm | PixelFormat::RGBA16Float) {
+        return;
+    }
+    static CAPTURES: AtomicU64 = AtomicU64::new(0);
+    let capture = CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if capture >= 2 {
+        return;
+    }
+    let raw = texture.raw.clone();
+    let texture_id = texture.raw.gpu_resource_id().0;
+    let lineage = wallpaper_texture_lineage(texture);
+    let width = plain(|| raw.width());
+    let height = plain(|| raw.height());
+    let row_bytes = width.saturating_mul(8);
+    let byte_count = row_bytes.saturating_mul(height);
+    let (Ok(width_usize), Ok(height_usize), Ok(byte_count_usize)) = (
+        usize::try_from(width),
+        usize::try_from(height),
+        usize::try_from(byte_count),
+    ) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(std::env::var_os("REIMS_VGPU_CAPTURE_DIR").unwrap());
+    let _ = std::thread::Builder::new()
+        .name("reims-background-texture-probe".into())
+        .spawn(move || {
+            let mut bytes = vec![0u8; byte_count_usize];
+            match raw.get_bytes(
+                &mut bytes,
+                row_bytes,
+                0,
+                rt::Region::new_2d(0, 0, width, height),
+                0,
+                0,
+            ) {
+                Ok(()) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = dir.join(format!(
+                        "{}-sampled-background-{capture:02}-texture-{texture_id:x}-{}x{}-{format:?}.rgba16",
+                        std::process::id(), width_usize, height_usize
+                    ));
+                    if let Err(error) = std::fs::write(&path, bytes) {
+                        log::warn!("background texture readback {} failed: {error}", path.display());
+                    } else {
+                        log::info!(
+                            "background texture storage snapshot {} storage={:?}",
+                            path.display(),
+                            plain(|| raw.storage_mode())
+                        );
+                        log::info!(
+                            "background texture snapshot id={texture_id:#x} format={format:?} size={}x{} lineage={lineage}",
+                            width_usize,
+                            height_usize,
+                        );
+                    }
+                }
+                Err(error) => log::warn!(
+                    "background texture GPU readback failed for {format:?} {width}x{height}: {error}"
+                ),
+            }
+        });
 }
 
 /// A runtime heap, with the device that made it.
@@ -576,6 +936,326 @@ impl Alone {
                 self.reason()
             ),
         )
+    }
+}
+
+/// Captures the background shader's source and render target after the command buffer that uses
+/// them has completed. The earlier asynchronous `get_bytes` snapshot can race pending GPU writes.
+pub(crate) fn capture_background_after_completion(
+    command_buffer: &VulkanCommandBuffer,
+    source: &VulkanTexture,
+    target: &VulkanTexture,
+    pipeline_id: u64,
+) {
+    if std::env::var_os("REIMS_VGPU_CAPTURE_DIR").is_none()
+        || plain(|| source.raw.width()) < 3840
+        || plain(|| source.raw.height()) < 2160
+    {
+        return;
+    }
+    static SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+
+    let source_raw = source.raw.clone();
+    let target_raw = target.raw.clone();
+    let source_lineage = wallpaper_texture_lineage(source);
+    let target_lineage = wallpaper_texture_lineage(target);
+    let source_object_id = source.id().0;
+    let target_object_id = target.id().0;
+    let dir = std::path::PathBuf::from(std::env::var_os("REIMS_VGPU_CAPTURE_DIR").unwrap());
+    let pid = std::process::id();
+    log::info!(
+        "wallpaper completion readback scheduled: pipeline={pipeline_id} source={source_lineage} target={target_lineage}"
+    );
+
+    if let Err(error) = command_buffer.add_completed_handler(
+        OnFault::Die,
+        Box::new(move |info| {
+            if info.status != CommandBufferStatus::COMPLETED || info.error.is_some() {
+                log::warn!(
+                    "wallpaper completed readback skipped: status={:?} error={:?}",
+                    info.status,
+                    info.error
+                );
+                return;
+            }
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+
+            for (label, raw, object_id, lineage) in [
+                ("sampled-source", source_raw, source_object_id, source_lineage),
+                (
+                    "background-target",
+                    target_raw,
+                    target_object_id,
+                    target_lineage,
+                ),
+            ] {
+                let (width, height, format) = (
+                    plain(|| raw.width()),
+                    plain(|| raw.height()),
+                    plain(|| raw.pixel_format()),
+                );
+                if !matches!(format, PixelFormat::RGBA16Unorm | PixelFormat::RGBA16Float) {
+                    log::warn!(
+                        "wallpaper completed readback skipped {label}: unsupported {format:?}"
+                    );
+                    continue;
+                }
+                let Some(row_bytes) = width.checked_mul(8) else {
+                    continue;
+                };
+                let Some(byte_count) = row_bytes.checked_mul(height) else {
+                    continue;
+                };
+                let (Ok(width_usize), Ok(height_usize), Ok(byte_count_usize)) = (
+                    usize::try_from(width),
+                    usize::try_from(height),
+                    usize::try_from(byte_count),
+                ) else {
+                    continue;
+                };
+                if byte_count_usize > 128 * 1024 * 1024 {
+                    continue;
+                }
+                let mut bytes = vec![0u8; byte_count_usize];
+                match raw.get_bytes(
+                    &mut bytes,
+                    row_bytes,
+                    0,
+                    rt::Region::new_2d(0, 0, width, height),
+                    0,
+                    0,
+                ) {
+                    Ok(()) => {
+                        let texture_id = raw.gpu_resource_id().0;
+                        let path = dir.join(format!(
+                            "{pid}-background-completed-{label}-pipeline-{pipeline_id}-object-{object_id:x}-texture-{texture_id:x}-{width_usize}x{height_usize}-{format:?}.rgba16"
+                        ));
+                        match std::fs::write(&path, bytes) {
+                            Ok(()) => log::info!(
+                                "wallpaper completed readback {label}: pipeline={pipeline_id} {lineage} path={}",
+                                path.display()
+                            ),
+                            Err(error) => log::warn!(
+                                "wallpaper completed readback {} failed: {error}",
+                                path.display()
+                            ),
+                        }
+                    }
+                    Err(error) => log::warn!(
+                        "wallpaper completed readback {label} failed: {error}"
+                    ),
+                }
+            }
+        }),
+    ) {
+        log::warn!("wallpaper completion handler refused: {error}");
+    }
+}
+
+/// Captures selected guest render-pass colour targets after their command buffer completes.
+/// This is an opt-in probe for comparing glass/shadow shader output with the final display frame.
+pub(crate) fn capture_pipeline_target_after_completion(
+    command_buffer: &VulkanCommandBuffer,
+    target: &VulkanTexture,
+    pipeline_id: u64,
+    stages: &str,
+    attachment: usize,
+) {
+    let Some(capture_dir) = std::env::var_os("REIMS_VGPU_CAPTURE_DIR") else {
+        return;
+    };
+    let Some(selection) = std::env::var_os("REIMS_VGPU_CAPTURE_PIPELINES") else {
+        return;
+    };
+    let selection = selection.to_string_lossy();
+    if !selection
+        .split(',')
+        .map(str::trim)
+        .filter(|needle| !needle.is_empty())
+        .any(|needle| stages.contains(needle))
+    {
+        return;
+    }
+
+    let width = plain(|| target.raw.width());
+    let height = plain(|| target.raw.height());
+    let format = plain(|| target.raw.pixel_format());
+    let bytes_per_pixel = match format {
+        PixelFormat::RGBA16Unorm | PixelFormat::RGBA16Float => 8,
+        PixelFormat::RGBA8Unorm
+        | PixelFormat::BGRA8Unorm
+        | PixelFormat::RG16Uint
+        | PixelFormat::RG16Sint
+        | PixelFormat::RG16Float
+        | PixelFormat::R32Uint
+        | PixelFormat::R32Sint
+        | PixelFormat::R32Float => 4,
+        _ => {
+            log::info!("render-target probe skipped unsupported format: {format:?}");
+            return;
+        }
+    };
+    let Some(row_bytes) = width.checked_mul(bytes_per_pixel) else {
+        return;
+    };
+    let Some(byte_count) = row_bytes.checked_mul(height) else {
+        return;
+    };
+    let (Ok(width_usize), Ok(height_usize), Ok(byte_count_usize)) = (
+        usize::try_from(width),
+        usize::try_from(height),
+        usize::try_from(byte_count),
+    ) else {
+        return;
+    };
+    if byte_count_usize == 0 || byte_count_usize > 128 * 1024 * 1024 {
+        return;
+    }
+
+    // Give each shader/target shape its own quota: a frequently used small mask must not
+    // consume every capture before the guest creates the full-size blur and outline passes.
+    static QUOTAS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, u8>>> =
+        std::sync::OnceLock::new();
+    static CAPTURED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let key = format!("{stages}/{attachment}/{width}x{height}/{format:?}");
+    let Ok(mut quotas) = QUOTAS.get_or_init(Default::default).lock() else {
+        return;
+    };
+    if quotas.len() >= 64 && !quotas.contains_key(&key) {
+        return;
+    }
+    let count = quotas.entry(key).or_default();
+    if *count >= 2 {
+        return;
+    }
+    if CAPTURED_BYTES
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| {
+                total
+                    .checked_add(byte_count)
+                    .filter(|&next| next <= 256 * 1024 * 1024)
+            },
+        )
+        .is_err()
+    {
+        return;
+    }
+    *count += 1;
+    drop(quotas);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Copy immediately after this render pass, in command-buffer order. A completion-time read
+    // of the target itself can observe a later pass that reused the same texture.
+    let buffer = match target
+        .device
+        .new_buffer_of_length(OnFault::Return, byte_count, 0)
+    {
+        Ok(Some(buffer)) => buffer,
+        Ok(None) => {
+            log::warn!("render-target probe could not allocate {byte_count} bytes");
+            return;
+        }
+        Err(error) => {
+            log::warn!("render-target probe buffer allocation failed: {error}");
+            return;
+        }
+    };
+    let blit = match command_buffer.blit_encoder(OnFault::Return) {
+        Ok(Some(blit)) => blit,
+        Ok(None) => {
+            log::warn!("render-target probe could not create blit encoder");
+            return;
+        }
+        Err(error) => {
+            log::warn!("render-target probe blit encoder failed: {error}");
+            return;
+        }
+    };
+    if let Err(error) = blit.encode(
+        OnFault::Return,
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: target,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(width, height, 1),
+            destination_buffer: &buffer,
+            destination_offset: 0,
+            destination_bytes_per_row: row_bytes,
+            destination_bytes_per_image: byte_count,
+        },
+    ) {
+        log::warn!("render-target probe copy failed: {error}");
+        let _ = blit.encode(OnFault::Return, BlitCmd::EndEncoding);
+        return;
+    }
+    if let Err(error) = blit.encode(OnFault::Return, BlitCmd::EndEncoding) {
+        log::warn!("render-target probe end encoding failed: {error}");
+        return;
+    }
+
+    let lineage = wallpaper_texture_lineage(target);
+    let object_id = target.id().0;
+    let stages = stages.to_owned();
+    let dir = std::path::PathBuf::from(capture_dir);
+    let pid = std::process::id();
+    log::info!(
+        "render-target ordered snapshot scheduled: pipeline={pipeline_id} sequence={sequence} attachment={attachment} stages={stages} {lineage}"
+    );
+
+    if let Err(error) = command_buffer.add_completed_handler(
+        OnFault::Die,
+        Box::new(move |info| {
+            if info.status != CommandBufferStatus::COMPLETED || info.error.is_some() {
+                log::warn!(
+                    "render-target readback skipped: pipeline={pipeline_id} sequence={sequence} status={:?} error={:?}",
+                    info.status,
+                    info.error
+                );
+                return;
+            }
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+            let contents = buffer.contents();
+            if contents.is_null() {
+                log::warn!("render-target probe buffer has no host contents");
+                return;
+            }
+            // SAFETY: this shared buffer is retained by the completion handler, and the
+            // command-buffer completion above guarantees its GPU copy has finished.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(contents.as_ptr::<u8>(), byte_count_usize).to_vec()
+            };
+            let safe_stages: String = stages
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() || "-_".contains(ch) { ch } else { '_' })
+                .take(120)
+                .collect();
+            let path = dir.join(format!(
+                "{pid}-pipeline-{pipeline_id}-{sequence}-attachment-{attachment}-{safe_stages}-object-{object_id:x}-{width_usize}x{height_usize}-{format:?}.raw"
+            ));
+            match std::fs::write(&path, bytes) {
+                Ok(()) => log::info!(
+                    "render-target ordered snapshot pipeline={pipeline_id} sequence={sequence} attachment={attachment} stages={stages} {lineage} path={}",
+                    path.display()
+                ),
+                Err(error) => log::warn!(
+                    "render-target snapshot {} failed: {error}",
+                    path.display()
+                ),
+            }
+        }),
+    ) {
+        log::warn!("render-target probe completion handler refused: {error}");
     }
 }
 
@@ -1271,6 +1951,9 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// range past the buffer, as Metal's validation refuses it. A range whose end passes
     /// `u64::MAX` dies.
     fn did_modify_range(&self, _on: OnFault, range: NsRange) -> RaiseResult<()> {
+        if let Some(surface) = &self.surface {
+            surface.sync_to_guest();
+        }
         let sel = "didModifyRange:";
         let range = crate::gpu::range(range)
             .unwrap_or_else(|| unrepresentable(sel, &format!("the range {range:?}")));
@@ -1341,6 +2024,12 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         let sel = "newTextureWithDescriptor:offset:bytesPerRow:";
         let fields = descriptor.fields();
         let mut desc = fields.descriptor(sel, Maker::Other);
+        // DIAG(boot-tile): textures over buffers (the boot screen's corner tile?).
+        log::warn!(
+            target: "reims_vgpu_core::boot_tile",
+            "buffer texture {}x{} format {:?} at offset {offset:#x} bpr {bytes_per_row} of a {:#x}-byte buffer",
+            desc.width, desc.height, desc.pixel_format, self.raw.length()
+        );
         // As the linear texture's.
         let answered = match self.gpu_read_only() && fields.formatless().is_none() {
             true => read_only_usage(&mut desc),
@@ -1371,22 +2060,24 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         read_only: bool,
     ) -> RaiseResult<bool> {
         let length = plain(|| self.raw.length());
-        self.backing
-            .replace(&ranges.ranges, read_only, length, length, |first, keep| {
-                send(REPLACE, Policy::Dies, || {
-                    // SAFETY: the alias is mapped and readable; a read-only one only the GPU
-                    // writes, whose writes this host's GPU drops (`backing`'s docs), and any
-                    // other is writable. It stays mapped, with the same pages, until its
-                    // keep-alive is dropped, as nothing else frees or remaps it.
-                    unsafe {
-                        (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
-                            None,
-                            Some(keep),
-                        )
-                    }
+        crate::gpu::timing::host_bytes("buffer replace (gather + rebind)", length, || {
+            self.backing
+                .replace(&ranges.ranges, read_only, length, length, |first, keep| {
+                    send(REPLACE, Policy::Dies, || {
+                        // SAFETY: the alias is mapped and readable; a read-only one only the GPU
+                        // writes, whose writes this host's GPU drops (`backing`'s docs), and any
+                        // other is writable. It stays mapped, with the same pages, until its
+                        // keep-alive is dropped, as nothing else frees or remaps it.
+                        unsafe {
+                            self.raw.rebind_bytes_no_copy(
+                                rt::HostMemory::new(first),
+                                None,
+                                Some(keep),
+                            )
+                        }
+                    })
                 })
-            })
+        })
     }
 }
 
@@ -1834,10 +2525,7 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// ([`TextureObject::private_usage`]); for one whose GPU writes never reach its memory, whose
     /// runtime texture is made of another usage, its whole usage alone ([`read_only_usage`]).
     fn usage(&self) -> u64 {
-        if self.gpu_read_only() {
-            return self.private_usage;
-        }
-        u64::from(plain(|| self.raw.usage()).as_raw()) | self.private_usage
+        TextureObject::usage(self)
     }
 
     fn width(&self) -> u64 {
@@ -2145,11 +2833,8 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                     // SAFETY: as a buffer's, for the heap's size; the alias starts on a page,
                     // which is the runtime's import unit on this host.
                     unsafe {
-                        (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
-                            None,
-                            Some(keep),
-                        )
+                        self.raw
+                            .rebind_bytes_no_copy(rt::HostMemory::new(first), None, Some(keep))
                     }
                 })
             },
@@ -2516,6 +3201,99 @@ pub(crate) mod tests {
             assert!(made.is_none(), "{length}");
         }
         b.set_label("reims-vgpu.test").unwrap();
+    }
+
+    /// The Windows guest-RAM→Vulkan bridge, end to end on this GPU. A region the host already
+    /// mapped (`VirtualAlloc`, standing in for WHPX guest RAM) is leased by its host VA
+    /// (`fd: None`) — the bridge's own plumbing — then imported into a GPU buffer through
+    /// `new_buffer_over_host_memory` (`VK_EXT_external_memory_host`).
+    ///
+    /// This asserts the import SUCCEEDS: the leased host pointer is imported by the RTX 4060 and
+    /// the buffer answers that pointer as its contents. It FAILS if the runtime aborts or refuses
+    /// the import (e.g. the pre-port `host_page()==None` → `Unsupported(HostMemory,NotImplemented)`
+    /// path). The buffer is kept until after the import is checked, then released.
+    /// Ignored by default: it builds a device and talks to the GPU; run manually on the host.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "builds a device and imports host memory on the GPU: run manually on the host"]
+    fn bridge_leases_host_va_and_runtime_import_is_the_only_gap() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let d = dev();
+        let len: usize = 2 * 1024 * 1024;
+        // SAFETY: a fresh committed read-write region owned here; freed at the end.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null(), "VirtualAlloc failed");
+        let host = base as u64;
+        // The bridge: lease it as the C API would under WHPX — no backing object, host VA only.
+        let lease = crate::os::lease_guest_memory([crate::os::GuestRamFile {
+            host,
+            length: len as u64,
+            fd: None,
+            offset: 0,
+        }]);
+        // Import a sub-range into a GPU buffer (the apple-gfx no-copy path). The runtime may abort
+        // on an unported host_page(); catch_death turns that into a failure, not a crash.
+        use reims_vgpu_core::testkit::capture::catch_death;
+        // SAFETY: the region outlives the buffer (freed after it drops, below).
+        let bytes =
+            unsafe { HostRange::new(HostPtr::from_ptr((host + 0x4000) as *mut u8), 0x1000) };
+        let caught = catch_death(|| {
+            match d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, None) {
+                Ok(Some(b)) => {
+                    // The buffer must answer the imported host pointer and length, and must stay
+                    // valid here, before it is released at the end of this closure.
+                    let contents = b.contents();
+                    let length = b.length();
+                    let matches_ptr = contents == bytes.ptr();
+                    drop(b);
+                    Some((length, matches_ptr))
+                }
+                _ => None,
+            }
+        });
+        let imported = match &caught {
+            Ok(Some((length, matches_ptr))) => {
+                println!(
+                    "bridge: IMPORTED leased host VA {host:#x} into a GPU buffer; length={length} contents==host_ptr:{matches_ptr}"
+                );
+                assert_eq!(
+                    *length, 0x1000,
+                    "the buffer's length is the imported length"
+                );
+                assert!(
+                    *matches_ptr,
+                    "the buffer's contents is the imported host pointer"
+                );
+                true
+            }
+            Ok(None) => {
+                println!("bridge: REFUSED (runtime returned Ok(None)/Err)");
+                false
+            }
+            Err(site) => {
+                println!(
+                    "bridge: ABORTED by the runtime: {:?} @ {}",
+                    site.kind, site.file
+                );
+                false
+            }
+        };
+        drop(lease);
+        // SAFETY: the region this test reserved; the buffer was released inside the closure.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+        assert!(
+            imported,
+            "the RTX 4060 did not import the leased host VA — bridge not proven live"
+        );
     }
 
     /// A no-copy buffer's contents are the memory, at any offset into a page; its deallocator

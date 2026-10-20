@@ -19,14 +19,16 @@ pub const FRAGMENT_FUNCTION_GAMMA_COLOR_MATRIX: &str =
 /// The pipeline label.
 pub const PIPELINE_LABEL: &str = "reims-vgpu.display-present";
 
-/// Which pipeline: the render target's pixel format, and whether it applies the gamma table and
-/// the colour matrix.
+/// Which pipeline: the render target's pixel format, whether it applies the gamma table and
+/// the colour matrix, and whether source-over alpha blending is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PipelineKey {
     /// The render target's `MTLPixelFormat`.
     pub format: u64,
     /// Whether the gamma table and the colour matrix apply.
     pub gamma: bool,
+    /// Whether source-over alpha blending is enabled.
+    pub blend: bool,
 }
 
 /// A display's render pipelines.
@@ -102,6 +104,7 @@ impl<P: Platform> DisplayPipelineCache<P> {
                 },
                 color0_pixel_format: key.format,
                 resource_index: None,
+                blend_source_over: key.blend,
             })
             .ok()
             .flatten();
@@ -234,6 +237,7 @@ mod tests {
                 },
                 color0_pixel_format: key.format,
                 resource_index: None,
+                blend_source_over: key.blend,
             }
         }
 
@@ -247,6 +251,7 @@ mod tests {
             let key = PipelineKey {
                 format: 80,
                 gamma: true,
+                blend: false,
             };
             let m = p.call_log().mark();
             let a = c.pipeline_for(key).unwrap();
@@ -268,16 +273,41 @@ mod tests {
             let with = PipelineKey {
                 format: 80,
                 gamma: true,
+                blend: false,
             };
             let without = PipelineKey {
                 format: 80,
                 gamma: false,
+                blend: false,
             };
             let a = c.pipeline_for(with).unwrap();
             let m = p.call_log().mark();
             let b = c.pipeline_for(without).unwrap();
             let made = p.call_log().since(m);
             assert_eq!(made[0].args, vec![Arg::val(&desc(&c, without))]);
+            assert_ne!(a.id(), b.id());
+        }
+
+        /// Blended pipelines pass blend_source_over: true and are keyed separately.
+        #[test]
+        fn blending_uses_source_over() {
+            let p = FakePlatform::new();
+            let c = cache(&p);
+            let unblended = PipelineKey {
+                format: 80,
+                gamma: false,
+                blend: false,
+            };
+            let blended = PipelineKey {
+                format: 80,
+                gamma: false,
+                blend: true,
+            };
+            let a = c.pipeline_for(unblended).unwrap();
+            let m = p.call_log().mark();
+            let b = c.pipeline_for(blended).unwrap();
+            let made = p.call_log().since(m);
+            assert_eq!(made[0].args, vec![Arg::val(&desc(&c, blended))]);
             assert_ne!(a.id(), b.id());
         }
 
@@ -289,6 +319,7 @@ mod tests {
             let key = PipelineKey {
                 format: 124,
                 gamma: false,
+                blend: false,
             };
             p.script().push(
                 "newRenderPipelineStateWithDescriptor:error:",

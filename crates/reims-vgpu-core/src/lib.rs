@@ -32,6 +32,7 @@
 // `deserializer/deserializer.rs`.
 #![allow(clippy::module_inception)]
 
+pub mod cmdhash;
 pub mod collections;
 pub mod deserializer;
 pub mod device;
@@ -44,11 +45,13 @@ pub mod iosurface;
 pub mod logging;
 pub mod memory;
 pub mod num;
+pub mod perfstats;
 pub mod platform;
 pub mod process;
 pub mod raise;
 pub mod resources;
 pub mod rt;
+pub mod sampler;
 pub mod seams;
 pub mod sync;
 pub mod tasks;

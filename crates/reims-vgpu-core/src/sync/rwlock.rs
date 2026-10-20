@@ -35,9 +35,60 @@ pub struct ReadGuard<'a, T = ()> {
 /// A unique guard.
 pub type WriteGuard<'a, T = ()> = parking_lot::RwLockWriteGuard<'a, T>;
 
+/// The table of a thread's reads: a fixed array, with no destructor, so its thread-local needs no
+/// destructor registration, which on the Windows GNU target runs a fence and atomics at every
+/// access (measured hot in a profile of the decode threads). A thread holds reads of a handful of
+/// locks at most; past [`Reads::CAP`] the read is counted nowhere and taken as a first read.
+pub(crate) struct Reads {
+    slots: [(usize, u32); Reads::CAP],
+    len: usize,
+}
+
+impl Reads {
+    const CAP: usize = 16;
+
+    const fn new() -> Reads {
+        Reads {
+            slots: [(0, 0); Reads::CAP],
+            len: 0,
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (usize, u32)> {
+        self.slots[..self.len].iter()
+    }
+
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, (usize, u32)> {
+        self.slots[..self.len].iter_mut()
+    }
+
+    fn get_mut(&mut self, i: usize) -> Option<&mut (usize, u32)> {
+        self.slots[..self.len].get_mut(i)
+    }
+
+    fn push(&mut self, entry: (usize, u32)) {
+        if self.len < Self::CAP {
+            self.slots[self.len] = entry;
+            self.len += 1;
+        }
+    }
+
+    fn swap_remove(&mut self, i: usize) {
+        if i < self.len {
+            self.len -= 1;
+            self.slots[i] = self.slots[self.len];
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 thread_local! {
     /// The locks this thread holds reads of, by address, with how many reads of each.
-    static READS: RefCell<Vec<(usize, u32)>> = const { RefCell::new(Vec::new()) };
+    static READS: RefCell<Reads> = const { RefCell::new(Reads::new()) };
 }
 
 impl<T> WriterPrefRwLock<T> {
@@ -78,6 +129,83 @@ impl<T> WriterPrefRwLock<T> {
     /// A unique hold if the lock is free and no writer is queued.
     pub fn try_write(&self) -> Option<WriteGuard<'_, T>> {
         self.inner.try_write()
+    }
+}
+
+/// A read of a [`WriterPrefRwLock`] taken on one thread and handed to another, which adopts it
+/// ([`WriterPrefRwLock::adopt`]) and releases it there. Taken as a nested read of a read the
+/// taking thread holds, it never waits; adopted, the adopting thread's own reads of the lock are
+/// nested reads, which pass a queued writer, so the adopting thread never waits for the lock.
+/// Dropped unadopted, it is released where it drops.
+pub struct HandedRead {
+    /// The lock's key; the release goes through `release`.
+    key: usize,
+    /// Releases the read: the lock's `force_unlock_read`.
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for HandedRead {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+/// An adopted [`HandedRead`]: counted as the thread's read until it drops, then released.
+pub struct AdoptedRead<'a, T = ()> {
+    _lock: &'a WriterPrefRwLock<T>,
+    handed: HandedRead,
+}
+
+impl<T> Drop for AdoptedRead<'_, T> {
+    fn drop(&mut self) {
+        let key = self.handed.key;
+        READS.with_borrow_mut(|reads| {
+            if let Some(i) = reads.iter().position(|&(k, _)| k == key)
+                && let Some((_, n)) = reads.get_mut(i)
+            {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    reads.swap_remove(i);
+                }
+            }
+        });
+        // `handed` drops after: the read is released.
+    }
+}
+
+impl<T: Send + Sync + 'static> WriterPrefRwLock<T> {
+    /// A nested read of the read `held` (this thread's), handed on ([`HandedRead`]). The lock
+    /// must outlive the handed read: its owner travels with it.
+    #[allow(unsafe_code)] // the release of the read it forgot, on the adopting thread
+    pub fn read_handoff(&self, held: &ReadGuard<'_, T>) -> HandedRead {
+        let _ = held;
+        let guard = self.inner.read_recursive();
+        std::mem::forget(guard);
+        let lock = std::ptr::from_ref(self).expose_provenance();
+        HandedRead {
+            key: self.key(),
+            release: Some(Box::new(move || {
+                // The read `read_handoff` took and forgot. The owner keeps the lock alive to here.
+                let lock = std::ptr::with_exposed_provenance::<WriterPrefRwLock<T>>(lock);
+                unsafe { (*lock).inner.force_unlock_read() };
+            })),
+        }
+    }
+
+    /// Adopts `handed` as this thread's read of the lock, until the result drops.
+    pub fn adopt(&self, handed: HandedRead) -> AdoptedRead<'_, T> {
+        assert_eq!(handed.key, self.key(), "a read handed from another lock");
+        let key = self.key();
+        READS.with_borrow_mut(|reads| match reads.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n = n.saturating_add(1),
+            None => reads.push((key, 1)),
+        });
+        AdoptedRead {
+            _lock: self,
+            handed,
+        }
     }
 }
 
@@ -169,7 +297,7 @@ mod tests {
         assert!(wrote.load(Ordering::SeqCst));
         assert!(l.try_write().is_some());
         // The thread's table is empty again: its next read is a first read.
-        assert!(READS.with_borrow(Vec::is_empty));
+        assert!(READS.with_borrow(Reads::is_empty));
     }
 
     /// Once the thread's reads have ended, its next read is a first read and waits behind a

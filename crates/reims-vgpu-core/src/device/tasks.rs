@@ -81,6 +81,10 @@ impl<P: Platform> DeviceCore<P> {
         length: u64,
         restoring: bool,
     ) -> RaiseResult<()> {
+        // DIAG(empty-entry): rare; a task id defined again would show here twice.
+        log::debug!(
+            "DefineTask: id {task_id} root page {task_root:#x} length {length:#x} restoring {restoring}"
+        );
         if task_id >= MAX_TASKS {
             crate::raise!(
                 DeviceRaise::InvalidTaskId,
@@ -96,7 +100,7 @@ impl<P: Platform> DeviceCore<P> {
                 );
             }
             let host: TaskDeviceLink<P> = self.weak_self.clone();
-            let task = if task_id != 0 && self.caps.process_isolation {
+            let task = if task_id != 0 && self.isolates_guest_tasks() {
                 RemoteTask::launch(
                     &self.platform,
                     host,

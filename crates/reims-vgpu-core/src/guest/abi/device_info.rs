@@ -57,6 +57,16 @@ const _: () = assert!(matches!(
 ));
 const _: () = assert!(matches!(caps::WRITE_ROUNDING_MODES, [1, 2]));
 
+/// Whether the guest is told of the host's Apple GPU families. `REIMS_VGPU_APPLE_FAMILIES=0` says
+/// none, as an Intel Mac's GPU does: an x86 guest told of Apple families takes the device for
+/// Apple silicon, and RenderBox's binary archive then aborts in Metal (`+[MTLLoader
+/// sliceIDForDevice:…]`, no slice for a paravirtual x86 device), crashing iconservicesagent,
+/// Spotlight and the Dock's extras. Read once.
+fn apple_families_reported() -> bool {
+    static REPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPORTED.get_or_init(|| !std::env::var("REIMS_VGPU_APPLE_FAMILIES").is_ok_and(|v| v == "0"))
+}
+
 /// A query's answer as the caps kept it: its value, or its raise thrown again here, where the
 /// writer asks it, as `on` says.
 fn asked<T: Clone>(on: OnFault, kept: &RaiseResult<T>) -> RaiseResult<T> {
@@ -241,7 +251,7 @@ pub fn write_device_info(
         } else {
             0
         };
-        let apple5_supported = asked(on, apple5)?;
+        let apple5_supported = asked(on, apple5)? && apple_families_reported();
         let multisample_array = flags.supports_texture_2d_multisample_array;
         w.put(28, || {
             Ok(dynamic_attribute_stride
@@ -305,7 +315,7 @@ pub fn write_device_info(
                 (MTL_GPU_FAMILY_APPLE7, apple7),
                 (MTL_GPU_FAMILY_APPLE6, apple6),
             ] {
-                if asked(on, kept)? {
+                if asked(on, kept)? && apple_families_reported() {
                     return Ok(family.cast_unsigned().low_u32());
                 }
             }
@@ -324,7 +334,8 @@ pub fn write_device_info(
             (minus_1009, 0x20),
             (apple10, 0x40),
         ] {
-            if asked(on, kept)? {
+            // -1009 is no Apple family: it is told either way.
+            if asked(on, kept)? && (apple_families_reported() || bit == 0x20) {
                 families |= bit;
             }
         }

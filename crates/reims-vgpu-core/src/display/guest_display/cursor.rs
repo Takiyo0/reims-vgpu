@@ -311,6 +311,11 @@ impl<P: Platform> GuestDisplay<P> {
         let l = self.guest_display_mutex.lock();
         // A doorbell while paused dies (testing.md 7.4).
         Self::assert_running(&l);
+        let enabled = self.page(&l).load(sp::ENABLED_INTERRUPTS);
+        let raised = self.page(&l).load(sp::RAISED_INTERRUPTS);
+        if enabled & raised != 0 {
+            self.poke();
+        }
         let keep = self.client_core();
         let Some(c) = keep.as_ref() else {
             return;

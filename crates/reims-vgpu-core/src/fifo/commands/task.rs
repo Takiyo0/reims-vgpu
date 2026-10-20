@@ -35,6 +35,8 @@ pub(super) fn delete_task<P: Platform>(c: &mut Command<'_, P>) {
     c.f_class(|c, _| {
         c.check_size(TASK)?;
         let task_id = c.payload.u32(0);
+        // DIAG(empty-entry): rare.
+        log::debug!("DeleteTask: id {task_id}");
         if !c.device().delete_task_id(task_id)? {
             log::warn!("task {task_id} not deleted: the device refused it");
             raise!(RaiseKind::DeleteTask, format!("task {task_id} not deleted"));
@@ -78,6 +80,8 @@ pub(super) fn delete_object<P: Platform>(c: &mut Command<'_, P>) {
             );
         }
         c.check_size(length)?;
+        // DIAG(empty-entry): which task's objects go, and when.
+        log::debug!("DeleteObject: task {} ({declared:#x} bytes)", p.u32(0));
         let task = c.task(p.u32(0))?;
         task.delete_object_with_serialized_data(hold, p.tail(4).bytes(), c.completion())
     });

@@ -157,6 +157,22 @@ pub fn creation<T>(
     made
 }
 
+/// Runs `call`, a runtime call `sel` that takes `bytes` bytes of host memory (an import of host
+/// pointers, an alias of guest pages), and when the lines are on writes its wall time on the
+/// calling thread with the length: where a guest's mapping of memory waits on the import.
+pub fn host_bytes<T>(sel: &str, bytes: u64, call: impl FnOnce() -> T) -> T {
+    if !on() {
+        return call();
+    }
+    let start = now();
+    let made = call();
+    log::debug!(
+        "{sel}: {:.2} ms over {bytes:#x} bytes of host memory, synchronous on the calling thread",
+        ms(elapsed_since(start)),
+    );
+    made
+}
+
 /// What a render state leaves to its first use, as a creation line says it.
 pub const RENDER_LATER: &str = " (its VkPipelines are made at the draws that first need them)";
 

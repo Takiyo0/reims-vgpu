@@ -28,6 +28,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.153"
 shlex = "2.0.1"
 toml = "1.1.2"
+time = { version = "0.3.55", features = ["local-offset"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Lists the host's Vulkan GPUs; `loaded` opens the Vulkan loader at run time, so the binary
@@ -40,6 +41,9 @@ block2 = "0.6.2"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSData", "NSProgress", "NSObject", "NSArray", "NSRunLoop", "NSDate"] }
 objc2-virtualization = "0.3.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [profile.release]
 debug = "line-tables-only"

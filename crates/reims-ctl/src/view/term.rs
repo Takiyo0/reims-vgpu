@@ -67,42 +67,54 @@ const QUERIES: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
 /// Asks the terminal, on stdout, and reads its answers from stdin, which must be the terminal
 /// in raw mode, for at most `timeout`.
 pub fn query(timeout: Duration) -> Caps {
-    let mut out = std::io::stdout();
-    if out.write_all(QUERIES).and_then(|_| out.flush()).is_err() {
+    #[cfg(windows)]
+    {
+        // Crossterm consumes terminal query replies on Windows. Use half-block rendering unless
+        // the user explicitly selects a terminal graphics protocol.
+        let _ = timeout;
         return Caps::default();
     }
-    let deadline = Instant::now() + timeout;
-    let mut buf = Vec::new();
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
+    #[cfg(unix)]
+    {
+        let mut out = std::io::stdout();
+        if out.write_all(QUERIES).and_then(|_| out.flush()).is_err() {
+            return Caps::default();
         }
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one pollfd, for stdin.
-        let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
-        if n <= 0 {
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+        let deadline = Instant::now() + timeout;
+        let mut buf = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
             }
-            break;
+            let mut pfd = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd, for stdin.
+            let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
+            if n <= 0 {
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                break;
+            }
+            let mut chunk = [0u8; 1024];
+            // SAFETY: chunk holds its length in bytes.
+            let r = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if r <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..r as usize]);
+            if parse(&buf).answered {
+                break;
+            }
         }
-        let mut chunk = [0u8; 1024];
-        // SAFETY: chunk holds its length in bytes.
-        let r = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if r <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..r as usize]);
-        if parse(&buf).answered {
-            break;
-        }
+        parse(&buf)
     }
-    parse(&buf)
 }
 
 /// Reads the answers out of what the terminal sent, skipping anything else.

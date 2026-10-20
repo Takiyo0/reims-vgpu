@@ -1,11 +1,11 @@
-//! reims-util (<https://github.com/steelbrain/reims-util>) makes what a new x86-64 VM boots from:
+//! reims-util (<https://github.com/Takiyo0/reims-util>) makes what a new x86-64 VM boots from:
 //! an OpenCore image, with OVMF's code and variables beside it, and a macOS installer, downloaded
 //! from Apple and checked against Apple's chunklists. It also makes an existing VM a new OpenCore
 //! image presenting the same Mac (opencore.rs). reims-ctl runs it with `--json`: each line
 //! on its stdout is an event, `step`, `progress` or `note`, and the last is `done`, with what it
 //! made, or `error`.
 //!
-//! It is installed beside reims-ctl, at [`REV`], by `cargo install` from its repository
+//! It is installed beside reims-ctl, from the `master` branch, by `cargo install` from its repository
 //! ([`install`]). `reims-ctl __record-install`, which scripts/install-ctl.sh runs last, installs
 //! it, so the update that brings a reims-ctl that needs it installs it too, though that update
 //! runs the script it started with, which predates reims-util. `REIMS_CTL_UTIL` names a binary to
@@ -13,7 +13,7 @@
 //!
 //! Every install builds it again, in an empty target directory, and replaces the one there
 //! (`--force`). cargo 1.98.1 judges a git package's binary up to date across commits (measured
-//! 2026-10-13): from a target directory an earlier commit was built in, `cargo install --rev` of
+//! 2026-10-13): from a target directory an earlier commit was built in, `cargo install --branch` of
 //! a later one installs the earlier commit's binary and records it as the later one's. Without
 //! `--force`, an install so recorded would be kept. The build takes 12 s on an M3 Max.
 //!
@@ -32,9 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const REPO: &str = "https://github.com/steelbrain/reims-util";
-/// The commit [`install`] installs.
-pub const REV: &str = "5405b2d13b6bea4c6db33f68cdfc751489c26855";
+pub const REPO: &str = "https://github.com/Takiyo0/reims-util";
+/// The branch [`install`] installs.
+pub const BRANCH: &str = "master";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
@@ -42,15 +42,15 @@ pub fn binary() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("REIMS_CTL_UTIL") {
         return Ok(PathBuf::from(p));
     }
+    #[cfg(windows)]
+    let name = "reims-util.exe";
+    #[cfg(not(windows))]
+    let name = "reims-util";
     let beside = std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join("reims-util")));
+        .and_then(|e| e.parent().map(|d| d.join(name)));
     let on_path: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| {
-            std::env::split_paths(&p)
-                .map(|d| d.join("reims-util"))
-                .collect()
-        })
+        .map(|p| std::env::split_paths(&p).map(|d| d.join(name)).collect())
         .unwrap_or_default();
     beside
         .into_iter()
@@ -66,7 +66,7 @@ pub fn version(bin: &Path) -> Option<String> {
     (o.status.success() && !v.is_empty()).then_some(v)
 }
 
-/// Installs reims-util at [`REV`] with `cargo install`, into the bin directory it installed
+/// Installs reims-util from [`BRANCH`] with `cargo install`, into the bin directory it installed
 /// reims-ctl into, building afresh in the cache directory from `repo`, the reims-vgpu checkout,
 /// whose rust-toolchain.toml picks the toolchain.
 pub fn install(repo: &Path) -> Result<()> {
@@ -83,7 +83,7 @@ pub fn install(repo: &Path) -> Result<()> {
     let _ = std::fs::remove_dir_all(&target);
     let status = Command::new(&cargo)
         .args([
-            "install", "--locked", "--force", "--quiet", "--git", REPO, "--rev", REV,
+            "install", "--locked", "--force", "--quiet", "--git", REPO, "--branch", BRANCH,
         ])
         .arg("reims-util")
         .env("CARGO_TARGET_DIR", &target)
@@ -419,10 +419,22 @@ fn end_with_parent(cmd: &mut Command) {
 /// and reims-util, which does not inherit it, ends with reims-ctl ([`end_with_parent`]).
 struct Lock {
     _file: std::fs::File,
+    #[cfg(windows)]
+    mutex: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // SAFETY: this thread acquired the mutex and the handle belongs to this guard.
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.mutex);
+            windows_sys::Win32::Foundation::CloseHandle(self.mutex);
+        }
+    }
 }
 
 fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
-    use std::os::fd::AsRawFd;
     let path = dir.join(".lock");
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -430,19 +442,49 @@ fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: flock on a descriptor this function holds open.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        progress("waiting for another download of a macOS installer to end");
-        // SAFETY: as above.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this function holds open.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            progress("waiting for another download of a macOS installer to end");
+            // SAFETY: as above.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                bail!(
+                    "lock {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Ok(Lock { _file: f })
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
+        let name = format!(
+            "Local\\reims-ctl-installer-{:08x}",
+            crc32fast::hash(path.to_string_lossy().as_bytes())
+        );
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the UTF-16 name is NUL-terminated and all other arguments are null/false.
+        let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if mutex.is_null() {
+            bail!("create installer lock: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: mutex is a valid mutex handle; waiting also serializes concurrent downloads.
+        if unsafe { WaitForSingleObject(mutex, INFINITE) }
+            != windows_sys::Win32::Foundation::WAIT_OBJECT_0
+        {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(mutex) };
             bail!(
-                "lock {}: {}",
-                path.display(),
+                "wait for installer lock: {}",
                 std::io::Error::last_os_error()
             );
         }
+        let _ = progress;
+        Ok(Lock { _file: f, mutex })
     }
-    Ok(Lock { _file: f })
 }
 
 #[cfg(test)]
@@ -485,6 +527,7 @@ mod tests {
     }
 
     /// A stand-in for reims-util that prints `lines` and exits with `code`.
+    #[cfg(unix)]
     fn fake(dir: &Path, lines: &str, code: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join("reims-util");
@@ -498,6 +541,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_passes_steps_and_percents_a_second_apart_and_returns_the_result() {
         let d = std::env::temp_dir().join(format!("reims-ctl-util-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();

@@ -14,6 +14,9 @@
 //!   longest; `-` while the sink has reported none. The Vulkan platform's sink measures it (its
 //!   command buffers' GPU end less their start, as the runtime answers them), on either OS; the
 //!   Metal platform's does not.
+//! - *window CPU*: time spent in the Vulkan window sink's acquire, encode, and present calls;
+//!   stage totals are CPU wall time within the reporting second, not guest GPU time or display
+//!   scanout time.
 //!
 //! A rate is over the time since the display's last line. A gap still open when the line is
 //! written counts too, so a guest that stops presenting shows a gap that grows by a second each
@@ -114,6 +117,40 @@ struct GpuTimes {
     max: AtomicU64,
 }
 
+/// One presenter's CPU-side stage since the last report.
+#[derive(Default)]
+struct StageTimes {
+    count: AtomicU64,
+    total: AtomicU64,
+    max: AtomicU64,
+}
+
+impl StageTimes {
+    fn record(&self, elapsed: Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Relaxed);
+        self.total.fetch_add(ns, Relaxed);
+        self.max.fetch_max(ns, Relaxed);
+    }
+
+    fn take(&self) -> (u64, u64, u64) {
+        (
+            self.count.swap(0, Relaxed),
+            self.total.swap(0, Relaxed),
+            self.max.swap(0, Relaxed),
+        )
+    }
+}
+
+/// Outcomes of calls to the window presenter in this reporting second.
+#[derive(Default)]
+struct WindowOutcomes {
+    presented: AtomicU64,
+    retry: AtomicU64,
+    ended: AtomicU64,
+    nothing: AtomicU64,
+}
+
 /// One display's statistics (module doc).
 pub(crate) struct DisplayStats {
     /// The display's port.
@@ -128,6 +165,12 @@ pub(crate) struct DisplayStats {
     drawn: Presents,
     /// The window's GPU times.
     gpu: GpuTimes,
+    /// CPU time in the window presenter's sequential stages.
+    acquire: StageTimes,
+    encode: StageTimes,
+    present_call: StageTimes,
+    /// Counts of the window presenter's draw outcomes.
+    outcomes: WindowOutcomes,
     /// When the period of the next report started.
     since: AtomicU64,
 }
@@ -143,6 +186,10 @@ impl DisplayStats {
             guest: Presents::new(),
             drawn: Presents::new(),
             gpu: GpuTimes::default(),
+            acquire: StageTimes::default(),
+            encode: StageTimes::default(),
+            present_call: StageTimes::default(),
+            outcomes: WindowOutcomes::default(),
             since,
         }
     }
@@ -172,6 +219,27 @@ impl DisplayStats {
         self.gpu.max.fetch_max(ns, Relaxed);
     }
 
+    /// Records the CPU wall time of one window present stage.
+    pub(crate) fn window_stage_time(&self, stage: WindowStage, elapsed: Duration) {
+        let times = match stage {
+            WindowStage::Acquire => &self.acquire,
+            WindowStage::Encode => &self.encode,
+            WindowStage::PresentCall => &self.present_call,
+        };
+        times.record(elapsed);
+    }
+
+    /// Records one window presenter outcome.
+    pub(crate) fn window_outcome(&self, outcome: WindowOutcome) {
+        let count = match outcome {
+            WindowOutcome::Presented => &self.outcomes.presented,
+            WindowOutcome::Retry => &self.outcomes.retry,
+            WindowOutcome::Ended => &self.outcomes.ended,
+            WindowOutcome::Nothing => &self.outcomes.nothing,
+        };
+        count.fetch_add(1, Relaxed);
+    }
+
     /// The line for the period up to now, which starts the next.
     fn report(&self) -> String {
         let now = mono_now(&*self.clock);
@@ -197,9 +265,45 @@ impl DisplayStats {
                     );
                 }
             }
+            stage(&mut line, "acquire", self.acquire.take());
+            stage(&mut line, "encode", self.encode.take());
+            stage(&mut line, "present-call", self.present_call.take());
+            let presented = self.outcomes.presented.swap(0, Relaxed);
+            let retry = self.outcomes.retry.swap(0, Relaxed);
+            let ended = self.outcomes.ended.swap(0, Relaxed);
+            let nothing = self.outcomes.nothing.swap(0, Relaxed);
+            let _ = write!(
+                line,
+                "; window outcomes {presented} presented, {retry} retry, {ended} ended, {nothing} nothing"
+            );
         }
         line
     }
+}
+
+/// A window sink call whose CPU wall time is reported in the next stats line.
+pub(crate) enum WindowStage {
+    Acquire,
+    Encode,
+    PresentCall,
+}
+
+/// What the window presenter returned from a draw.
+pub(crate) enum WindowOutcome {
+    Presented,
+    Retry,
+    Ended,
+    Nothing,
+}
+
+/// One CPU-side present stage's call count, total milliseconds and maximum milliseconds.
+fn stage(line: &mut String, name: &str, (count, total, max): (u64, u64, u64)) {
+    let _ = write!(
+        line,
+        "; window CPU {name} {count} calls, {:.2} ms total, {:.2} ms max",
+        millis(total),
+        millis(max)
+    );
 }
 
 /// `kind`'s rate over `seconds` and its longest gap, onto `line`.
@@ -374,8 +478,12 @@ fn report_forever(clock: &dyn TimerClock) -> ! {
             }
         }
         let live = registry().lock().live();
-        let lines = lines(&live);
+        let mut lines = lines(&live);
         drop(live);
+        // The FIFO thread's work this second (`reims_vgpu_core::perfstats`).
+        if let Some(work) = reims_vgpu_core::perfstats::take_line() {
+            lines.push_str(&work);
+        }
         if !lines.is_empty() {
             let _ = std::io::stderr().lock().write_all(lines.as_bytes());
         }

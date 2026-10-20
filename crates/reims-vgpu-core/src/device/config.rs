@@ -36,6 +36,8 @@ pub struct DeviceConfig<P: Platform> {
     pub enable_argument_buffers: bool,
     /// `enableProcessIsolation`.
     pub enable_process_isolation: bool,
+    /// Isolate nonzero tasks only while the IOSurface device has a mapped descriptor table.
+    pub process_isolation_follows_guest: bool,
     /// `enableProtectedContent` (ignored).
     pub enable_protected_content: bool,
     /// `deviceFeatureLevel`.
@@ -55,6 +57,7 @@ impl<P: Platform> Default for DeviceConfig<P> {
             using_iosurface_mapper: false,
             enable_argument_buffers: true,
             enable_process_isolation: false,
+            process_isolation_follows_guest: false,
             enable_protected_content: false,
             device_feature_level: 0,
             display_port_connection_types: 0,

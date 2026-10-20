@@ -1129,9 +1129,28 @@ thread_local! {
     /// A notice of [`DIES`] the runtime announced on this thread inside a call here, which the
     /// call dies at once it returns.
     static PENDING: RefCell<Option<rt::DegradeNotice>> = const { RefCell::new(None) };
+    /// `PENDING` holds a notice. Every call here reads this destructor-free flag first, so the
+    /// common call never touches `PENDING`, whose value has a destructor to register at each
+    /// access on the Windows GNU target.
+    static PENDING_SET: Cell<bool> = const { Cell::new(false) };
     /// The kinds of [`HEARD`] the runtime announced on this thread inside the innermost
     /// [`hearing`], where one runs.
     static HEARING: RefCell<Option<Vec<rt::Degradation>>> = const { RefCell::new(None) };
+}
+
+/// Keeps `notice` as this thread's pending one.
+fn set_pending(notice: &rt::DegradeNotice) {
+    PENDING.with(|p| *p.borrow_mut() = Some(notice.clone()));
+    PENDING_SET.with(|f| f.set(true));
+}
+
+/// Takes this thread's pending notice, touching `PENDING` only when one was set.
+fn take_pending() -> Option<rt::DegradeNotice> {
+    if !PENDING_SET.with(Cell::get) {
+        return None;
+    }
+    PENDING_SET.with(|f| f.set(false));
+    PENDING.with(RefCell::take)
 }
 
 /// Whether this process dies at a difference from Metal's answer it could go on past: a
@@ -1227,7 +1246,7 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
         fn drop(&mut self) {
             DEPTH.with(|d| d.set(d.get() - 1));
             if !self.returned {
-                PENDING.with(|p| drop(p.take()));
+                take_pending();
             }
         }
     }
@@ -1238,7 +1257,7 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
         leave.returned = true;
         out
     };
-    if let Some(notice) = PENDING.with(RefCell::take) {
+    if let Some(notice) = take_pending() {
         let call = sel.unwrap_or(notice.degradation.code());
         if census::on() {
             census::selector(notice.degradation, call);
@@ -1382,14 +1401,14 @@ pub fn notice(message: &rt::DebugMessage) {
             if DEPTH.with(Cell::get) == 0 {
                 census::selector(kind, census::OUTSIDE);
             } else {
-                PENDING.with(|p| *p.borrow_mut() = Some(notice.clone()));
+                set_pending(notice);
             }
             return;
         }
     }
     // Kept first: the death below ends the process, but the test capture's unwinds into the
     // runtime, which catches it, and the thread then dies at its next call here.
-    PENDING.with(|p| *p.borrow_mut() = Some(notice.clone()));
+    set_pending(notice);
     if DEPTH.with(Cell::get) == 0 {
         degraded(notice.degradation.code(), notice);
     }

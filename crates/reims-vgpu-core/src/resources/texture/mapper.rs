@@ -20,6 +20,8 @@ pub struct MapperRefTextureResource<P: Platform> {
     mapping_id: u64,
     /// Taken by the drop.
     texture: Option<P::Texture>,
+    surface_base: u64,
+    surface_size: u64,
 }
 
 impl<P: Platform> MapperRefTextureResource<P> {
@@ -33,12 +35,16 @@ impl<P: Platform> MapperRefTextureResource<P> {
         task: TaskRef<P>,
         mapping_id: u64,
         texture: P::Texture,
+        surface_base: u64,
+        surface_size: u64,
     ) -> RaiseResult<Option<Arc<Resource<P>>>> {
         Ok(Some(Resource::new(ResourceKind::MapperRefTexture(
             MapperRefTextureResource {
                 task,
                 mapping_id,
                 texture: Some(texture),
+                surface_base,
+                surface_size,
             },
         ))))
     }
@@ -46,6 +52,54 @@ impl<P: Platform> MapperRefTextureResource<P> {
     /// The mapping's id.
     pub fn mapping_id(&self) -> u64 {
         self.mapping_id
+    }
+
+    /// The surface base address in host memory.
+    pub fn surface_base(&self) -> u64 {
+        self.surface_base
+    }
+
+    /// The surface allocation size in bytes.
+    pub fn surface_size(&self) -> u64 {
+        self.surface_size
+    }
+
+    /// Synchronizes guest memory into the host surface.
+    fn sync_from_guest(&self) {
+        // Refresh the guest-memory staging first. A WHPX surface can itself have a second
+        // staging allocation, so copying it before this step would import stale guest bytes.
+        if let Some(t) = self.task.upgrade() {
+            if let Some(map) = t.memory_map() {
+                if self.surface_base != 0 && self.surface_size != 0 {
+                    use crate::host::HostPtr;
+                    use crate::num::ToUsize;
+                    let ptr = HostPtr::from_addr(self.surface_base.to_usize());
+                    map.sync_range_from_guest(ptr, self.surface_size);
+                }
+            }
+        }
+        if let Some(surface) = self.texture.as_ref().and_then(Texture::iosurface) {
+            use crate::platform::os::surface::Surface as _;
+            surface.sync_from_guest();
+        }
+    }
+
+    /// Synchronizes host surface memory back into guest memory.
+    fn sync_to_guest(&self) {
+        if let Some(surface) = self.texture.as_ref().and_then(Texture::iosurface) {
+            use crate::platform::os::surface::Surface as _;
+            surface.sync_to_guest();
+        }
+        if let Some(t) = self.task.upgrade() {
+            if let Some(map) = t.memory_map() {
+                if self.surface_base != 0 && self.surface_size != 0 {
+                    use crate::host::HostPtr;
+                    use crate::num::ToUsize;
+                    let ptr = HostPtr::from_addr(self.surface_base.to_usize());
+                    map.sync_range_to_guest(ptr, self.surface_size);
+                }
+            }
+        }
     }
 }
 
@@ -63,18 +117,35 @@ impl<P: Platform> ResourceClass<P> for MapperRefTextureResource<P> {
             .map(|t| AnyResource::Texture(t.clone_ref())))
     }
 
-    /// Nothing.
+    fn needs_prepare(&self, this: &Resource<P>) -> bool {
+        let _ = this;
+        true
+    }
+
+    fn prepare_with_cpu(&self, _hold: Hold<'_>, this: &Resource<P>) -> RaiseResult<()> {
+        self.sync_from_guest();
+        this.set_is_host_valid(true);
+        Ok(())
+    }
+
+    fn synchronize_with_cpu(&self, this: &Resource<P>) -> RaiseResult<()> {
+        let _ = this;
+        self.sync_to_guest();
+        Ok(())
+    }
+
     fn prepare_in_encoder(
         &self,
         _hold: Hold<'_>,
         this: &Resource<P>,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        let _ = (this, encoder);
+        let _ = encoder;
+        self.sync_from_guest();
+        this.set_is_host_valid(true);
         Ok(())
     }
 
-    /// Nothing.
     fn synchronize_in_encoder(
         &self,
         _hold: Hold<'_>,
@@ -82,6 +153,7 @@ impl<P: Platform> ResourceClass<P> for MapperRefTextureResource<P> {
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
         let _ = (this, encoder);
+        self.sync_to_guest();
         Ok(())
     }
 
@@ -92,8 +164,7 @@ impl<P: Platform> ResourceClass<P> for MapperRefTextureResource<P> {
     }
 
     fn is_host_valid(&self, this: &Resource<P>) -> bool {
-        let _ = this;
-        true
+        this.state.host_valid()
     }
 
     fn is_guest_valid(&self, this: &Resource<P>) -> bool {
@@ -162,27 +233,41 @@ mod tests {
         let (p, _rec, host) = setup();
         let t: Fk<kind::Texture> = p.world().new_obj(Model::None);
         let id = t.id();
-        let r = MapperRefTextureResource::new(Arc::downgrade(&host), 7, t)
+        let r = MapperRefTextureResource::new(Arc::downgrade(&host), 7, t, 0x1000, 0x4000)
             .unwrap()
             .unwrap();
         let m = kind_of(&r);
         assert_eq!(m.mapping_id(), 7);
+        assert_eq!(m.surface_base(), 0x1000);
+        assert_eq!(m.surface_size(), 0x4000);
         assert_eq!(r.get_texture().unwrap().unwrap().id(), id);
         match r.get_resource().unwrap().unwrap() {
             AnyResource::Texture(x) => assert_eq!(x.id(), id),
             other => panic!("{other:?}"),
         }
-        // Its flags stay false; the getters answer valid, so it never needs paging.
-        assert!(r.is_host_valid() && r.is_guest_valid());
+        // Starts with host_valid false, guest_valid true.
+        assert!(!r.is_host_valid() && r.is_guest_valid());
         assert!(!r.state.host_valid() && !r.state.guest_valid());
-        r.set_is_host_valid(false);
-        assert!(r.is_host_valid());
-        assert!(!r.needs_prepare() && !r.needs_sync());
+        assert!(r.needs_prepare() && !r.needs_sync());
+        assert!(!r.needs_cpu_paging());
         assert!(!r.supports_discard());
         let mark = p.call_log().mark();
+        r.prepare_with_cpu(Hold::NONE).unwrap();
+        assert!(r.is_host_valid() && r.state.host_valid());
+        // needs_prepare() always returns true so guest memory is reliably synced on every access.
+        assert!(r.needs_prepare() && !r.needs_sync());
+        // Second prepare (via encoder) also runs and keeps needs_prepare true.
         r.prepare_in_encoder(Hold::NONE, None).unwrap();
+        assert!(r.is_host_valid() && r.state.host_valid());
+        assert!(r.needs_prepare());
+        r.synchronize_with_cpu().unwrap();
         r.synchronize_in_encoder(Hold::NONE, None).unwrap();
-        assert!(p.call_log().since(mark).is_empty());
+        let calls = p.call_log().since(mark);
+        assert!(calls.iter().all(|c| c.sel == "iosurface"));
+        assert!(!calls.is_empty());
+        r.set_is_host_valid(false);
+        assert!(!r.is_host_valid());
+        assert!(r.needs_prepare());
         // No discard: opcode 60 on it is unrecognized.
         {
             let e = r.discard().err().unwrap();
@@ -201,7 +286,7 @@ mod tests {
         let (p, _rec, host) = setup();
         let (t, sid) = surface_texture(&p);
         let tid = t.id();
-        let r = MapperRefTextureResource::new(Arc::downgrade(&host), 9, t)
+        let r = MapperRefTextureResource::new(Arc::downgrade(&host), 9, t, 0, 0)
             .unwrap()
             .unwrap();
         let mark = p.call_log().mark();
@@ -232,7 +317,9 @@ mod tests {
             Arc::downgrade(&other)
         };
         let (t, sid) = surface_texture(&p);
-        let r = MapperRefTextureResource::new(gone, 9, t).unwrap().unwrap();
+        let r = MapperRefTextureResource::new(gone, 9, t, 0, 0)
+            .unwrap()
+            .unwrap();
         drop(r);
         assert_eq!(p.call_log().count("release_io_surface_with_mapping_id"), 0);
         // The texture is released; the surface lives on through the leaked retain.

@@ -85,10 +85,17 @@ impl<P: Platform> SharedBufferResource<P> {
     }
 
     fn buffer(&self) -> RaiseResult<P::Buffer> {
-        match self.buffer.lock().as_ref() {
-            Some(b) => Ok(b.clone_ref()),
-            None => raise(RaiseKind::BufferInvalidated),
+        let b = match self.buffer.lock().as_ref() {
+            Some(b) => b.clone_ref(),
+            None => return raise(RaiseKind::BufferInvalidated),
+        };
+        if let Some(t) = self.task.upgrade() {
+            if let Some(map) = t.memory_map() {
+                use crate::platform::resource::Buffer as _;
+                map.sync_range_from_guest(b.contents(), b.length());
+            }
         }
+        Ok(b)
     }
 }
 
@@ -134,6 +141,18 @@ impl<P: Platform> ResourceClass<P> for SharedBufferResource<P> {
         let old = self.buffer.lock().take();
         drop(old);
         Ok(())
+    }
+
+    fn flush_to_guest(&self, this: &Resource<P>) {
+        let _ = this;
+        if let Some(b) = self.buffer.lock().as_ref() {
+            if let Some(t) = self.task.upgrade() {
+                if let Some(map) = t.memory_map() {
+                    use crate::platform::resource::Buffer as _;
+                    map.sync_range_to_guest(b.contents(), b.length());
+                }
+            }
+        }
     }
 
     fn needs_sync(&self, this: &Resource<P>) -> bool {

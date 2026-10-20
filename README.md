@@ -6,44 +6,51 @@
 > platforms and GPU drivers, so how well it runs can still depend on your host and its GPU.
 
 reims-vgpu is a virtual GPU for macOS VMs. It gives macOS running in QEMU accelerated graphics,
-through Metal on a Mac or Vulkan on Linux, using the GPU driver macOS already ships with. There's
-nothing to install in the guest.
+through Metal on a Mac or Vulkan on Linux and WHPX, using the GPU driver macOS already ships with.
+There's nothing to install in the guest.
 
 Alongside the GPU, we ship a QEMU build that uses it, and `reims-ctl`, a small tool that creates
 and runs macOS VMs for you.
 
+<details>
+<summary>Click to view the stress-test video (Non-edited; 10Core 10GB RAM)</summary>
+<br>
+
+[Stress-test video](https://github.com/user-attachments/assets/af927973-063e-461c-ab40-6265c0f3f0ab)
+</details>
+
 ![reims-vgpu running an arm64 macOS 13 Ventura guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
-
-*arm64 macOS 13 Ventura guest on an Apple Silicon host.*
-
-![reims-vgpu running an x86_64 macOS 13 Ventura guest desktop on a Linux host](assets/readme/reims-vgpu-macos-x86-desktop.png)
-
-*x86_64 macOS 13 Ventura guest on a Linux host.*
 
 ## Getting started
 
 We don't ship disk images: macOS comes straight from Apple. On an Apple silicon Mac, that's an
-IPSW, or a VM you already made with macosvm or tart. On Linux, `reims-ctl` downloads the installer
-from Apple and sets the VM up for you, or uses a disk that already has macOS on it.
+IPSW, or a VM you already made with macosvm or tart. On Linux and Windows, `reims-ctl` can download
+the installer from Apple and set the VM up for you, or use a disk that already has macOS on it.
 
 We've tested arm64 macOS 13, 14, 15 and 26 on an M3 Max, and x86-64 macOS 26 on Linux with an RTX
 5080 laptop GPU. [docs/qemu.md](docs/qemu.md) has the details.
 
 ### Install reims-ctl
 
-Clone the repository (without `--recursive`: QEMU's own submodules are not needed) and run:
+Clone the repository (without `--recursive`: QEMU's own submodules are not needed). Then run the
+installer for your host:
 
 ```sh
 scripts/install-ctl.sh
 ```
 
-It installs what the build needs (Homebrew on macOS; apt on Ubuntu and Debian, pacman on Arch and
-CachyOS; Rust through rustup.rs), fetches `vendor/qemu`, builds the library and QEMU on it, installs
-QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`, with
-[reims-util](https://github.com/steelbrain/reims-util) beside it on Linux. `vendor/qemu` is
-fetched from its public repository (`steelbrain/qemu-reims-vgpu`), at the commit this checkout
-pins, and Cargo fetches metal2vulkan from its public repository, at the commit the workspace's
-`Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
+```powershell
+.\scripts\install-ctl.ps1
+```
+
+The Unix installer installs what the build needs (Homebrew on macOS; apt on Ubuntu and Debian,
+pacman on Arch and CachyOS; Rust through rustup.rs), fetches `vendor/qemu`, builds the library and
+QEMU on it, installs QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`.
+The Windows installer builds QEMU with MSYS2 UCRT64 and installs both Rust tools. `vendor/qemu` follows the
+`master` branch of [qemu-sanctum-vgpu](https://github.com/Takiyo0/qemu-sanctum-vgpu), and Cargo
+fetches metal2vulkan from [Takiyo0/metal2vulkan](https://github.com/Takiyo0/metal2vulkan)'s `master`
+branch. The submodule and Cargo lockfile record exact commits for each checkout; update them from
+their branches when you want newer code. `reims-ctl doctor` checks the host and the install.
 
 ### x86-64 guest on Linux (KVM)
 
@@ -132,6 +139,10 @@ bug report.
 ```sh
 reims-ctl list                  # the VMs and whether they run
 reims-ctl set mac --memory 12G --resolution 1920x1080   # applies at the next start
+reims-ctl set mac --hotplug-displays                    # reserve ports; restart the VM once
+reims-ctl set mac --pointer-agent-port 4455             # optional; requires ReimsPointer in the guest
+reims-ctl displays mac                                  # query live display count/capacity
+reims-ctl displays mac --count 2                        # change it live and save for next start
 reims-ctl command mac           # the QEMU command it runs, as a shell script
 reims-ctl report mac            # logs, settings and the host's details, zipped, for a bug report
 reims-ctl update                # pull the checkout and install again
@@ -164,8 +175,8 @@ window does: its sizing, HiDPI, pointer, scrolling and cursor, each entry with i
 
 ### Environment overrides
 
-Set in QEMU's environment (`reims-ctl set <vm> --env KEY=VALUE`). Every one is optional; the library
-reads them once per process, and an unset or unparsable value is the default.
+Set in QEMU's environment (`reims-ctl set <vm> --env KEY=VALUE`). These overrides are optional;
+each row names the process that reads it where that matters.
 
 | Variable | Effect |
 |---|---|
@@ -176,8 +187,24 @@ reads them once per process, and an unset or unparsable value is the default.
 | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
 | `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS: SDL3's window in place of AppKit's |
+| `REIMS_VGPU_GUEST_DISPLAY_PORTS=8` | the number of display ports the guest sees (up to the ports QEMU reserves) |
+| `REIMS_VGPU_APPLE_FAMILIES=0` | tell the guest this GPU has no Apple GPU families |
+| `REIMS_VGPU_ASYNC_PREPARE=0` | keep resource preparation on the FIFO thread; enabled by default, but the Windows performance launcher disables it |
+| `REIMS_VGPU_RAM_IMPORT=0` | import guest RAM lazily in 64 MiB stretches instead of importing it all at device creation |
+| `REIMS_VGPU_LOG_TIME=1` | prefix log lines with epoch time and thread name |
+| `REIMS_VGPU_LOG_ASYNC=1` | write non-error log lines on a background thread so the FIFO thread does not wait on stderr |
+| `REIMS_VGPU_SAMPLE=1` | start the Windows sampling profiler (`boot-perf.ps1 -Sample`) |
+| `REIMS_VGPU_CMDHASH=1` | print a command-stream hash once a second (`boot-perf.ps1 -Profile`) |
+| `REIMS_VGPU_EVENT_STATS=1` | print QEMU input-event queue and bottom-half timing statistics |
+| `QEMU_AUDIO_STATS=1` | print QEMU USB-audio statistics |
+| `M2V_TIMING=1` | print metal2vulkan timing lines for wrapped calls taking at least 1 ms |
+| `QEMU_WHPX_MMIO_FAST=0` | disable QEMU's WHPX fast path for common 64-bit `mov` MMIO accesses |
+| `QEMU_PCORES=1` | restrict QEMU threads to the highest-efficiency CPU class on hybrid CPUs (no gain measured) |
 | `REIMS_VGPU_STRICT=1` | the Vulkan platform: end the process at each difference from Metal's answer it would otherwise log |
 | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ([docs/accuracy-ledger.md](docs/accuracy-ledger.md)) |
+
+The Windows launcher also clears inherited performance switches before starting QEMU. Their
+defaults, platform limits and full list are in [docs/windows.md](docs/windows.md#configuration-reference).
 
 The guest's mode is QEMU's `apple-gfx` property `resolution=` (`2560x1600`, `2560x1600@200` for a
 density, or `host`; 1920x1080 at 1× by default), which `reims-ctl`'s resolution and HiDPI settings
@@ -200,7 +227,7 @@ tree can run on it beside the Metal one.
   Metal and Vulkan platforms, a display's window, the Rust API and the C API
   ([docs/development.md](docs/development.md#crates)).
 - QEMU: `vendor/qemu` tracks
-  [`steelbrain/qemu-reims-vgpu@steelbrain/reims-vgpu`](https://github.com/steelbrain/qemu-reims-vgpu/tree/steelbrain/reims-vgpu):
+  [`Takiyo0/qemu-sanctum-vgpu@master`](https://github.com/Takiyo0/qemu-sanctum-vgpu/tree/master):
   `apple-gfx` in C on the C API, which finds the library through pkg-config and links it
   statically.
 - The option ROM: `firmware/`, the PCI device's UEFI driver, in C, which an x86-64 guest's
@@ -209,12 +236,21 @@ tree can run on it beside the Metal one.
   `Cargo.toml` names. On macOS it runs on MoltenVK.
 - VMs: `reims-ctl` (`crates/reims-ctl`) creates, boots and manages them.
 
+## Windows host
+
+An x86-64 macOS guest also runs on Windows 11: QEMU on WHPX, the Vulkan platform on the host GPU
+(an NVIDIA GPU is the one measured), and each display in a Win32 window of its own. After installing
+Rust and MSYS2, `scripts/install-ctl.ps1` builds and installs the library, QEMU, option ROM,
+`reims-ctl`, and `reims-util`. [docs/windows.md](docs/windows.md) covers building, running, the
+guest's setup, every environment variable, the performance work, and the known limits.
+[docs/merge-notes.md](docs/merge-notes.md) says how this branch relates to `master`.
+
 ## Developing
 
 macOS already includes a paravirtual GPU driver named `AppleParavirtGPU.kext`, written against the
 host side Apple ships as `ParavirtualizedGraphics.framework`. reims-vgpu replaces that framework.
 It takes the guest's GPU command stream and runs it on Metal on a Mac, or on Vulkan on Linux
-through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan), and can draw each guest
+through [`metal2vulkan`](https://github.com/Takiyo0/metal2vulkan), and can draw each guest
 display into a window of its own. QEMU's `apple-gfx` devices link it, on a Mac as on Linux. There
 is no guest driver to install. On x86-64, the OpenCore image reims-util makes carries one small
 kext, ReimsVgpu.kext, which has macOS 26's driver use the GPU as its arm64 build does.
@@ -250,7 +286,7 @@ the following.
   and `cargo xtask check` build, does (`xcodebuild -downloadComponent MetalToolchain`).
 - Homebrew's `lld` (`brew install lld`), whose `lld-link` and `ld.lld` link the EFI option ROM
   (`firmware/`) that `cargo xtask dist` builds with Xcode's clang.
-- For the QEMU targets: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
+- For the QEMU targets: the `vendor/qemu` submodule (`git submodule update --init --remote vendor/qemu`) and
   QEMU's build dependencies (Homebrew's `meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so
   on).
 

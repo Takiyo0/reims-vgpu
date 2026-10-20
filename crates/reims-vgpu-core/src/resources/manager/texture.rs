@@ -53,7 +53,7 @@ use crate::deserializer::texture_descriptor::{
 use crate::guest::GuestPtr;
 use crate::guest::records::{GuestFeatures, ObjectEntry};
 use crate::memory::cursor::Cursor;
-use crate::num::{ToUsize, Truncate};
+use crate::num::{ToU64, ToUsize, Truncate};
 use crate::platform::descriptor::TextureDescriptor;
 use crate::platform::device::GpuDevice;
 use crate::platform::os::surface::Surface;
@@ -1251,7 +1251,7 @@ fn new_iosurface_texture<P: Platform, E: CreateEnv<P>>(
     surface: Option<&P::Surface>,
     cursor: &mut Cursor,
     placement: Option<GuestPtr>,
-) -> RaiseResult<Result<P::Texture, String>> {
+) -> RaiseResult<Result<(P::Texture, u16), String>> {
     let (serialized, plane, rotation) = refuse!(command.read(cursor));
     let desc = serialized.desc(placement_index(placement));
     let descriptor = env.platform().texture_descriptor(&desc);
@@ -1291,7 +1291,7 @@ fn new_iosurface_texture<P: Platform, E: CreateEnv<P>>(
         drop(texture);
         return Ok(misplaced_refusal());
     }
-    Ok(Ok(texture))
+    Ok(Ok((texture, plane)))
 }
 
 /// A texture over a mapper's IOSurface (object type 11). The surface is retained through the
@@ -1322,19 +1322,27 @@ pub(crate) fn create_mapper_ref_texture<P: Platform, E: CreateEnv<P>>(
             header.command_type
         )));
     };
-    let texture = match new_iosurface_texture(env, command, Some(&surface), &mut cursor, placement)
-    {
-        Ok(Ok(texture)) => texture,
-        Ok(Err(e)) => {
-            host.release_io_surface_with_mapping_id(mapping_id, Some(surface));
-            return Ok(Err(e));
-        }
-        Err(raised) => {
-            keep_forever(surface, Kept::SurfaceUseCount);
-            return Err(raised);
-        }
-    };
-    let resource = match env.new_mapper_ref_texture_resource(mapping_id, texture) {
+    let (texture, _) =
+        match new_iosurface_texture(env, command, Some(&surface), &mut cursor, placement) {
+            Ok(Ok((texture, plane))) => (texture, plane),
+            Ok(Err(e)) => {
+                host.release_io_surface_with_mapping_id(mapping_id, Some(surface));
+                return Ok(Err(e));
+            }
+            Err(raised) => {
+                keep_forever(surface, Kept::SurfaceUseCount);
+                return Err(raised);
+            }
+        };
+    use crate::platform::os::surface::Surface as _;
+    let surface_base = surface.base_address().addr().to_u64();
+    let surface_size = surface.alloc_size();
+    let resource = match env.new_mapper_ref_texture_resource(
+        mapping_id,
+        texture,
+        surface_base,
+        surface_size,
+    ) {
         Ok(resource) => resource,
         Err(raised) => {
             keep_forever(surface, Kept::SurfaceUseCount);
@@ -1385,8 +1393,8 @@ pub(crate) fn create_backing_ref_texture<P: Platform, E: CreateEnv<P>>(
     let surface = env.res_io_surface(&backing)?;
     let texture = new_iosurface_texture(env, command, surface.as_ref(), &mut cursor, placement)?;
     drop(surface);
-    let texture = refuse!(texture);
-    match env.new_ref_texture_resource(u32::from(entry.object_type()), texture, backing)? {
+    let (texture, plane) = refuse!(texture);
+    match env.new_ref_texture_resource(u32::from(entry.object_type()), texture, backing, plane)? {
         Some(r) => Ok(Ok(r)),
         None => Ok(Err("no host resource made for the ref texture".to_owned())),
     }

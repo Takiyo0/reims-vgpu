@@ -7,15 +7,17 @@
 //! `ffi::host_call`: a host function that raises ends the process at the call.
 
 use std::ffi::c_void;
+#[cfg(unix)]
 use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use reims_vgpu::{
     AddTraceRange, CreateTask, DestroyTask, Device, DeviceConfig, Error, HostCallbacks, HostPtr,
-    HostTask, HostTraceRange, MapMemory, MemoryFile, MemoryMap, PhysicalMemoryRange,
-    RaiseInterrupt, ReadMemory, RemoveTraceRange, UnmapMemory,
+    HostTask, HostTraceRange, MapMemory, MemoryMap, PhysicalMemoryRange, RaiseInterrupt,
+    ReadMemory, RemoveTraceRange, UnmapMemory,
 };
 
 use crate::ffi;
@@ -304,17 +306,24 @@ pub struct RvgDeviceConfig {
     /// not a multiple of the host's page size: RVG_ERR_INVALID_ARGUMENT, in that order, before
     /// any file is duplicated.
     pub memory_files: *const RvgMemoryRangeFile,
+    /// Isolate nonzero tasks only while the IOSurface device has a mapped descriptor table;
+    /// argument buffers follow the same condition.
+    pub process_isolation_follows_guest: bool,
 }
 
 // SAFETY: repr(C), a u32 first; integers, bools and pointers.
 unsafe impl HostStruct for RvgDeviceConfig {
     /// The first version ends at `callbacks`: a host built against it passes 48, and has no
-    /// `memory_files`.
+    /// `memory_files` or `process_isolation_follows_guest`.
     const V1_SIZE: usize = 48;
 }
 
 const _: () =
     assert!(std::mem::offset_of!(RvgDeviceConfig, memory_files) == RvgDeviceConfig::V1_SIZE);
+const _: () = assert!(
+    std::mem::offset_of!(RvgDeviceConfig, process_isolation_follows_guest)
+        == std::mem::offset_of!(RvgDeviceConfig, memory_files) + std::mem::size_of::<*const ()>()
+);
 
 /// The device: one paravirtualized GPU and its display ports.
 pub struct RvgDevice {
@@ -379,8 +388,9 @@ pub(crate) unsafe fn memory_map(
     let mut m = MemoryMap::new();
     for (i, r) in ranges.iter().enumerate() {
         let file = match files.get(i) {
+            #[cfg(unix)]
             Some(f) if f.fd >= 0 => match duplicate(f.fd) {
-                Ok(fd) => Some(MemoryFile {
+                Ok(fd) => Some(reims_vgpu::MemoryFile {
                     fd: Arc::new(fd),
                     offset: f.offset,
                 }),
@@ -393,6 +403,19 @@ pub(crate) unsafe fn memory_map(
                     return Err(RVG_ERR_INVALID_ARGUMENT);
                 }
             },
+            // On Windows there is no fd-backed guest RAM yet: the fd→host-pointer bridge
+            // (docs/windows-whpx-feasibility.md) is not implemented, so a range that names a file
+            // is refused rather than silently mishandled. A range with fd -1 (anonymous RAM, as
+            // vmapple's) carries no file and is accepted.
+            #[cfg(windows)]
+            Some(f) if f.fd >= 0 => {
+                log::warn!(
+                    "device not created: memory range {i} names fd {}, but fd-backed guest RAM is \
+                     not supported on Windows yet (the WHPX host-pointer bridge is unimplemented)",
+                    f.fd
+                );
+                return Err(RVG_ERR_INVALID_ARGUMENT);
+            }
             _ => None,
         };
         // SAFETY: the header's contract on `host_address`: mapped while any device made over
@@ -423,30 +446,45 @@ fn file_refusal(r: &RvgMemoryRange, f: &RvgMemoryRangeFile, page: NonZeroU64) ->
     if f.fd == -1 {
         return None;
     }
-    let size = match file_size(f.fd) {
-        Ok(size) => size,
-        Err(e) => return Some(format!("has fd {}, which fstat cannot read: {e}", f.fd)),
-    };
-    if f.offset
-        .checked_add(r.physical_length)
-        .is_none_or(|end| size < end)
+    // A non-negative fd names a file-backed range. The fstat/size checks below are POSIX; on
+    // Windows the fd→host-pointer bridge is not built, so such a range is refused here (the
+    // memory_map loop refuses it too).
+    #[cfg(windows)]
     {
+        let _ = (r, page);
         return Some(format!(
-            "holds {size:#x} bytes, fewer than its offset {:#x} and the range's {:#x}",
-            f.offset, r.physical_length
+            "has fd {}, but fd-backed guest RAM is not supported on Windows yet",
+            f.fd
         ));
     }
-    if f.offset % page != 0 {
-        return Some(format!(
-            "has offset {:#x}, not a multiple of the page size {page:#x}",
-            f.offset
-        ));
+    #[cfg(unix)]
+    {
+        let size = match file_size(f.fd) {
+            Ok(size) => size,
+            Err(e) => return Some(format!("has fd {}, which fstat cannot read: {e}", f.fd)),
+        };
+        if f.offset
+            .checked_add(r.physical_length)
+            .is_none_or(|end| size < end)
+        {
+            return Some(format!(
+                "holds {size:#x} bytes, fewer than its offset {:#x} and the range's {:#x}",
+                f.offset, r.physical_length
+            ));
+        }
+        if f.offset % page != 0 {
+            return Some(format!(
+                "has offset {:#x}, not a multiple of the page size {page:#x}",
+                f.offset
+            ));
+        }
+        None
     }
-    None
 }
 
-/// The host's page size (`sysconf(_SC_PAGESIZE)`, which does not fail): 16 KiB on arm64 macOS,
-/// 4 KiB on x86-64.
+/// The host's page size: `sysconf(_SC_PAGESIZE)` on unix (16 KiB on arm64 macOS, 4 KiB on
+/// x86-64), `GetSystemInfo().dwPageSize` on Windows.
+#[cfg(unix)]
 fn host_page_size() -> NonZeroU64 {
     // SAFETY: a query of a constant; it reads and writes no memory of the caller's.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -456,7 +494,18 @@ fn host_page_size() -> NonZeroU64 {
         .unwrap_or(NonZeroU64::MIN)
 }
 
-/// The size of the file `fd` names (`fstat`).
+/// The host's page size on Windows (`GetSystemInfo().dwPageSize`, 4 KiB on x86-64).
+#[cfg(windows)]
+fn host_page_size() -> NonZeroU64 {
+    let mut info: windows_sys::Win32::System::SystemInformation::SYSTEM_INFO =
+        unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid SYSTEM_INFO out-slot.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut info) };
+    NonZeroU64::new(u64::from(info.dwPageSize)).unwrap_or(NonZeroU64::MIN)
+}
+
+/// The size of the file `fd` names (`fstat`). Unix only; Windows has no fd-backed guest RAM yet.
+#[cfg(unix)]
 fn file_size(fd: i32) -> std::io::Result<u64> {
     let mut st = MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `st` is a writable `struct stat`; an `fd` that names no open file is an error the
@@ -469,7 +518,8 @@ fn file_size(fd: i32) -> std::io::Result<u64> {
     Ok(u64::try_from(st.st_size).unwrap_or(0))
 }
 
-/// A duplicate of `fd`, close-on-exec (`fcntl(F_DUPFD_CLOEXEC)`), which the map holds.
+/// A duplicate of `fd`, close-on-exec (`fcntl(F_DUPFD_CLOEXEC)`), which the map holds. Unix only.
+#[cfg(unix)]
 fn duplicate(fd: i32) -> std::io::Result<OwnedFd> {
     // SAFETY: `fcntl` reads and writes no memory of the caller's; an `fd` that names no open
     // file is an error the call returns.
@@ -640,6 +690,7 @@ pub unsafe extern "C" fn rvg_device_create(
             memory_map,
             use_iosurface_mapper: c.use_iosurface_mapper,
             process_isolation: c.process_isolation,
+            process_isolation_follows_guest: c.process_isolation_follows_guest,
             argument_buffers: !c.disable_argument_buffers,
             callbacks: host_callbacks(&table, &callbacks),
         };
@@ -892,5 +943,8 @@ pub unsafe extern "C" fn rvg_device_did_resume(device: *mut RvgDevice) {
     })
 }
 
-#[cfg(test)]
+// The C-API tests build fd-backed memory maps (`AsRawFd` over temp files) and fork children that
+// die by POSIX signal; both are unix-specific. On Windows the fd→host-pointer memory bridge is
+// unimplemented (see docs/windows-whpx-feasibility.md), so these fixtures do not apply.
+#[cfg(all(test, unix))]
 mod tests;

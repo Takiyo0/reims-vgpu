@@ -263,6 +263,95 @@ pub(crate) fn shows_guest_pages(first: HostPtr, length: u64) -> bool {
 /// ([`UnmapHold`]). A leaf lock: nothing is called under it.
 static HOLDS: Mutex<Holds> = Mutex::new(Holds::new());
 
+/// The most bytes of scratch ranges kept for reuse ([`Scratch`]); a range past it is unmapped.
+const SCRATCH_CAP: u64 = 512 << 20;
+
+/// Scratch ranges ([`HostVm::allocate_scratch`]) given back and not unmapped: the copy fallback's
+/// buffers (core's `memory::map`), which WHPX makes per mapping of scattered guest pages, where a
+/// fresh range costs a new section, its zero fill and its first-touch faults (8.7 ms p50 for 8 MB,
+/// measured). A range is kept only once no runtime import holds a page of it, so no live buffer
+/// reads a range a later fallback overwrites: one given back while held waits in `deferred`, and
+/// joins the free ranges when its last hold goes ([`UnmapHold`]'s drop). A leaf lock: nothing is
+/// called under it.
+struct Scratch {
+    /// Free ranges by length: their first bytes.
+    free: BTreeMap<u64, Vec<u64>>,
+    /// The bytes `free` holds.
+    pooled: u64,
+    /// Scratch ranges given back while an import held them: first byte to end.
+    deferred: BTreeMap<u64, u64>,
+    /// Whether the kept ranges passed [`SCRATCH_CAP`] (said once).
+    over_cap: bool,
+}
+
+impl Scratch {
+    /// None.
+    const fn new() -> Scratch {
+        Scratch {
+            free: BTreeMap::new(),
+            pooled: 0,
+            deferred: BTreeMap::new(),
+            over_cap: false,
+        }
+    }
+
+    /// A free range of exactly `len` bytes, taken out: its first byte.
+    fn take(&mut self, len: u64) -> Option<u64> {
+        let list = self.free.get_mut(&len)?;
+        let first = list.pop()?;
+        if list.is_empty() {
+            self.free.remove(&len);
+        }
+        self.pooled -= len;
+        Some(first)
+    }
+
+    /// Keeps the `len` bytes at `first` for reuse: `false` for an empty range. Past the cap a
+    /// range is kept all the same, as every scratch range is registered persistent (the runtime may
+    /// keep an import of it, which must outlive any unmap): the cap only says so once.
+    fn put(&mut self, first: u64, len: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        if self.pooled.saturating_add(len) > SCRATCH_CAP && !self.over_cap {
+            self.over_cap = true;
+            log::warn!(
+                "scratch ranges kept for reuse pass {SCRATCH_CAP:#x} bytes; they are kept all the                  same (the runtime may hold imports of them)"
+            );
+        }
+        self.free.entry(len).or_default().push(first);
+        self.pooled += len;
+        true
+    }
+}
+
+/// Whether copy-fallback ranges are pooled for reuse ([`Scratch`]). `REIMS_VGPU_SCRATCH_POOL=0`
+/// turns it off, to test whether a range reused while a GPU copy still reads it shows stale
+/// frames (video jumping back and forth while the screen composites). Read once.
+fn scratch_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("REIMS_VGPU_SCRATCH_POOL").is_ok_and(|v| v == "0"))
+}
+
+/// The length a scratch range of `len` bytes is made with: rounded up to a size class (an eighth
+/// of the power of two at or above it, and whole 64 KiB granules), so ranges of nearby lengths
+/// share the pool's ranges and their kept imports, where an exact length missed whenever a size
+/// was new (a fresh range costs its section, zero fill and first-touch faults: 8.7 ms p50 for 8
+/// MB, measured). `REIMS_VGPU_SCRATCH_CLASSES=0` keeps exact lengths.
+fn scratch_class(len: u64) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on =
+        *ON.get_or_init(|| !std::env::var("REIMS_VGPU_SCRATCH_CLASSES").is_ok_and(|v| v == "0"));
+    if !on || len == 0 {
+        return len;
+    }
+    let step = (len.next_power_of_two() / 8).max(64 << 10);
+    len.div_ceil(step).saturating_mul(step)
+}
+
+/// The process's scratch ranges kept for reuse ([`Scratch`]).
+static SCRATCH: Mutex<Scratch> = Mutex::new(Scratch::new());
+
 /// A hold on the host pages a runtime import covers, which the runtime is given in a no-copy
 /// buffer's keep-alive: while it lives, [`VulkanVm`]'s `deallocate` of pages it meets leaves them
 /// mapped, and its drop, which the runtime makes once it freed the import, unmaps them (module
@@ -295,6 +384,14 @@ impl Drop for UnmapHold {
         }
         let vm = OsVm::new();
         for pages in free {
+            // A scratch range given back while held is kept for reuse now that no hold meets it,
+            // where it is the whole range and the cap has room.
+            let scratch = SCRATCH.lock().deferred.remove(&pages.start) == Some(pages.end);
+            if scratch {
+                // Kept, never unmapped: the runtime may hold an import of it.
+                SCRATCH.lock().put(pages.start, pages.end - pages.start);
+                continue;
+            }
             let at = HostPtr::from_addr(pages.start.to_usize());
             let _ = vm.deallocate(at, pages.end - pages.start);
         }
@@ -406,6 +503,62 @@ impl HostVm for VulkanVm {
         }
         self.vm.deallocate(addr, len)
     }
+
+    fn allocate_scratch(&self, len: u64) -> Result<HostAddr, KernReturn> {
+        if !scratch_pool() {
+            // As the committed copy fallback: a fresh range, unmapped at its free (holds wait).
+            return self.allocate_anywhere(len);
+        }
+        let len = scratch_class(len);
+        let reused = SCRATCH.lock().take(len);
+        match reused {
+            Some(first) => {
+                reims_vgpu_core::perfstats::SCRATCH_REUSED.add(std::time::Duration::ZERO);
+                let at = HostPtr::from_addr(first.to_usize());
+                // New contents under the address, as a fresh range's are (module docs).
+                self.changed(at, len);
+                Ok(at)
+            }
+            None => {
+                let made = std::time::Instant::now();
+                let at = self.allocate_anywhere(len)?;
+                reims_vgpu_core::perfstats::SCRATCH_FRESH.add(made.elapsed());
+                // A scratch range is never unmapped (`free_scratch` keeps it), so the runtime may
+                // keep one import of it and bind each buffer over it there, instead of importing
+                // its pages anew at each reuse (1.4 ms p50 for 8 MB, measured).
+                if let Some(first) = NonNull::new(at.as_ptr::<u8>()) {
+                    metal2vulkan_runtime::register_persistent_host_range(first, len);
+                }
+                Ok(at)
+            }
+        }
+    }
+
+    fn free_scratch(&self, addr: HostAddr, len: u64) -> KernReturn {
+        if !scratch_pool() {
+            return self.deallocate(addr, len);
+        }
+        // The class the range was made with (`scratch_class`)
+        let len = scratch_class(len);
+        // At the unmap, as `deallocate`'s (module docs).
+        let pages = self.changed(addr, len);
+        let whole = pages.start == addr.addr().to_u64() && pages.end - pages.start == len;
+        if HOLDS.lock().unmap(pages.clone()) {
+            // Kept for reuse once its last hold goes ([`UnmapHold`]'s drop).
+            if whole {
+                SCRATCH.lock().deferred.insert(pages.start, pages.end);
+            }
+            return KernReturn::SUCCESS;
+        }
+        if whole && SCRATCH.lock().put(pages.start, len) {
+            return KernReturn::SUCCESS;
+        }
+        // Not a whole scratch range: left mapped rather than unmapped under a kept import.
+        log::warn!(
+            "free_scratch of {len:#x} bytes at {addr:?} that is not a whole range: kept mapped"
+        );
+        KernReturn::SUCCESS
+    }
 }
 
 /// The base and size of each task the host's `createTask` made, until its `destroyTask`. A leaf
@@ -501,6 +654,24 @@ mod tests {
     use reims_vgpu_core::host::{HostTraceRange, PhysicalMemoryRange};
 
     use super::*;
+
+    /// A scratch range is reused only at its exact length, and the cap refuses what would pass it
+    #[test]
+    fn scratch_reuses_exact_lengths_up_to_the_cap() {
+        let mut s = Scratch::new();
+        assert_eq!(s.take(0x80_0000), None);
+        assert!(s.put(0x1000_0000, 0x80_0000));
+        assert!(s.put(0x2000_0000, 0x40_0000));
+        assert_eq!(s.take(0x70_0000), None, "no other length");
+        assert_eq!(s.take(0x80_0000), Some(0x1000_0000));
+        assert_eq!(s.take(0x80_0000), None, "taken once");
+        assert_eq!(s.pooled, 0x40_0000);
+        assert!(s.put(0x3000_0000, SCRATCH_CAP), "kept past the cap");
+        assert_eq!(s.take(SCRATCH_CAP), Some(0x3000_0000));
+        assert!(!s.put(0x3000_0000, 0), "nothing to keep");
+        assert_eq!(s.take(0x40_0000), Some(0x2000_0000));
+        assert_eq!(s.pooled, 0);
+    }
 
     thread_local! {
         /// What [`seen`] was told on this thread.

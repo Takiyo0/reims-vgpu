@@ -28,6 +28,7 @@
 //!   `tests::a_define_whose_event_raises_dies_under_its_handler`).
 
 pub mod commands;
+pub mod decode_worker;
 pub mod ring;
 pub mod stamps;
 pub mod thread;
@@ -241,6 +242,8 @@ pub struct Fifo<P: Platform> {
     /// A child's ring mapping, from a start to its thread's exit.
     mapping: Mutex<Option<Arc<Mapping<P>>>>,
     platform: Arc<P>,
+    /// The second half of its exec commands, in its order (`decode_worker`).
+    pub(crate) decode: Arc<decode_worker::DecodeWorker>,
 }
 
 impl<P: Platform> Drop for Fifo<P> {
@@ -292,6 +295,7 @@ impl<P: Platform> Fifo<P> {
             event_value: Arc::new(AtomicU64::new(0)),
             mapping: Mutex::new(None),
             platform: Arc::clone(platform),
+            decode: Arc::default(),
         })
     }
 
@@ -413,6 +417,11 @@ impl<P: Platform> Fifo<P> {
     /// Whether the FIFO is quiesced.
     pub fn is_quiesced(&self) -> bool {
         self.quiesced.load(Ordering::SeqCst)
+    }
+
+    /// Whether the FIFO's thread is running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
     }
 
     /// The fault offset (a child's own copy, not its node's).

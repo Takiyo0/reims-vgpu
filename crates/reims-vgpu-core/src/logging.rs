@@ -15,6 +15,12 @@
 //! When it is set, its filter decides which lines are written, to the hook too; when it isn't,
 //! the hook's own level does.
 //!
+//! With `REIMS_VGPU_LOG_ASYNC=1` the stderr lines below error are handed, formatted and
+//! timestamped, to a writer thread over a bounded queue ([`async_writer`]), so the thread that
+//! logs (the FIFO's, on the GPU path) never waits on the disk: a synchronous write to a growing
+//! log file was measured stalling it 203 ms. A full queue drops the line and counts it; error
+//! lines are still written in place, so a fatal's last words are never queued.
+//!
 //! Which lines are written, and whether a line's arguments are evaluated, are diagnostics: a line
 //! evaluates its arguments only when a logger takes it, so no argument has an effect. A value a
 //! line shows that has one (a read of guest memory, a question to Metal) is read before the line,
@@ -111,6 +117,30 @@ pub fn stderr_line(level: Level, target: &str, message: &str) -> String {
     format!("reims-vgpu {level} {target}: {message}\n")
 }
 
+/// The environment variable that prefixes each stderr line with its wall-clock time and thread, a
+/// diagnostic for lining lines up with a host's own timestamped trace.
+pub const TIME_ENV_VAR: &str = "REIMS_VGPU_LOG_TIME";
+
+/// Whether `REIMS_VGPU_LOG_TIME` is set, read on first use.
+fn timestamps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(TIME_ENV_VAR).is_some())
+}
+
+/// `line` after `[<UTC seconds since the epoch, to the microsecond> <thread>] `.
+fn timestamped(line: String) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("?");
+    format!(
+        "[{}.{:06} {name}] {line}",
+        now.as_secs(),
+        now.subsec_micros()
+    )
+}
+
 /// The logger: the environment's filter, the host's hook, and stderr.
 struct Logger {
     /// `REIMS_VGPU_LOG`'s filter, read on first use; `None` if it is not set.
@@ -170,7 +200,27 @@ impl Log for Logger {
         match hook {
             Some((_, hook)) => hook(record.level(), record.target(), &message),
             None => {
-                let line = stderr_line(record.level(), record.target(), &message);
+                let mut line = stderr_line(record.level(), record.target(), &message);
+                if timestamps() {
+                    line = timestamped(line);
+                }
+                if record.level() > Level::Error
+                    && let Some(tx) = async_writer()
+                {
+                    let dropped = DROPPED.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    if dropped != 0 {
+                        let note = stderr_line(
+                            Level::Warn,
+                            "reims_vgpu_core::logging",
+                            &format!("{dropped} log lines dropped: the writer fell behind"),
+                        );
+                        let _ = tx.try_send(note);
+                    }
+                    if tx.try_send(line).is_err() {
+                        DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
+                }
                 // One write per line, so lines from different threads do not interleave.
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
@@ -181,6 +231,32 @@ impl Log for Logger {
 }
 
 static LOGGER: Logger = Logger::new();
+
+/// Lines the asynchronous writer's full queue dropped since the last written.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The queue of the thread that writes stderr lines, when `REIMS_VGPU_LOG_ASYNC=1` (the module
+/// doc); `None` otherwise, or where the thread could not start. Made on first use.
+fn async_writer() -> Option<&'static std::sync::mpsc::SyncSender<String>> {
+    static TX: OnceLock<Option<std::sync::mpsc::SyncSender<String>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        if !std::env::var("REIMS_VGPU_LOG_ASYNC").is_ok_and(|v| v == "1") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1 << 16);
+        std::thread::Builder::new()
+            .name("reims-vgpu.log".to_owned())
+            .spawn(move || {
+                let mut err = std::io::stderr();
+                while let Ok(line) = rx.recv() {
+                    let _ = err.write_all(line.as_bytes());
+                }
+            })
+            .ok()?;
+        Some(tx)
+    })
+    .as_ref()
+}
 
 /// Whether this module's logger is the process's: `Some(true)` once installed, `Some(false)` if
 /// the host's was there first, `None` before anything asked.

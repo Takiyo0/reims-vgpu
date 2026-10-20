@@ -246,23 +246,68 @@ impl<P: Platform> Fifo<P> {
     pub(crate) fn dispatch(self: &Arc<Self>, header: &FifoCommand, payload: &[u8]) {
         let payload = Payload::new(payload);
         let Some(op) = Opcode::from_id(header.command_id) else {
+            log::warn!(
+                "FIFO channel {}: unknown command_id={} len={} stamp={}",
+                self.stamp_index(),
+                header.command_id,
+                header.length,
+                header.stamp_value
+            );
             return misc::invalid(self, header, payload);
         };
+        log::info!(
+            "FIFO channel {}: dispatch command_id={} ({:?}) len={} stamp={}",
+            self.stamp_index(),
+            header.command_id,
+            op,
+            header.length,
+            header.stamp_value
+        );
         match op.handler::<P>() {
             // One pool and one holder per command: the holder releases what it holds, then the
             // pool pops.
             Some(h) => {
+                // DIAG(cmd-time): a command whose handler and releases take 2 ms or more is
+                // written at debug, with its name: where the FIFO thread's time goes.
+                let timed = log::log_enabled!(log::Level::Debug).then(std::time::Instant::now);
+                let started = std::time::Instant::now();
+                let command_id = header.command_id;
+                // An exec hands its decode to the FIFO's worker; any other command waits for the
+                // worker first, so it never overtakes an exec before it (`decode_worker`).
+                let exec = matches!(op, Opcode::ExecIndirect2 | Opcode::ExecIndirect3);
+                if !exec {
+                    self.decode.drain();
+                }
                 let pool = Pool::push(self.platform());
                 let held = Held::new();
-                h(&mut Command {
+                let mut command = Command {
                     fifo: self,
                     held: &held,
                     hold: Hold::of(&held),
                     header,
                     payload,
-                });
+                };
+                if exec {
+                    crate::fifo::decode_worker::with_current(&self.decode, || h(&mut command));
+                } else {
+                    h(&mut command);
+                }
+                let ran = timed.map(|t| t.elapsed());
                 drop(held);
                 drop(pool);
+                crate::perfstats::command(command_id, started.elapsed());
+                crate::perfstats::channel(self.stamp_index() as usize, started.elapsed());
+                if let (Some(t), Some(ran)) = (timed, ran) {
+                    let all = t.elapsed();
+                    if all.as_secs_f64() >= 0.002 {
+                        log::debug!(
+                            "FIFO channel {}: command {op:?} took {:.2} ms ({:.2} ms in its handler, the rest in its releases)",
+                            self.stamp_index(),
+                            all.as_secs_f64() * 1000.0,
+                            ran.as_secs_f64() * 1000.0
+                        );
+                    }
+                }
             }
             None => misc::deprecated(self, header, payload),
         }

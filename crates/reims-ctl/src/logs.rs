@@ -26,8 +26,11 @@ pub fn bundle(vm: &Vm, host: Host) -> Result<PathBuf> {
     }
     if let Ok(inv) = runtime::invocation_for_print(vm, host) {
         zip.add(
-            &format!("{prefix}/launch.sh"),
-            inv.shell_script("the QEMU command reims-ctl runs")
+            &format!(
+                "{prefix}/launch.{}",
+                if cfg!(windows) { "ps1" } else { "sh" }
+            ),
+            inv.platform_script("the QEMU command reims-ctl runs")
                 .as_bytes(),
         )?;
     }
@@ -207,6 +210,20 @@ pub fn system_info(host: Host) -> String {
                 ),
             );
         }
+        Os::Windows => {
+            section("Windows", run("cmd", &["/c", "ver"]));
+            section(
+                "PowerShell",
+                run(
+                    "powershell",
+                    &[
+                        "-NoProfile",
+                        "-Command",
+                        "$PSVersionTable.PSVersion.ToString()",
+                    ],
+                ),
+            );
+        }
         Os::Other => {}
     }
     s
@@ -305,18 +322,15 @@ impl Zip {
 }
 
 fn dos_now() -> (u16, u16) {
-    // SAFETY: as in runtime::now_stamp.
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        let time =
-            ((tm.tm_hour as u16) << 11) | ((tm.tm_min as u16) << 5) | ((tm.tm_sec as u16) / 2);
-        let date = (((tm.tm_year - 80).max(0) as u16) << 9)
-            | (((tm.tm_mon + 1) as u16) << 5)
-            | tm.tm_mday as u16;
-        (time, date)
-    }
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let date = now.date();
+    let clock = now.time();
+    let time = ((clock.hour() as u16) << 11)
+        | ((clock.minute() as u16) << 5)
+        | ((clock.second() as u16) / 2);
+    let year = date.year().saturating_sub(1980).clamp(0, 127) as u16;
+    let date = (year << 9) | ((u8::from(date.month()) as u16) << 5) | date.day() as u16;
+    (time, date)
 }
 
 #[cfg(test)]

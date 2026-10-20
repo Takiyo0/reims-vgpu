@@ -242,7 +242,8 @@ impl SinglePlane {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_with_blit(
+            encoder,
             state,
             || paged.ensure_physical(hold),
             || {
@@ -378,7 +379,8 @@ impl DualPlaneBlit {
         state: &ResourceState,
         encoder: Option<&P::BlitEncoder>,
     ) -> RaiseResult<()> {
-        paged.prepare(
+        paged.prepare_with_blit(
+            encoder,
             state,
             || paged.ensure_physical(hold),
             || self.page(paged, encoder, false),

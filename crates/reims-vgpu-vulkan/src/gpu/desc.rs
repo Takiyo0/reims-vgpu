@@ -1038,7 +1038,7 @@ fn clear_color(c: ClearColor) -> rt::ClearColor {
 /// attachment holds it, as Metal's attachment retains its texture, and with it the IOSurface a
 /// texture over one keeps.
 fn attachment_texture(t: Option<&VulkanTexture>) -> Option<rt::Texture> {
-    t.map(|t| t.raw.clone())
+    t.map(|t| t.texels("setAttachmentTexture:").clone())
 }
 
 /// The [`Source`] of a texture core sets on an attachment.

@@ -191,7 +191,11 @@ impl<P: Platform> Deserializer<P> {
             made.0.push(Arc::clone(&fresh));
             fresh
         };
-        decoder.lock().decode(hold, header, segment)?;
+        crate::perfstats::SEGMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let decoded = decoder.lock().decode(hold, header, segment);
+        crate::perfstats::DECODE_SEGMENT[usize::from(header.encoder_type).min(4)].add(t.elapsed());
+        decoded?;
         // Tested after the decode, on the header an envelope may have replaced
         Ok((header.continued_by_next != 0).then_some(decoder))
     }

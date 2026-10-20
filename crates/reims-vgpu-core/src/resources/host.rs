@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::deserializer::Deserializer;
+use crate::guest::GuestPtr;
 use crate::guest::records::FeaturesRef;
 use crate::host::HostPtr;
 use crate::memory::cursor::{Cursor, WritableCursor};
@@ -72,6 +73,18 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
         page: u32,
         length: u64,
     ) -> RaiseResult<P::Buffer>;
+
+    /// [`new_buffer_for_virtual_page`](Self::new_buffer_for_virtual_page) for a transfer buffer
+    /// (a host-side staging buffer no guest value names), which a host may hand out again for the
+    /// same physical pages.
+    fn new_transfer_buffer_for_virtual_page(
+        &self,
+        hold: Hold<'_>,
+        page: u32,
+        length: u64,
+    ) -> RaiseResult<P::Buffer> {
+        self.new_buffer_for_virtual_page(hold, page, length)
+    }
 
     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
     /// nothing checks: the backing's validity writes still happen.
@@ -204,6 +217,22 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
         length: u64,
         need_writable: bool,
     ) -> RaiseResult<MappedAddress<P>>;
+
+    /// Resolves the host virtual address for each guest virtual page in offset..offset + length.
+    /// Answers None if pages could not be walked or are not in the guest memory map.
+    fn resolve_virtual_pages(
+        &self,
+        _hold: Hold<'_>,
+        _offset: u64,
+        _length: u64,
+    ) -> RaiseResult<Option<Vec<GuestPtr>>> {
+        Ok(None)
+    }
+
+    /// The guest memory map, if available.
+    fn memory_map(&self) -> Option<Arc<crate::memory::map::MemoryMap<P>>> {
+        None
+    }
 }
 
 /// A host address into task memory and the mapping that backs it: the address is valid while
